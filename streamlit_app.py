@@ -82,6 +82,15 @@ def _clean_prod_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     df = df.rename(columns=lambda x: str(x).replace("\n", ""))
     return df
 
+
+def _pick_depth_column(df: pd.DataFrame) -> str | None:
+    candidates = ["DEPT", "DEPTH", "MD", "TVD", "TVDSS", "Z_GDM", "GL_GDM", "H_GDM", "ГЛУБИНА", "Глубина"]
+    upper_map = {c.upper(): c for c in df.columns}
+    for cand in candidates:
+        if cand.upper() in upper_map:
+            return upper_map[cand.upper()]
+    return None
+
 def _default_bounds_for_pvts(pvts: list[int]) -> dict[int, dict[str, tuple[float, float]]]:
     return {pvt: {"a": (0.05, 0.30), "b": (-3.0, -0.5), "sigma": (25.0, 35.0)} for pvt in pvts}
 
@@ -140,8 +149,8 @@ def leverett_tab() -> None:
             type=["csv", "xlsx", "xls"],
             key="prod_file",
         )
-        maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=120, step=10)
-        popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=15, step=1)
+        maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=200, step=10)
+        popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
 
     if wells_file is None:
         st.info("Загрузите файл скважин, чтобы продолжить.")
@@ -233,6 +242,8 @@ def leverett_tab() -> None:
         region_df,
         x="Кнг_W",
         y="Kng_model",
+        color="weight" if "weight" in region_df.columns else None,
+        color_continuous_scale="Viridis",
         hover_data=hover_cols,
         title=f"PVT {region}: историческое vs предсказанное Кнг",
         opacity=0.7,
@@ -245,25 +256,36 @@ def leverett_tab() -> None:
         wells = sorted(region_df["WELL_NAME"].astype(str).unique().tolist())
         well = st.selectbox("Скважина для детального графика", options=wells)
         well_df = region_df[region_df["WELL_NAME"].astype(str) == well].copy()
-        well_df = well_df.reset_index(drop=True)
-        well_df["point_id"] = well_df.index + 1
-        chart_df = well_df.melt(
-            id_vars=["point_id", "WELL_NAME"],
-            value_vars=["Кнг_W", "Kng_model"],
-            var_name="type",
-            value_name="Kng",
-        )
-        fig_well = px.line(
-            chart_df,
-            x="point_id",
-            y="Kng",
-            color="type",
-            markers=True,
-            hover_data=["WELL_NAME", "type", "Kng"],
-            title=f"Скважина {well}: сравнение кривых",
-        )
-        fig_well.update_layout(xaxis_title="Номер точки", yaxis_title="Кнг")
-        st.plotly_chart(fig_well, use_container_width=True)
+        depth_col = _pick_depth_column(well_df)
+        if depth_col is None:
+            st.warning("Не найдена колонка глубины (например DEPTH/DEPT).")
+        elif "ACTNUM_GDM" not in well_df.columns:
+            st.warning("В данных отсутствует ACTNUM_GDM для детального графика.")
+        else:
+            well_df[depth_col] = pd.to_numeric(well_df[depth_col], errors="coerce")
+            well_df = well_df.dropna(subset=[depth_col]).sort_values(depth_col).reset_index(drop=True)
+
+            curve_df = well_df[[depth_col, "ACTNUM_GDM", "Кнг_W", "Kng_model"]].copy()
+            curve_df = curve_df.rename(columns={"Кнг_W": "Кн РИГИС", "Kng_model": "Кн J-функция"})
+            chart_df = curve_df.melt(
+                id_vars=[depth_col],
+                value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн J-функция"],
+                var_name="Кривая",
+                value_name="Значение",
+            )
+
+            fig_well = px.line(
+                chart_df,
+                x="Значение",
+                y=depth_col,
+                color="Кривая",
+                line_shape="hv",
+                title=f"Скважина {well}: вертикальный профиль",
+            )
+            fig_well.update_traces(mode="lines")
+            fig_well.update_yaxes(autorange="reversed")
+            fig_well.update_layout(xaxis_title="Значение", yaxis_title="Глубина")
+            st.plotly_chart(fig_well, use_container_width=True)
 
     csv_result = result_df.to_csv(index=False).encode("utf-8")
     csv_params = params_df.to_csv(index=False).encode("utf-8")

@@ -3,9 +3,6 @@ import pandas as pd
 from scipy.optimize import differential_evolution
 from sklearn.metrics import r2_score
 
-PI = 3.1415
-COS_THETA = 1.0
-
 REQUIRED_WELL_COLUMNS = [
     "WELL_NAME",
     "PVTNUM_GDM",
@@ -70,34 +67,21 @@ def calc_kng_vector(df: pd.DataFrame, a: float, b: float, sigma: float) -> np.nd
     pc = _safe_series(df, "PC")
     swl = _safe_series(df, "SWL_GDM")
 
-    valid = (poro > 0) & (perm > 0) & np.isfinite(pc) & np.isfinite(swl) & (a > 0) & np.isfinite(b) & (sigma > 0)
+    valid = (poro > 0) & (perm > 0) & np.isfinite(pc) & np.isfinite(swl)
     kng = np.full(len(df), np.nan)
-    if not np.any(valid):
+    if valid.sum() == 0:
         return kng
 
-    poro_v = poro[valid]
-    perm_v = perm[valid]
-    pc_v = pc[valid]
-    swl_v = np.clip(swl[valid], 0, 1)
+    poro = poro[valid]
+    perm = perm[valid]
+    pc = pc[valid]
+    swl = swl[valid]
 
-    j0 = PI * pc_v / (sigma * COS_THETA) * np.sqrt(perm_v / poro_v)
-    jmax = a * (0.01 ** b)
-    j0 = np.minimum(j0, jmax)
-
-    pc_init = j0 * sigma * COS_THETA / PI * np.sqrt(poro_v / perm_v)
-    j = pc_init / (sigma * COS_THETA) * np.sqrt(perm_v / poro_v)
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        kvn = (j / a) ** (1 / b)
-    # kvn = np.nan_to_num(kvn, nan=0.0, posinf=1.0, neginf=0.0)
-    # kvn = np.clip(kvn, 0.01, 1.0)
-    kvn = np.nan_to_num(kvn, nan=0.0, posinf=10.0, neginf=0.0)
-    kvn = np.clip(kvn, 0.0, 1.0)
-    kv = swl_v + (1 - swl_v) * kvn
+    j = np.pi * pc / sigma * np.sqrt(perm / poro)
+    kvn = (j / a) ** (1 / b)
+    kv = swl + (1 - swl) * kvn
     kng_valid = 1 - kv
     kng_valid = np.clip(kng_valid, 0, 1)
-
-    
     kng[valid] = kng_valid
     return kng
 
@@ -123,8 +107,8 @@ def loss_function(params: tuple[float, float, float], df: pd.DataFrame) -> float
 def optimize_pvt(
     df: pd.DataFrame,
     bounds_by_pvt: dict[int, dict[str, tuple[float, float]]],
-    maxiter: int = 120,
-    popsize: int = 15,
+    maxiter: int = 200,
+    popsize: int = 20,
 ) -> dict[int, tuple[float, float, float]]:
     params: dict[int, tuple[float, float, float]] = {}
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
@@ -136,28 +120,24 @@ def optimize_pvt(
             bounds_by_pvt[pvt]["b"],
             bounds_by_pvt[pvt]["sigma"],
         ]
-        result = differential_evolution(
-            loss_function,
-            bounds=bounds,
-            args=(g,),
-            maxiter=maxiter,
-            popsize=popsize,
-            polish=True,
-            seed=42,
-        )
+        result = differential_evolution(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, popsize=popsize)
         params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
     return params
 
 
 def apply_model(df: pd.DataFrame, params: dict[int, tuple[float, float, float]]) -> pd.DataFrame:
     df = df.copy()
-    df["Kng_model"] = np.nan
-    for pvt, idx in df.groupby("PVTNUM_GDM").groups.items():
-        pvt_int = int(pvt)
-        if pvt_int not in params:
+    kng_model = np.zeros(len(df))
+
+    for i, row in df.iterrows():
+        pvt = int(float(row["PVTNUM_GDM"]))
+        if pvt not in params:
             continue
-        a, b, sigma = params[pvt_int]
-        df.loc[idx, "Kng_model"] = calc_kng_vector(df.loc[idx], a, b, sigma)
+        a, b, sigma = params[pvt]
+        val = calc_kng_vector(row.to_frame().T, a, b, sigma)[0]
+        kng_model[i] = val
+
+    df["Kng_model"] = kng_model
     return df
 
 
@@ -166,26 +146,16 @@ def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
         y_true = _safe_series(g, "Кнг_W")
         y_pred = _safe_series(g, "Kng_model")
-        weights = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
-        valid = np.isfinite(y_true) & np.isfinite(y_pred)
-        if not np.any(valid):
-            continue
-        y_true = y_true[valid]
-        y_pred = y_pred[valid]
-        w = weights[valid]
+        w = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
         err = y_pred - y_true
         mae = float(np.average(np.abs(err), weights=w))
         rmse = float(np.sqrt(np.average(err**2, weights=w)))
         bias = float(np.average(err, weights=w))
+        r2 = float(r2_score(y_true, y_pred))
         score = float(1 - (np.sum(w * np.abs(err)) / np.sum(w)))
-        if len(y_true) > 1:
-            r2 = float(r2_score(y_true, y_pred))
-        else:
-            r2 = np.nan
         rows.append(
             {
-                "PVTNUM_GDM": int(pvt_raw),
-                "N": len(y_true),
+                "PVTNUM_GDM": int(float(pvt_raw)),
                 "MAE": mae,
                 "RMSE": rmse,
                 "BIAS": bias,
@@ -232,8 +202,8 @@ def run_pipeline(
     df_wells: pd.DataFrame,
     df_prod: pd.DataFrame | None,
     bounds_by_pvt: dict[int, dict[str, tuple[float, float]]],
-    maxiter: int = 120,
-    popsize: int = 15,
+    maxiter: int = 200,
+    popsize: int = 20,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     missing = [c for c in REQUIRED_WELL_COLUMNS if c not in df_wells.columns]
     if missing:
