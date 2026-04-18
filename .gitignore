@@ -1,3 +1,16 @@
-data  
-__pycache__
-docker-compose.yml
+# Data files (too large for Git)
+*.txt
+*.csv
+*.xlsx
+*.xls
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Docker
+*.log
+EOF
