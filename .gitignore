@@ -1,4 +1,4 @@
-# Data files (too large for Git)
+# Large data files (это ваши большие файлы)
 *.txt
 *.csv
 *.xlsx
@@ -8,9 +8,37 @@ data/
 # Python
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
 .venv/
 venv/
+ENV/
+env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
 
 # Docker
 *.log
-EOF
+docker-compose.override.yml
+
+# Git
+*.orig
+
+# Project specific
+model_result.csv
+*.db
+*.sqlite
