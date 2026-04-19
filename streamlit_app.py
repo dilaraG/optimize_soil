@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from pathlib import Path
 
 import numpy as np
@@ -25,14 +26,15 @@ st.set_page_config(page_title="J-функция Леверетта", layout="wid
 DATA_DIR = Path(__file__).resolve().parent / "data"
 
 
-def _read_table(uploaded_file) -> pd.DataFrame:
-    name = uploaded_file.name.lower()
+@st.cache_data(show_spinner=False)
+def _read_table_from_bytes(file_bytes: bytes, filename: str) -> pd.DataFrame:
+    name = filename.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(uploaded_file, low_memory=False)
+        return pd.read_csv(io.BytesIO(file_bytes), low_memory=False)
     if name.endswith(".xlsx") or name.endswith(".xls"):
-        return pd.read_excel(uploaded_file)
+        return pd.read_excel(io.BytesIO(file_bytes))
     if name.endswith(".txt"):
-        content = uploaded_file.getvalue().decode("utf-8", errors="ignore")
+        content = file_bytes.decode("utf-8", errors="ignore")
         lines = [line.strip() for line in content.splitlines() if line.strip()]
         if not lines:
             raise ValueError("Пустой txt файл.")
@@ -44,6 +46,10 @@ def _read_table(uploaded_file) -> pd.DataFrame:
             df[first_col] = df[first_col].astype(str).str.replace('"', "", regex=False)
         return df
     raise ValueError("Поддерживаются только файлы .csv, .xlsx/.xls и .txt")
+
+
+def _read_table(uploaded_file) -> pd.DataFrame:
+    return _read_table_from_bytes(uploaded_file.getvalue(), uploaded_file.name)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -83,6 +89,16 @@ def _clean_prod_df(df: pd.DataFrame | None) -> pd.DataFrame | None:
     df = _normalize_columns(df.copy())
     df = df.rename(columns=lambda x: str(x).replace("\n", ""))
     return df
+
+
+@st.cache_data(show_spinner=False)
+def _clean_wells_cached(df: pd.DataFrame) -> pd.DataFrame:
+    return _clean_wells_df(df)
+
+
+@st.cache_data(show_spinner=False)
+def _clean_prod_cached(df: pd.DataFrame | None) -> pd.DataFrame | None:
+    return _clean_prod_df(df)
 
 
 def _pick_depth_column(df: pd.DataFrame) -> str | None:
@@ -164,6 +180,12 @@ def _validate_columns(df_wells: pd.DataFrame, df_prod: pd.DataFrame | None) -> l
         if not prod_ok:
             errors.append("Файл добычи должен содержать колонки скважины и региона (PVTNUM).")
     return errors
+
+
+@st.cache_data(show_spinner=False)
+def _load_kkd_cached(db_path: str, mtime: float) -> pd.DataFrame:
+    _ = mtime
+    return load_kkd_dataframe(db_path)
 
 
 def _fig_j_swn_lab(
@@ -279,7 +301,8 @@ def laboratory_tab() -> None:
         st.caption(f"Excel: `{excel_path()}`  |  SQLite: `{sqlite_path()}`")
 
     try:
-        df = load_kkd_dataframe()
+        db_file = sqlite_path()
+        df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
     except FileNotFoundError:
         st.info("База ещё не создана. Положите `ККД_БД.xlsx` в папку `data` или загрузите файл выше, затем нажмите «Пересобрать SQLite из Excel».")
         return
@@ -376,15 +399,26 @@ def leverett_tab() -> None:
         maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=200, step=10)
         popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
 
-    if wells_file is None:
+    if wells_file is not None:
+        st.session_state["wells_file_name"] = wells_file.name
+        st.session_state["wells_file_bytes"] = wells_file.getvalue()
+    if prod_file is not None:
+        st.session_state["prod_file_name"] = prod_file.name
+        st.session_state["prod_file_bytes"] = prod_file.getvalue()
+
+    wells_bytes = st.session_state.get("wells_file_bytes")
+    wells_name = st.session_state.get("wells_file_name")
+    if not wells_bytes or not wells_name:
         st.info("Загрузите файл скважин, чтобы продолжить.")
         return
 
     try:
-        raw_wells = _read_table(wells_file)
-        raw_prod = _read_table(prod_file) if prod_file is not None else None
-        df_wells = _clean_wells_df(raw_wells)
-        df_prod = _clean_prod_df(raw_prod)
+        raw_wells = _read_table_from_bytes(wells_bytes, wells_name)
+        raw_prod = None
+        if st.session_state.get("prod_file_bytes") and st.session_state.get("prod_file_name"):
+            raw_prod = _read_table_from_bytes(st.session_state["prod_file_bytes"], st.session_state["prod_file_name"])
+        df_wells = _clean_wells_cached(raw_wells)
+        df_prod = _clean_prod_cached(raw_prod)
     except Exception as e:
         st.error(f"Ошибка чтения файла: {e}")
         return
@@ -405,6 +439,20 @@ def leverett_tab() -> None:
     st.dataframe(df_wells.head(30), use_container_width=True)
     st.caption(f"Строк после очистки: {len(df_wells)}")
 
+    pvt_horizon_map: dict[int, list[str]] = st.session_state.get("pvt_horizon_map", {})
+    if lab_ready and cloud is not None and not cloud.empty:
+        st.subheader("Связь код горизонта -> PVTNUM")
+        hors_universe = sorted(cloud["lab_horizon"].astype(str).unique().tolist())
+        for pvt in pvts:
+            existing = pvt_horizon_map.get(pvt, [])
+            pvt_horizon_map[pvt] = st.multiselect(
+                f"Горизонты для PVTNUM {pvt}",
+                options=hors_universe,
+                default=existing,
+                key=f"pvt_hor_map_{pvt}",
+            )
+        st.session_state["pvt_horizon_map"] = pvt_horizon_map
+
     st.subheader("Режим границ a, b")
     if lab_ready and cloud is not None and not cloud.empty:
         bounds_mode = st.radio(
@@ -422,17 +470,6 @@ def leverett_tab() -> None:
     if bounds_mode == "Ручной ввод":
         bounds_by_pvt = _bounds_ui_manual(pvts)
     else:
-        st.markdown("**Сопоставление: какой код горизонта относится к какому PVTNUM** (можно несколько)")
-        hors_universe = sorted(cloud["lab_horizon"].astype(str).unique().tolist()) if cloud is not None else []
-        pvt_horizon_map: dict[int, list[str]] = {}
-        for pvt in pvts:
-            pvt_horizon_map[pvt] = st.multiselect(
-                f"Горизонты для PVTNUM {pvt}",
-                options=hors_universe,
-                key=f"pvt_hor_map_{pvt}",
-            )
-        st.session_state["pvt_horizon_map"] = pvt_horizon_map
-
         if st.button("Подобрать границы a, b автоматически по облаку", type="primary"):
             if cloud is None or cloud.empty:
                 st.error("Нет данных лаборатории в session_state.")
@@ -540,6 +577,8 @@ def leverett_tab() -> None:
     if run_fix:
         if not use_fixed:
             st.error("Включите «Рассчитать с заданными коэффициентами» и задайте a, b, sigma.")
+        elif lab_ready and cloud is not None and any(not (pvt_horizon_map.get(p) or []) for p in pvts):
+            st.error("Для режима заданных коэффициентов выберите соответствие горизонтов для каждого PVTNUM.")
         else:
             with st.spinner("Применяются заданные коэффициенты..."):
                 try:
@@ -591,10 +630,10 @@ def leverett_tab() -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Параметры")
-        st.dataframe(params_df, use_container_width=True)
+        st.dataframe(params_df.round(3), use_container_width=True)
     with c2:
         st.subheader("Метрики")
-        st.dataframe(qa_df, use_container_width=True)
+        st.dataframe(qa_df.round(3), use_container_width=True)
 
     if lab_ready and cloud is not None and not cloud.empty:
         st.subheader("J vs Swn: лаборатория + степенная модель с оптимальными a, b")
@@ -637,15 +676,49 @@ def leverett_tab() -> None:
         st.warning("Для выбранного региона нет валидных точек.")
         return
 
-    hover_cols = [c for c in ["WELL_NAME", "PC", "PORO_GDM", "PERM_GDM", "SWL_GDM", "Кнг_W", "Kng_model", "weight"] if c in region_df.columns]
+    color_mode = st.radio(
+        "Палитра точек на графике",
+        options=("По весу", "По толщине"),
+        horizontal=True,
+        key="scatter_color_mode",
+    )
+
+    depth_for_thickness = _pick_depth_column(region_df)
+    if color_mode == "По толщине":
+        if depth_for_thickness is None:
+            st.warning("Колонка глубины не найдена, палитра автоматически переключена на веса.")
+            color_mode = "По весу"
+        elif "WELL_NAME" not in region_df.columns:
+            st.warning("Нет колонки WELL_NAME для расчета толщин, палитра переключена на веса.")
+            color_mode = "По весу"
+        else:
+            region_df[depth_for_thickness] = pd.to_numeric(region_df[depth_for_thickness], errors="coerce")
+            thickness_df = (
+                region_df.dropna(subset=[depth_for_thickness])
+                .groupby("WELL_NAME")[depth_for_thickness]
+                .agg(["min", "max"])
+                .reset_index()
+            )
+            thickness_df["thickness"] = thickness_df["max"] - thickness_df["min"]
+            region_df = region_df.merge(thickness_df[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left")
+
+    hover_cols = [
+        c
+        for c in ["WELL_NAME", "PC", "PORO_GDM", "PERM_GDM", "SWL_GDM", "Кнг_W", "Kng_model", "weight", "thickness"]
+        if c in region_df.columns
+    ]
+    color_col = "weight"
+    if color_mode == "По толщине" and "thickness" in region_df.columns:
+        color_col = "thickness"
+
     fig_scatter = px.scatter(
         region_df,
         x="Кнг_W",
         y="Kng_model",
-        color="weight" if "weight" in region_df.columns else None,
+        color=color_col if color_col in region_df.columns else None,
         color_continuous_scale="Viridis",
         hover_data=hover_cols,
-        title=f"PVT {region}: историческое vs предсказанное Кнг",
+        title=f"PVT {region}: историческое vs предсказанное Кнг ({'вес' if color_col == 'weight' else 'толщина'})",
         opacity=0.7,
     )
     fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
@@ -666,7 +739,7 @@ def leverett_tab() -> None:
             .sort_values(["avg_weight", "max_weight"], ascending=False)
         )
         st.markdown("**Скважины с наибольшими весами (в целом по выборке)**")
-        st.dataframe(weight_summary.head(15), use_container_width=True)
+        st.dataframe(weight_summary.head(15).round(3), use_container_width=True)
 
     if not qa_df.empty:
         qa_row = qa_df[qa_df["PVTNUM_GDM"] == int(region)]
@@ -675,10 +748,16 @@ def leverett_tab() -> None:
             recs = []
             if qa_row["R2"] < 0.5:
                 recs.append("Низкий R2: сузьте диапазоны a/b или увеличьте maxiter/popsize.")
-            if abs(qa_row["BIAS"]) > 0.08:
-                recs.append("Высокий BIAS: проверьте sigma и SWL_GDM.")
+            bias = float(qa_row["BIAS"])
+            if abs(bias) > 0.08:
+                if bias > 0:
+                    recs.append("BIAS > 0 (модель завышает Кн): попробуйте повысить sigma или немного снизить a.")
+                else:
+                    recs.append("BIAS < 0 (модель занижает Кн): попробуйте понизить sigma или немного повысить a.")
             if qa_row["RMSE"] > 0.15:
                 recs.append("Повышенный RMSE: проверьте выбросы PC/PERM/PORO и очистку данных.")
+            if qa_row["SCORE"] < 0.75:
+                recs.append("Низкий SCORE: проверьте соответствие горизонтов PVTNUM и пересмотрите границы a/b.")
             if not recs:
                 recs.append("Качество выглядит стабильным; при автограницах можно сузить горизонты в лаборатории.")
             st.markdown("**Рекомендации**")

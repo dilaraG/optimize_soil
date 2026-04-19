@@ -149,6 +149,32 @@ def _tight_a_from_b(s: np.ndarray, j: np.ndarray, b: float, side: str) -> float:
     return float(np.min(r))
 
 
+def _tight_a_from_b_robust_upper(s: np.ndarray, j: np.ndarray, b: float) -> float:
+    """
+    Робастная оценка a для верхней огибающей.
+    Отсекаем экстремально большие r = J / Swn^b, чтобы единичные выбросы
+    не завышали верхнюю границу.
+    """
+    with np.errstate(divide="ignore", invalid="ignore"):
+        r = j / (s**b)
+    r = r[np.isfinite(r) & (r > 0)]
+    if r.size == 0:
+        return float("nan")
+    if r.size < 8:
+        return float(np.max(r))
+
+    q1, q3 = np.quantile(r, [0.25, 0.75])
+    iqr = q3 - q1
+    hi = q3 + 1.5 * iqr
+    core = r[r <= hi]
+    if core.size < max(5, int(0.3 * r.size)):
+        core = r
+
+    # Верхняя граница как высокий квантиль "ядра", а не абсолютный max.
+    # Это сохраняет верхнюю огибающую близкой к облаку без улета по выбросам.
+    return float(np.quantile(core, 0.98))
+
+
 def _clip_power_curve(s: np.ndarray, j_min: float, j_max: float, a: float, b: float) -> tuple[np.ndarray, np.ndarray]:
     """Сетка только по диапазону s; J обрезается в пределах точек."""
     s0, s1 = float(np.min(s)), float(np.max(s))
@@ -216,7 +242,7 @@ def auto_ab_bounds_from_cloud(
         b_lo = float(min(b_lo_raw, b_ols) - 0.12)
         b_lo = float(np.clip(b_lo, -12.0, b_up - 0.02))
 
-    a_up = _tight_a_from_b(s, jj, b_up, "upper")
+    a_up = _tight_a_from_b_robust_upper(s, jj, b_up)
     a_lo = _tight_a_from_b(s, jj, b_lo, "lower")
     if not (np.isfinite(a_up) and np.isfinite(a_lo)):
         return {
