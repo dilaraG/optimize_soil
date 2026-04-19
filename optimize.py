@@ -109,10 +109,15 @@ def optimize_pvt(
     bounds_by_pvt: dict[int, dict[str, tuple[float, float]]],
     maxiter: int = 200,
     popsize: int = 20,
+    fixed_params: dict[int, tuple[float, float, float]] | None = None,
 ) -> dict[int, tuple[float, float, float]]:
     params: dict[int, tuple[float, float, float]] = {}
+    fixed = fixed_params or {}
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
-        pvt = int(pvt_raw)
+        pvt = int(float(pvt_raw))
+        if pvt in fixed:
+            params[pvt] = fixed[pvt]
+            continue
         if pvt not in bounds_by_pvt:
             continue
         bounds = [
@@ -204,6 +209,7 @@ def run_pipeline(
     bounds_by_pvt: dict[int, dict[str, tuple[float, float]]],
     maxiter: int = 200,
     popsize: int = 20,
+    fixed_params: dict[int, tuple[float, float, float]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     missing = [c for c in REQUIRED_WELL_COLUMNS if c not in df_wells.columns]
     if missing:
@@ -211,7 +217,13 @@ def run_pipeline(
 
     data = prepare_input_df(df_wells)
     data = prepare_weights(data, df_prod)
-    params = optimize_pvt(data, bounds_by_pvt, maxiter=maxiter, popsize=popsize)
+    params = optimize_pvt(
+        data,
+        bounds_by_pvt,
+        maxiter=maxiter,
+        popsize=popsize,
+        fixed_params=fixed_params,
+    )
     result = apply_model(data, params)
     qa = compute_qa(result)
 
