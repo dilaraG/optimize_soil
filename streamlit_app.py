@@ -91,6 +91,18 @@ def _pick_depth_column(df: pd.DataFrame) -> str | None:
             return upper_map[cand.upper()]
     return None
 
+
+def _well_convergence_percent(df: pd.DataFrame) -> float:
+    eps = 1e-6
+    true_vals = pd.to_numeric(df["Кнг_W"], errors="coerce")
+    pred_vals = pd.to_numeric(df["Kng_model"], errors="coerce")
+    valid = true_vals.notna() & pred_vals.notna()
+    if valid.sum() == 0:
+        return float("nan")
+    rel_err = (pred_vals[valid] - true_vals[valid]).abs() / true_vals[valid].abs().clip(lower=eps)
+    conv = 100.0 * (1.0 - rel_err.mean())
+    return float(max(0.0, min(100.0, conv)))
+
 def _default_bounds_for_pvts(pvts: list[int]) -> dict[int, dict[str, tuple[float, float]]]:
     return {pvt: {"a": (0.05, 0.30), "b": (-3.0, -0.5), "sigma": (25.0, 35.0)} for pvt in pvts}
 
@@ -252,6 +264,43 @@ def leverett_tab() -> None:
     fig_scatter.update_layout(xaxis_title="Кнг историческое (ГИС)", yaxis_title="Кнг предсказанное")
     st.plotly_chart(fig_scatter, use_container_width=True)
 
+    st.markdown("#### Аналитика по выбранному региону")
+    region_wells_count = region_df["WELL_NAME"].astype(str).nunique() if "WELL_NAME" in region_df.columns else 0
+    region_points_count = len(region_df)
+    m1, m2 = st.columns(2)
+    m1.metric("Уникальных скважин (PVTNUM)", int(region_wells_count))
+    m2.metric("Всего точек (PVTNUM)", int(region_points_count))
+
+    if "weight" in result_df.columns and "WELL_NAME" in result_df.columns:
+        weight_summary = (
+            result_df.groupby("WELL_NAME", as_index=False)
+            .agg(
+                avg_weight=("weight", "mean"),
+                max_weight=("weight", "max"),
+                points=("weight", "size"),
+            )
+            .sort_values(["avg_weight", "max_weight"], ascending=False)
+        )
+        st.markdown("**Скважины с наибольшими весами (в целом по выборке)**")
+        st.dataframe(weight_summary.head(15), use_container_width=True)
+
+    if not qa_df.empty:
+        qa_row = qa_df[qa_df["PVTNUM_GDM"] == int(region)]
+        if not qa_row.empty:
+            qa_row = qa_row.iloc[0]
+            recs = []
+            if qa_row["R2"] < 0.5:
+                recs.append("Низкий R2: стоит сузить диапазоны a/b или увеличить maxiter/popsize.")
+            if abs(qa_row["BIAS"]) > 0.08:
+                recs.append("Высокий BIAS: вероятен систематический сдвиг; проверьте границы sigma и корректность SWL_GDM.")
+            if qa_row["RMSE"] > 0.15:
+                recs.append("Повышенный RMSE: проверьте выбросы по PC/PERM/PORO и качество очистки по конкретным скважинам.")
+            if not recs:
+                recs.append("Качество по метрикам выглядит стабильным; можно проверить устойчивость на альтернативных границах.")
+            st.markdown("**Рекомендации для анализа и настройки параметров**")
+            for rec in recs:
+                st.write(f"- {rec}")
+
     if "WELL_NAME" in region_df.columns:
         wells = sorted(region_df["WELL_NAME"].astype(str).unique().tolist())
         well = st.selectbox("Скважина для детального графика", options=wells)
@@ -279,13 +328,16 @@ def leverett_tab() -> None:
                 x="Значение",
                 y=depth_col,
                 color="Кривая",
-                line_shape="hv",
                 title=f"Скважина {well}: вертикальный профиль",
             )
             fig_well.update_traces(mode="lines")
             fig_well.update_yaxes(autorange="reversed")
             fig_well.update_layout(xaxis_title="Значение", yaxis_title="Глубина")
             st.plotly_chart(fig_well, use_container_width=True)
+
+            conv_percent = _well_convergence_percent(well_df)
+            if np.isfinite(conv_percent):
+                st.metric("Сходимость для скважины (Кн J-функция к Кн РИГИС), %", f"{conv_percent:.2f}")
 
     csv_result = result_df.to_csv(index=False).encode("utf-8")
     csv_params = params_df.to_csv(index=False).encode("utf-8")
