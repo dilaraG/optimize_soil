@@ -24,6 +24,7 @@ from optimize import run_pipeline
 st.set_page_config(page_title="J-функция Леверетта", layout="wide")
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
+UPLOAD_DIR = DATA_DIR / "uploads"
 
 
 @st.cache_data(show_spinner=False)
@@ -52,6 +53,30 @@ def _read_table(uploaded_file) -> pd.DataFrame:
     return _read_table_from_bytes(uploaded_file.getvalue(), uploaded_file.name)
 
 
+def _persist_uploaded_file(uploaded_file, prefix: str) -> str:
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    target = UPLOAD_DIR / f"{prefix}_{uploaded_file.name}"
+    if (not target.exists()) or target.stat().st_size != uploaded_file.size:
+        target.write_bytes(uploaded_file.getbuffer())
+    return str(target)
+
+
+@st.cache_data(show_spinner=False)
+def _read_table_from_path(path: str) -> pd.DataFrame:
+    p = Path(path)
+    name = p.name.lower()
+    if name.endswith(".csv"):
+        return pd.read_csv(p, low_memory=False)
+    if name.endswith(".xlsx") or name.endswith(".xls"):
+        return pd.read_excel(p)
+    if name.endswith(".txt"):
+        with p.open("r", encoding="utf-8", errors="ignore") as fh:
+            first_line = fh.readline()
+        columns = first_line[1:].replace('"', "").split()
+        return pd.read_csv(p, sep=r"\s+", skiprows=1, names=columns, engine="c", low_memory=False)
+    raise ValueError("Поддерживаются только файлы .csv, .xlsx/.xls и .txt")
+
+
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = (
@@ -78,7 +103,6 @@ def _clean_wells_df(df: pd.DataFrame) -> pd.DataFrame:
     if "PC" in df.columns:
         df = df.loc[df["PC"] >= 0.01]
     if "Кнг_W" in df.columns:
-        df = df.loc[df["Кнг_W"] != 0]
         df.loc[df["Кнг_W"] > 1, "Кнг_W"] = df["Кнг_W"] / 100
     return df.reset_index(drop=True)
 
@@ -396,27 +420,34 @@ def leverett_tab() -> None:
         st.header("Загрузка данных")
         wells_file = st.file_uploader("Файл скважин", type=["csv", "xlsx", "xls", "txt"], key="wells_file")
         prod_file = st.file_uploader("Файл добычи (опционально для весов)", type=["csv", "xlsx", "xls"], key="prod_file")
+        optimizer_method = st.selectbox(
+            "Метод оптимизации",
+            options=["differential_evolution", "pso", "dual_annealing"],
+            format_func=lambda x: {
+                "differential_evolution": "Дифференциальная эволюция",
+                "pso": "Рой частиц (PSO)",
+                "dual_annealing": "Dual Annealing",
+            }[x],
+            index=0,
+        )
         maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=200, step=10)
         popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
 
     if wells_file is not None:
-        st.session_state["wells_file_name"] = wells_file.name
-        st.session_state["wells_file_bytes"] = wells_file.getvalue()
+        st.session_state["wells_file_path"] = _persist_uploaded_file(wells_file, "wells")
     if prod_file is not None:
-        st.session_state["prod_file_name"] = prod_file.name
-        st.session_state["prod_file_bytes"] = prod_file.getvalue()
+        st.session_state["prod_file_path"] = _persist_uploaded_file(prod_file, "prod")
 
-    wells_bytes = st.session_state.get("wells_file_bytes")
-    wells_name = st.session_state.get("wells_file_name")
-    if not wells_bytes or not wells_name:
+    wells_path = st.session_state.get("wells_file_path")
+    if not wells_path:
         st.info("Загрузите файл скважин, чтобы продолжить.")
         return
 
     try:
-        raw_wells = _read_table_from_bytes(wells_bytes, wells_name)
+        raw_wells = _read_table_from_path(wells_path)
         raw_prod = None
-        if st.session_state.get("prod_file_bytes") and st.session_state.get("prod_file_name"):
-            raw_prod = _read_table_from_bytes(st.session_state["prod_file_bytes"], st.session_state["prod_file_name"])
+        if st.session_state.get("prod_file_path"):
+            raw_prod = _read_table_from_path(st.session_state["prod_file_path"])
         df_wells = _clean_wells_cached(raw_wells)
         df_prod = _clean_prod_cached(raw_prod)
     except Exception as e:
@@ -589,6 +620,7 @@ def leverett_tab() -> None:
                         maxiter=maxiter,
                         popsize=popsize,
                         fixed_params=fixed_params,
+                        optimizer_method=optimizer_method,
                     )
                 except Exception as e:
                     st.error(f"Ошибка расчета: {e}")
@@ -611,6 +643,7 @@ def leverett_tab() -> None:
                         maxiter=maxiter,
                         popsize=popsize,
                         fixed_params=None,
+                        optimizer_method=optimizer_method,
                     )
                 except Exception as e:
                     st.error(f"Ошибка расчета: {e}")

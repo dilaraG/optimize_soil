@@ -1,6 +1,6 @@
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution
+from scipy.optimize import differential_evolution, dual_annealing
 from sklearn.metrics import r2_score
 
 REQUIRED_WELL_COLUMNS = [
@@ -104,12 +104,49 @@ def loss_function(params: tuple[float, float, float], df: pd.DataFrame) -> float
     return float(np.sum(weights[valid] * huber_loss(r)))
 
 
+def _pso_optimize(
+    g: pd.DataFrame,
+    bounds: list[tuple[float, float]],
+    maxiter: int = 120,
+    particles: int = 28,
+) -> tuple[float, float, float]:
+    dim = 3
+    lb = np.array([b[0] for b in bounds], dtype=float)
+    ub = np.array([b[1] for b in bounds], dtype=float)
+    rng = np.random.default_rng(42)
+    x = rng.uniform(lb, ub, size=(particles, dim))
+    v = np.zeros_like(x)
+    pbest = x.copy()
+    pbest_val = np.array([loss_function(tuple(xx), g) for xx in x], dtype=float)
+    gidx = int(np.argmin(pbest_val))
+    gbest = pbest[gidx].copy()
+    gbest_val = float(pbest_val[gidx])
+
+    w, c1, c2 = 0.72, 1.49, 1.49
+    for _ in range(maxiter):
+        r1 = rng.random((particles, dim))
+        r2 = rng.random((particles, dim))
+        v = w * v + c1 * r1 * (pbest - x) + c2 * r2 * (gbest - x)
+        x = np.clip(x + v, lb, ub)
+        vals = np.array([loss_function(tuple(xx), g) for xx in x], dtype=float)
+        better = vals < pbest_val
+        pbest[better] = x[better]
+        pbest_val[better] = vals[better]
+        cur_idx = int(np.argmin(pbest_val))
+        cur_val = float(pbest_val[cur_idx])
+        if cur_val < gbest_val:
+            gbest_val = cur_val
+            gbest = pbest[cur_idx].copy()
+    return float(gbest[0]), float(gbest[1]), float(gbest[2])
+
+
 def optimize_pvt(
     df: pd.DataFrame,
     bounds_by_pvt: dict[int, dict[str, tuple[float, float]]],
     maxiter: int = 200,
     popsize: int = 20,
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
+    optimizer_method: str = "differential_evolution",
 ) -> dict[int, tuple[float, float, float]]:
     params: dict[int, tuple[float, float, float]] = {}
     fixed = fixed_params or {}
@@ -125,8 +162,15 @@ def optimize_pvt(
             bounds_by_pvt[pvt]["b"],
             bounds_by_pvt[pvt]["sigma"],
         ]
-        result = differential_evolution(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, popsize=popsize)
-        params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
+        method = (optimizer_method or "differential_evolution").lower()
+        if method == "pso":
+            params[pvt] = _pso_optimize(g, bounds=bounds, maxiter=maxiter, particles=max(12, popsize))
+        elif method == "dual_annealing":
+            result = dual_annealing(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, seed=42)
+            params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
+        else:
+            result = differential_evolution(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, popsize=popsize)
+            params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
     return params
 
 
@@ -203,6 +247,36 @@ def prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
     return df.reset_index(drop=True)
 
 
+def _filter_training_kng(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Для обучения исключаем нулевые и выбросные Кнг_W по каждой скважине.
+    Визуализация при этом выполняется на полном датафрейме.
+    """
+    out = df.copy()
+    out["Кнг_W"] = pd.to_numeric(out["Кнг_W"], errors="coerce")
+    mask = out["Кнг_W"].notna() & (out["Кнг_W"] != 0)
+    out = out.loc[mask].copy()
+    if out.empty or "WELL_NAME" not in out.columns:
+        return out
+
+    keep_idx: list[int] = []
+    for _, g in out.groupby("WELL_NAME"):
+        x = g["Кнг_W"].to_numpy(dtype=float)
+        if len(x) < 6:
+            keep_idx.extend(g.index.tolist())
+            continue
+        q1, q3 = np.quantile(x, [0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        keep = g[(g["Кнг_W"] >= lo) & (g["Кнг_W"] <= hi)]
+        # Если фильтр слишком агрессивный, оставляем почти все кроме экстремумов по 2/98
+        if len(keep) < max(5, int(0.5 * len(g))):
+            ql, qh = np.quantile(x, [0.02, 0.98])
+            keep = g[(g["Кнг_W"] >= ql) & (g["Кнг_W"] <= qh)]
+        keep_idx.extend(keep.index.tolist())
+    return out.loc[sorted(set(keep_idx))].copy()
+
+
 def run_pipeline(
     df_wells: pd.DataFrame,
     df_prod: pd.DataFrame | None,
@@ -210,6 +284,7 @@ def run_pipeline(
     maxiter: int = 200,
     popsize: int = 20,
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
+    optimizer_method: str = "differential_evolution",
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     missing = [c for c in REQUIRED_WELL_COLUMNS if c not in df_wells.columns]
     if missing:
@@ -217,12 +292,14 @@ def run_pipeline(
 
     data = prepare_input_df(df_wells)
     data = prepare_weights(data, df_prod)
+    train_data = _filter_training_kng(data)
     params = optimize_pvt(
-        data,
+        train_data,
         bounds_by_pvt,
         maxiter=maxiter,
         popsize=popsize,
         fixed_params=fixed_params,
+        optimizer_method=optimizer_method,
     )
     result = apply_model(data, params)
     qa = compute_qa(result)
