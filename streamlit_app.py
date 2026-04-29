@@ -154,6 +154,63 @@ def _well_convergence_percent_weighted(df: pd.DataFrame) -> float:
     return float(np.sum(ww * point_score) / sw)
 
 
+def _filter_convergence_points(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Для кроссплотов: исключаем нули и выбросы Кнг_W по каждой скважине.
+    """
+    out = df.copy()
+    out["Кнг_W"] = pd.to_numeric(out["Кнг_W"], errors="coerce")
+    out["Kng_model"] = pd.to_numeric(out["Kng_model"], errors="coerce")
+    out = out.dropna(subset=["Кнг_W", "Kng_model"])
+    out = out[out["Кнг_W"] != 0]
+    if out.empty or "WELL_NAME" not in out.columns:
+        return out
+
+    keep_idx: list[int] = []
+    for _, g in out.groupby("WELL_NAME"):
+        x = g["Кнг_W"].to_numpy(dtype=float)
+        if len(x) < 6:
+            keep_idx.extend(g.index.tolist())
+            continue
+        q1, q3 = np.quantile(x, [0.25, 0.75])
+        iqr = q3 - q1
+        lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
+        keep = g[(g["Кнг_W"] >= lo) & (g["Кнг_W"] <= hi)]
+        if len(keep) < max(5, int(0.5 * len(g))):
+            ql, qh = np.quantile(x, [0.02, 0.98])
+            keep = g[(g["Кнг_W"] >= ql) & (g["Кнг_W"] <= qh)]
+        keep_idx.extend(keep.index.tolist())
+    return out.loc[sorted(set(keep_idx))].copy()
+
+
+def _well_weighted_crossplot_df(df: pd.DataFrame) -> pd.DataFrame:
+    rows = []
+    for well, g in df.groupby("WELL_NAME"):
+        y_true = pd.to_numeric(g["Кнг_W"], errors="coerce")
+        y_pred = pd.to_numeric(g["Kng_model"], errors="coerce")
+        w = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0)
+        valid = y_true.notna() & y_pred.notna()
+        if valid.sum() == 0:
+            continue
+        t = y_true[valid].to_numpy(dtype=float)
+        p = y_pred[valid].to_numpy(dtype=float)
+        ww = w[valid].to_numpy(dtype=float)
+        ws = float(np.sum(ww))
+        if ws <= 0:
+            continue
+        rows.append(
+            {
+                "WELL_NAME": str(well),
+                "Кнг_W_wmean": float(np.sum(ww * t) / ws),
+                "Kng_model_wmean": float(np.sum(ww * p) / ws),
+                "convergence_percent": _well_convergence_percent_weighted(g),
+                "points": int(valid.sum()),
+                "avg_weight": float(np.mean(ww)),
+            }
+        )
+    return pd.DataFrame(rows)
+
+
 def _default_bounds_for_pvts(pvts: list[int]) -> dict[int, dict[str, tuple[float, float]]]:
     return {pvt: {"a": (0.05, 0.30), "b": (-3.0, -0.5), "sigma": (25.0, 35.0)} for pvt in pvts}
 
@@ -702,11 +759,11 @@ def leverett_tab() -> None:
 
     region = st.selectbox("Регион (PVTNUM_GDM)", options=region_options)
     region_mask = pd.to_numeric(result_df["PVTNUM_GDM"], errors="coerce") == float(region)
-    region_df = result_df.loc[region_mask].copy()
-    region_df = region_df.dropna(subset=["Кнг_W", "Kng_model"])
+    region_df_raw = result_df.loc[region_mask].copy()
+    region_df = _filter_convergence_points(region_df_raw)
 
     if region_df.empty:
-        st.warning("Для выбранного региона нет валидных точек.")
+        st.warning("Для выбранного региона нет валидных точек сходимости (без нулей/выбросов Кнг_W).")
         return
 
     color_mode = st.radio(
@@ -757,6 +814,29 @@ def leverett_tab() -> None:
     fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
     fig_scatter.update_layout(xaxis_title="Кнг историческое (ГИС)", yaxis_title="Кнг предсказанное")
     st.plotly_chart(fig_scatter, use_container_width=True)
+
+    st.subheader("Кроссплот по скважинам (средневзвешенные значения)")
+    if "WELL_NAME" in region_df.columns:
+        cross_df = _well_weighted_crossplot_df(region_df)
+        if cross_df.empty:
+            st.info("Недостаточно данных для кроссплота по скважинам.")
+        else:
+            fig_well_cross = px.scatter(
+                cross_df,
+                x="Кнг_W_wmean",
+                y="Kng_model_wmean",
+                color="convergence_percent",
+                color_continuous_scale="Turbo",
+                hover_data=["WELL_NAME", "points", "avg_weight", "convergence_percent"],
+                title=f"PVT {region}: кроссплот по скважинам (средневзвешенно)",
+                opacity=0.85,
+            )
+            fig_well_cross.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+            fig_well_cross.update_layout(
+                xaxis_title="Кнг_W (средневзвеш.)",
+                yaxis_title="Kng_model (средневзвеш.)",
+            )
+            st.plotly_chart(fig_well_cross, use_container_width=True)
 
     st.markdown("#### Аналитика по выбранному региону")
     region_wells_count = region_df["WELL_NAME"].astype(str).nunique() if "WELL_NAME" in region_df.columns else 0
