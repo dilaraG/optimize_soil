@@ -142,6 +142,7 @@ def optimize_brooks_corey_for_region(
     envelopes: dict[str, dict[str, tuple[float, float]]] | None = None,
     maxiter: int = 180,
     popsize: int = 18,
+    initial_guess: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, float]:
     """
     Подбор параметров методом differential_evolution
@@ -218,5 +219,43 @@ def optimize_brooks_corey_for_region(
         base = float(np.sum(w[m] * huber_loss(r)))
         return base + _penalty_for_envelope(p)
 
-    res = differential_evolution(loss, bounds=de_bounds, maxiter=maxiter, popsize=popsize, seed=42)
+    # Первое приближение из корреляционных зависимостей (по облакам лабораторных точек)
+    init_guess = initial_guess or {}
+    x0 = np.array(
+        [
+            init_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[0],
+            init_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[1],
+            init_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[0],
+            init_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[1],
+            init_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[0],
+            init_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[1],
+            init_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[0],
+            init_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[1],
+        ],
+        dtype=float,
+    )
+    lb = np.array([b[0] for b in de_bounds], dtype=float)
+    ub = np.array([b[1] for b in de_bounds], dtype=float)
+    x0 = np.clip(x0, lb, ub)
+    # физика: b < 0
+    for idx in [1, 3, 5, 7]:
+        x0[idx] = min(x0[idx], -1e-3)
+    # init популяции с центром вокруг корреляционного приближения
+    rng = np.random.default_rng(42)
+    n_dim = len(de_bounds)
+    n_pop = max(popsize * n_dim, 24)
+    init_pop = rng.uniform(lb, ub, size=(n_pop, n_dim))
+    init_pop[0] = x0
+    for i in range(1, min(6, n_pop)):
+        jitter = rng.normal(0.0, 0.05, size=n_dim) * (ub - lb)
+        init_pop[i] = np.clip(x0 + jitter, lb, ub)
+
+    res = differential_evolution(
+        loss,
+        bounds=de_bounds,
+        maxiter=maxiter,
+        popsize=popsize,
+        seed=42,
+        init=init_pop,
+    )
     return {k: float(v) for k, v in zip(param_names, res.x)}

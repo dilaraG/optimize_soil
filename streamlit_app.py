@@ -1107,31 +1107,38 @@ def brooks_corey_tab() -> None:
         return
     st.caption(f"Источник лабораторных данных БК: {bc_source}")
 
-    # Используем только те данные, которые пользователь выбрал во вкладке "Лаборатория"
+    # Для источника ККД используем выбор из вкладки "Лаборатория".
+    # Для пользовательского БК-файла фильтр задается прямо во вкладке БК после сопоставления колонок.
+    use_lab_meta_filter = (bc_source != "спец-файл Брукса-Кори")
     lab_meta = st.session_state.get("lab_meta") or {}
     area_col_meta = lab_meta.get("area_col")
     horizon_col_meta = lab_meta.get("horizon_col")
     selected_areas = lab_meta.get("areas") or []
     selected_horizons = lab_meta.get("horizons") or []
-    if not area_col_meta or not horizon_col_meta or not selected_areas or not selected_horizons:
-        st.warning(
-            "Для расчета Брукса-Кори сначала во вкладке «Лаборатория» выберите площади и горизонты "
-            "и нажмите «Применить фильтр и сохранить выбор…»."
-        )
-        return
-    if area_col_meta not in bc_lab_df.columns or horizon_col_meta not in bc_lab_df.columns:
-        st.error(
-            "В лабораторном источнике БК нет колонок площади/горизонта из последнего выбора во вкладке «Лаборатория». "
-            "Переоткройте «Лаборатория», выберите корректные колонки и сохраните фильтр."
-        )
-        return
-    bc_lab_df = bc_lab_df.copy()
-    bc_lab_df[area_col_meta] = bc_lab_df[area_col_meta].astype(str).str.strip()
-    bc_lab_df[horizon_col_meta] = bc_lab_df[horizon_col_meta].astype(str).str.strip()
-    bc_lab_df = bc_lab_df[
-        bc_lab_df[area_col_meta].isin([str(x).strip() for x in selected_areas])
-        & bc_lab_df[horizon_col_meta].isin([str(x).strip() for x in selected_horizons])
-    ].copy()
+    if use_lab_meta_filter:
+        if not horizon_col_meta or not selected_horizons:
+            st.warning(
+                "Для расчета Брукса-Кори сначала во вкладке «Лаборатория» выберите горизонты "
+                "и нажмите «Применить фильтр и сохранить выбор…»."
+            )
+            return
+        if horizon_col_meta not in bc_lab_df.columns:
+            st.error(
+                "В лабораторном источнике БК нет колонки горизонта из последнего выбора во вкладке «Лаборатория». "
+                "Переоткройте «Лаборатория», выберите корректные колонки и сохраните фильтр."
+            )
+            return
+        bc_lab_df = bc_lab_df.copy()
+        bc_lab_df[horizon_col_meta] = bc_lab_df[horizon_col_meta].astype(str).str.strip()
+        hmask = bc_lab_df[horizon_col_meta].isin([str(x).strip() for x in selected_horizons])
+        if area_col_meta and area_col_meta in bc_lab_df.columns and selected_areas:
+            bc_lab_df[area_col_meta] = bc_lab_df[area_col_meta].astype(str).str.strip()
+            amask = bc_lab_df[area_col_meta].isin([str(x).strip() for x in selected_areas])
+            bc_lab_df = bc_lab_df[hmask & amask].copy()
+            st.caption("Для БК применен фильтр: горизонты + площади (из Лаборатории).")
+        else:
+            bc_lab_df = bc_lab_df[hmask].copy()
+            st.caption("Для БК применен фильтр только по горизонтам (из Лаборатории).")
     if bc_lab_df.empty:
         st.error("После применения фильтра из вкладки «Лаборатория» не осталось данных для Брукса-Кори.")
         return
@@ -1197,6 +1204,23 @@ def brooks_corey_tab() -> None:
             "У выбранного swl-столбца высокая доля нулей. Проверьте, что выбран корректный столбец "
             "(часто путают `Sw_min` с фактической водонасыщенностью образца)."
         )
+    if not use_lab_meta_filter:
+        st.caption("Для пользовательского БК-файла фильтры задаются здесь, после сопоставления колонок.")
+        areas_bc = sorted(pd.Series(bc_lab_df.get("Площадь", pd.Series(dtype=object))).dropna().astype(str).str.strip().unique().tolist()) if "Площадь" in bc_lab_df.columns else []
+        horizons_bc = sorted(pd.Series(bc_lab_df[horizon_col]).dropna().astype(str).str.strip().unique().tolist())
+        sel_h_bc = st.multiselect("Горизонты для БК", options=horizons_bc, default=horizons_bc, key="bc_self_horizons")
+        sel_a_bc = st.multiselect("Площади для БК (опционально)", options=areas_bc, default=areas_bc, key="bc_self_areas") if areas_bc else []
+        bc_lab_df[horizon_col] = bc_lab_df[horizon_col].astype(str).str.strip()
+        hmask_self = bc_lab_df[horizon_col].isin([str(x).strip() for x in sel_h_bc]) if sel_h_bc else pd.Series(False, index=bc_lab_df.index)
+        if areas_bc and sel_a_bc:
+            bc_lab_df["Площадь"] = bc_lab_df["Площадь"].astype(str).str.strip()
+            amask_self = bc_lab_df["Площадь"].isin([str(x).strip() for x in sel_a_bc])
+            bc_lab_df = bc_lab_df[hmask_self & amask_self].copy()
+        else:
+            bc_lab_df = bc_lab_df[hmask_self].copy()
+        if bc_lab_df.empty:
+            st.error("После фильтрации пользовательского БК-файла не осталось данных.")
+            return
 
     lab = bc_lab_df.copy()
     lab = lab.rename(
@@ -1244,6 +1268,80 @@ def brooks_corey_tab() -> None:
             key=f"bc_map_{p}",
         )
     st.session_state["bc_pvt_h_map"] = pvt_h_map
+
+    use_manual_bc = st.checkbox("Использовать свои коэффициенты для 4 зависимостей (без оптимизации)", value=False, key="bc_manual_mode")
+    manual_params_by_pvt: dict[int, dict[str, float]] = {}
+    if use_manual_bc:
+        st.subheader("Ввод своих коэффициентов (по каждому региону)")
+        for p in pvts:
+            with st.expander(f"PVTNUM {p}: коэффициенты", expanded=False):
+                c1, c2 = st.columns(2)
+                with c1:
+                    a_swl = st.number_input(f"a_swl | PVT {p}", value=0.2, format="%.6f", key=f"man_a_swl_{p}")
+                    a_perm = st.number_input(f"a_perm | PVT {p}", value=1.0, format="%.6f", key=f"man_a_perm_{p}")
+                    a_pvit = st.number_input(f"a_pvit | PVT {p}", value=1.0, format="%.6f", key=f"man_a_pvit_{p}")
+                    a_n = st.number_input(f"a_n | PVT {p}", value=1.0, format="%.6f", key=f"man_a_n_{p}")
+                with c2:
+                    b_swl = st.number_input(f"b_swl | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_swl_{p}")
+                    b_perm = st.number_input(f"b_perm | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_perm_{p}")
+                    b_pvit = st.number_input(f"b_pvit | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_pvit_{p}")
+                    b_n = st.number_input(f"b_n | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_n_{p}")
+                manual_params_by_pvt[p] = {
+                    "a_swl": float(a_swl),
+                    "b_swl": float(b_swl),
+                    "a_perm": float(a_perm),
+                    "b_perm": float(b_perm),
+                    "a_pvit": float(a_pvit),
+                    "b_pvit": float(b_pvit),
+                    "a_n": float(a_n),
+                    "b_n": float(b_n),
+                }
+
+        st.subheader("Предпросмотр зависимостей по введенным коэффициентам")
+        p_preview = st.selectbox("Регион для предпросмотра ручных коэффициентов", options=pvts, key="bc_manual_preview_pvt")
+        hs = pvt_h_map.get(p_preview, [])
+        if not hs:
+            st.info(f"Для PVTNUM {p_preview} не выбраны горизонты.")
+        else:
+            lsub = lab[lab["HORIZON"].isin(hs)].copy()
+            if lsub.empty:
+                st.info(f"Для PVTNUM {p_preview} нет лабораторных точек после фильтра.")
+            else:
+                prm = manual_params_by_pvt[p_preview]
+                fig1 = _plot_bc_cloud(
+                    lsub,
+                    "PORO_LAB_FRAC",
+                    "SWL_LAB",
+                    f"PVT {p_preview}: swl(poro_frac) — ручные коэффициенты",
+                    opt_ab=(prm["a_swl"], prm["b_swl"]),
+                )
+                fig2 = _plot_bc_cloud(
+                    lsub,
+                    "SWL_LAB",
+                    "PERM_LAB",
+                    f"PVT {p_preview}: perm(swl) — ручные коэффициенты",
+                    opt_ab=(prm["a_perm"], prm["b_perm"]),
+                )
+                fig3 = _plot_bc_cloud(
+                    lsub,
+                    "perm_poro",
+                    "PVIT_LAB",
+                    f"PVT {p_preview}: pvit(perm_poro) — ручные коэффициенты",
+                    opt_ab=(prm["a_pvit"], prm["b_pvit"]),
+                )
+                fig4 = _plot_bc_cloud(
+                    lsub,
+                    "perm_poro",
+                    "N_LAB",
+                    f"PVT {p_preview}: n(perm_poro) — ручные коэффициенты",
+                    opt_ab=(prm["a_n"], prm["b_n"]),
+                )
+                c1, c2 = st.columns(2)
+                c1.plotly_chart(fig1, use_container_width=True)
+                c2.plotly_chart(fig2, use_container_width=True)
+                c3, c4 = st.columns(2)
+                c3.plotly_chart(fig3, use_container_width=True)
+                c4.plotly_chart(fig4, use_container_width=True)
 
     if st.button("Рассчитать Брукса-Кори", type="primary"):
         if any(not pvt_h_map.get(p) for p in pvts):
@@ -1295,13 +1393,22 @@ def brooks_corey_tab() -> None:
                     "x": lsub["perm_poro"].to_numpy(dtype=float),
                 },
             }
-            params = optimize_brooks_corey_for_region(
-                g,
-                bounds=bounds,
-                envelopes=envelopes,
-                maxiter=maxiter,
-                popsize=popsize,
-            )
+            if use_manual_bc:
+                params = manual_params_by_pvt.get(p, {})
+            else:
+                params = optimize_brooks_corey_for_region(
+                    g,
+                    bounds=bounds,
+                    envelopes=envelopes,
+                    maxiter=maxiter,
+                    popsize=popsize,
+                    initial_guess={
+                        "swl": swl_info.get("center"),
+                        "perm": perm_info.get("center"),
+                        "pvit": pvit_info.get("center"),
+                        "n": n_info.get("center"),
+                    },
+                )
             elapsed = float(time.perf_counter() - t0_pvt)
             if not params:
                 continue
