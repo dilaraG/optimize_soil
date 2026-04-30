@@ -14,6 +14,8 @@ from brooks_corey import (
     PowerBounds,
     auto_power_bounds,
     compute_soil_from_params,
+    envelope_max_violation,
+    evaluate_brooks_score,
     optimize_brooks_corey_for_region,
     prepare_brooks_training_data,
 )
@@ -1396,6 +1398,26 @@ def brooks_corey_tab() -> None:
             if use_manual_bc:
                 params = manual_params_by_pvt.get(p, {})
             else:
+                baseline = {
+                    "a_swl": 0.2,
+                    "b_swl": -0.5,
+                    "a_perm": 1.0,
+                    "b_perm": -0.5,
+                    "a_pvit": 1.0,
+                    "b_pvit": -0.5,
+                    "a_n": 1.0,
+                    "b_n": -0.5,
+                }
+                corr = {
+                    "a_swl": float(swl_info.get("center")[0]),
+                    "b_swl": float(swl_info.get("center")[1]),
+                    "a_perm": float(perm_info.get("center")[0]),
+                    "b_perm": float(perm_info.get("center")[1]),
+                    "a_pvit": float(pvit_info.get("center")[0]),
+                    "b_pvit": float(pvit_info.get("center")[1]),
+                    "a_n": float(n_info.get("center")[0]),
+                    "b_n": float(n_info.get("center")[1]),
+                }
                 params = optimize_brooks_corey_for_region(
                     g,
                     bounds=bounds,
@@ -1408,7 +1430,19 @@ def brooks_corey_tab() -> None:
                         "pvit": pvit_info.get("center"),
                         "n": n_info.get("center"),
                     },
+                    baseline_params=baseline,
                 )
+                # Финальный выбор по SCORE региона: авто/корреляция/дефолт
+                cand = [("auto", params), ("corr", corr), ("default", baseline)]
+                best_name, best_params, best_score = None, None, -np.inf
+                for nm, cp in cand:
+                    if envelope_max_violation(cp, envelopes) > 1e-9:
+                        continue
+                    score = evaluate_brooks_score(g, cp)
+                    if score > best_score:
+                        best_name, best_params, best_score = nm, cp, score
+                if best_params is not None:
+                    params = best_params
             elapsed = float(time.perf_counter() - t0_pvt)
             if not params:
                 continue

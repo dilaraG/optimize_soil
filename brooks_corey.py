@@ -105,6 +105,54 @@ def compute_soil_from_params(df: pd.DataFrame, params: dict[str, float]) -> np.n
     return out
 
 
+def evaluate_brooks_score(df: pd.DataFrame, params: dict[str, float]) -> float:
+    y_true = pd.to_numeric(df["Кнг_W"], errors="coerce").to_numpy()
+    w = pd.to_numeric(df.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
+    y_pred = compute_soil_from_params(df, params)
+    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
+    if m.sum() == 0:
+        return -np.inf
+    denom = float(np.sum(w[m]))
+    if denom <= 0:
+        return -np.inf
+    return float(1 - (np.sum(w[m] * np.abs(y_pred[m] - y_true[m])) / denom))
+
+
+def envelope_max_violation(
+    params: dict[str, float],
+    envelopes: dict[str, dict[str, tuple[float, float]]] | None,
+) -> float:
+    """
+    Максимальное нарушение огибающих для 4 зависимостей.
+    0.0 -> внутри огибающих.
+    """
+    if not envelopes:
+        return 0.0
+    vmax = 0.0
+    for key, a_name, b_name in [
+        ("swl", "a_swl", "b_swl"),
+        ("perm", "a_perm", "b_perm"),
+        ("pvit", "a_pvit", "b_pvit"),
+        ("n", "a_n", "b_n"),
+    ]:
+        if key not in envelopes:
+            continue
+        env = envelopes[key]
+        x = np.asarray(env.get("x"), dtype=float)
+        x = x[np.isfinite(x) & (x > 0)]
+        if len(x) == 0:
+            continue
+        lo_a, lo_b = env["lower"]
+        up_a, up_b = env["upper"]
+        y = _power(x, float(params[a_name]), float(params[b_name]))
+        ylo = _power(x, lo_a, lo_b)
+        yhi = _power(x, up_a, up_b)
+        v = np.maximum(0.0, np.minimum(ylo, yhi) - y) + np.maximum(0.0, y - np.maximum(ylo, yhi))
+        if np.isfinite(v).any():
+            vmax = max(vmax, float(np.nanmax(v)))
+    return vmax
+
+
 def prepare_brooks_training_data(df_wells: pd.DataFrame, df_prod: pd.DataFrame | None) -> pd.DataFrame:
     """
     Такая же предобработка как для J-функции: prepare_input_df + prepare_weights.
@@ -143,6 +191,7 @@ def optimize_brooks_corey_for_region(
     maxiter: int = 180,
     popsize: int = 18,
     initial_guess: dict[str, tuple[float, float]] | None = None,
+    baseline_params: dict[str, float] | None = None,
 ) -> dict[str, float]:
     """
     Подбор параметров методом differential_evolution
@@ -258,4 +307,38 @@ def optimize_brooks_corey_for_region(
         seed=42,
         init=init_pop,
     )
-    return {k: float(v) for k, v in zip(param_names, res.x)}
+    best = {k: float(v) for k, v in zip(param_names, res.x)}
+    best_val = float(loss(np.array([best[k] for k in param_names], dtype=float)))
+
+    # Fallback: сравниваем с базовыми наборами коэффициентов и берём лучший
+    candidates: list[dict[str, float]] = []
+    if baseline_params:
+        candidates.append({k: float(baseline_params[k]) for k in param_names if k in baseline_params})
+    if initial_guess:
+        ig = {
+            "a_swl": float(initial_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[0]),
+            "b_swl": float(initial_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[1]),
+            "a_perm": float(initial_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[0]),
+            "b_perm": float(initial_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[1]),
+            "a_pvit": float(initial_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[0]),
+            "b_pvit": float(initial_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[1]),
+            "a_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[0]),
+            "b_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[1]),
+        }
+        candidates.append(ig)
+
+    lb = np.array([b[0] for b in de_bounds], dtype=float)
+    ub = np.array([b[1] for b in de_bounds], dtype=float)
+    for cand in candidates:
+        if len(cand) < len(param_names):
+            continue
+        vec = np.array([cand[k] for k in param_names], dtype=float)
+        vec = np.clip(vec, lb, ub)
+        for idx in [1, 3, 5, 7]:
+            vec[idx] = min(vec[idx], -1e-3)
+        val = float(loss(vec))
+        if val < best_val:
+            best_val = val
+            best = {k: float(v) for k, v in zip(param_names, vec)}
+
+    return best
