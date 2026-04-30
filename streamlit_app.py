@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -9,6 +10,13 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from brooks_corey import (
+    PowerBounds,
+    auto_power_bounds,
+    compute_soil_from_params,
+    optimize_brooks_corey_for_region,
+    prepare_brooks_training_data,
+)
 from kkd_database import build_kkd_sqlite, excel_path, load_kkd_dataframe, sqlite_path
 from lab_analysis import (
     auto_ab_bounds_from_cloud,
@@ -211,6 +219,43 @@ def _well_weighted_crossplot_df(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _compute_qa_metrics(df: pd.DataFrame, true_col: str, pred_col: str) -> pd.DataFrame:
+    rows = []
+    for pvt_raw, g in df.groupby("PVTNUM_GDM"):
+        y_true = pd.to_numeric(g[true_col], errors="coerce").to_numpy()
+        y_pred = pd.to_numeric(g[pred_col], errors="coerce").to_numpy()
+        w = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
+        m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
+        if m.sum() == 0:
+            continue
+        yt = y_true[m]
+        yp = y_pred[m]
+        ww = w[m]
+        err = yp - yt
+        mae = float(np.average(np.abs(err), weights=ww))
+        rmse = float(np.sqrt(np.average(err**2, weights=ww)))
+        bias = float(np.average(err, weights=ww))
+        score = float(1 - (np.sum(ww * np.abs(err)) / np.sum(ww)))
+        # локально, чтобы не тащить импорт сверху второй раз
+        from sklearn.metrics import r2_score
+
+        r2 = float(r2_score(yt, yp)) if len(yt) > 1 else np.nan
+        rows.append(
+            {
+                "PVTNUM_GDM": int(float(pvt_raw)),
+                "MAE": mae,
+                "RMSE": rmse,
+                "BIAS": bias,
+                "R2": r2,
+                "SCORE": score,
+            }
+        )
+    qa = pd.DataFrame(rows)
+    if not qa.empty:
+        qa = qa.sort_values("PVTNUM_GDM").reset_index(drop=True)
+    return qa
+
+
 def _default_bounds_for_pvts(pvts: list[int]) -> dict[int, dict[str, tuple[float, float]]]:
     return {pvt: {"a": (0.05, 0.30), "b": (-3.0, -0.5), "sigma": (25.0, 35.0)} for pvt in pvts}
 
@@ -267,6 +312,120 @@ def _validate_columns(df_wells: pd.DataFrame, df_prod: pd.DataFrame | None) -> l
 def _load_kkd_cached(db_path: str, mtime: float) -> pd.DataFrame:
     _ = mtime
     return load_kkd_dataframe(db_path)
+
+
+def _guess_col(cols: list[str], candidates: list[str]) -> str:
+    upper = {c.upper(): c for c in cols}
+    for cand in candidates:
+        for uc, orig in upper.items():
+            if cand in uc:
+                return orig
+    return cols[0]
+
+
+def _add_pvit_n_if_missing(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Если в лабораторной таблице нет Pvit/n, пытаемся рассчитать их по группам
+    (скважина+образец) из зависимости ln(Pc)=ln(Pvit)-n*ln(Swn).
+    """
+    out = df.copy()
+    if "Pvit" in out.columns and "n" in out.columns:
+        return out
+
+    cols = list(out.columns)
+    swn_col = "Swn" if "Swn" in out.columns else ("Swn.1" if "Swn.1" in out.columns else None)
+    pc_col = None
+    for c in cols:
+        cc = str(c).replace("\n", " ").strip().lower()
+        if "капиллярное давление" in cc:
+            pc_col = c
+            break
+    well_col = "Скважина" if "Скважина" in out.columns else None
+    sample_cols = [c for c in ["Номер образца", "Порядковый номер образца"] if c in out.columns]
+    if swn_col is None or pc_col is None or well_col is None or not sample_cols:
+        return out
+
+    out["_swn_tmp"] = pd.to_numeric(out[swn_col], errors="coerce")
+    out["_pc_tmp"] = pd.to_numeric(out[pc_col], errors="coerce")
+    pvit = pd.Series(np.nan, index=out.index, dtype=float)
+    nval = pd.Series(np.nan, index=out.index, dtype=float)
+    group_cols = [well_col] + sample_cols
+
+    for _, g in out.groupby(group_cols, dropna=False):
+        m = np.isfinite(g["_swn_tmp"]) & np.isfinite(g["_pc_tmp"]) & (g["_swn_tmp"] > 0) & (g["_pc_tmp"] > 0)
+        gg = g.loc[m]
+        if len(gg) < 3:
+            continue
+        x = np.log(gg["_swn_tmp"].to_numpy(dtype=float))
+        y = np.log(gg["_pc_tmp"].to_numpy(dtype=float))
+        slope, intercept = np.polyfit(x, y, 1)
+        n_est = -float(slope)
+        pvit_est = float(np.exp(intercept))
+        if np.isfinite(n_est) and np.isfinite(pvit_est) and n_est > 0 and pvit_est > 0:
+            pvit.loc[g.index] = pvit_est
+            nval.loc[g.index] = n_est
+
+    out["Pvit"] = pvit
+    out["n"] = nval
+    out = out.drop(columns=["_swn_tmp", "_pc_tmp"])
+    return out
+
+
+def _get_bc_source_df() -> tuple[pd.DataFrame | None, str]:
+    """
+    Приоритет источников БК:
+    1) Загруженный спец-файл БК
+    2) Первый загруженный файл лаборатории (ККД) / данные из БД
+    3) Существующая БД
+    """
+    bc = st.session_state.get("bc_lab_df")
+    if isinstance(bc, pd.DataFrame) and not bc.empty:
+        return _add_pvit_n_if_missing(_normalize_columns(bc)), "спец-файл Брукса-Кори"
+
+    try:
+        db_file = sqlite_path()
+        if db_file.is_file():
+            kkd_df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
+            if isinstance(kkd_df, pd.DataFrame) and not kkd_df.empty:
+                kkd_df = _add_pvit_n_if_missing(_normalize_columns(kkd_df))
+                st.session_state["bc_lab_df"] = kkd_df
+                return kkd_df, "файл/БД ККД"
+    except Exception:
+        pass
+    return None, ""
+
+
+def _power_curve_from_ab(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
+        y = a * (x**b)
+    return np.nan_to_num(y, nan=np.nan, posinf=np.nan, neginf=np.nan)
+
+
+def _plot_bc_cloud(
+    df: pd.DataFrame,
+    x_col: str,
+    y_col: str,
+    title: str,
+    lower_ab: tuple[float, float] | None = None,
+    upper_ab: tuple[float, float] | None = None,
+    opt_ab: tuple[float, float] | None = None,
+) -> go.Figure:
+    fig = px.scatter(df, x=x_col, y=y_col, color="HORIZON" if "HORIZON" in df.columns else None, opacity=0.65, title=title)
+    x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
+    x = x[np.isfinite(x) & (x > 0)]
+    if len(x) == 0:
+        return fig
+    grid = np.linspace(float(np.min(x)), float(np.max(x)), 150)
+    if lower_ab is not None:
+        yl = _power_curve_from_ab(grid, lower_ab[0], lower_ab[1])
+        fig.add_trace(go.Scatter(x=grid, y=yl, mode="lines", name=f"Нижняя: a={lower_ab[0]:.3g}, b={lower_ab[1]:.3g}", line=dict(color="steelblue", dash="dash")))
+    if upper_ab is not None:
+        yu = _power_curve_from_ab(grid, upper_ab[0], upper_ab[1])
+        fig.add_trace(go.Scatter(x=grid, y=yu, mode="lines", name=f"Верхняя: a={upper_ab[0]:.3g}, b={upper_ab[1]:.3g}", line=dict(color="darkorange", dash="dashdot")))
+    if opt_ab is not None:
+        yo = _power_curve_from_ab(grid, opt_ab[0], opt_ab[1])
+        fig.add_trace(go.Scatter(x=grid, y=yo, mode="lines", name=f"Оптимальная: a={opt_ab[0]:.3g}, b={opt_ab[1]:.3g}", line=dict(color="crimson", width=3)))
+    return fig
 
 
 def _fig_j_swn_lab(
@@ -455,6 +614,22 @@ def laboratory_tab() -> None:
         fit = fit_power_j_swn(filt["Swn"].to_numpy(), filt["J_lab"].to_numpy())
         st.session_state["lab_trend_fit"] = fit
         st.success(f"Сохранено точек: {len(filt)}. Лаб. тренд: a={fit.get('a')}, b={fit.get('b')}, R²={fit.get('r2')}")
+
+    st.divider()
+    st.subheader("Лаборатория: загрузка данных для метода Брукса-Кори")
+    bc_file = st.file_uploader(
+        "Загрузить таблицу лабораторных точек (файл зависимости_оболако_точек)",
+        type=["csv", "xlsx", "xls"],
+        key="bc_lab_upload",
+    )
+    if bc_file is not None:
+        try:
+            bc_df = _read_table(bc_file)
+            bc_df = _add_pvit_n_if_missing(_normalize_columns(bc_df))
+            st.session_state["bc_lab_df"] = bc_df
+            st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк")
+        except Exception as e:
+            st.error(f"Ошибка загрузки данных Брукса-Кори: {e}")
 
     cloud = st.session_state.get("lab_cloud")
     if cloud is None or cloud.empty:
@@ -922,12 +1097,422 @@ def leverett_tab() -> None:
     c5.download_button("Скачать метрики", data=csv_qa, file_name="leverett_metrics.csv", mime="text/csv")
 
 
+def brooks_corey_tab() -> None:
+    st.title("Метод Брукса-Кори")
+    st.write("Подбор 4 степенных зависимостей: swl(poro), perm(swl), pvit(perm/poro), n(perm/poro).")
+
+    bc_lab_df, bc_source = _get_bc_source_df()
+    if bc_lab_df is None or bc_lab_df.empty:
+        st.info("Нет данных для Брукса-Кори: загрузите файл ККД/БК во вкладке «Лаборатория» или убедитесь, что доступна БД.")
+        return
+    st.caption(f"Источник лабораторных данных БК: {bc_source}")
+
+    # Используем только те данные, которые пользователь выбрал во вкладке "Лаборатория"
+    lab_meta = st.session_state.get("lab_meta") or {}
+    area_col_meta = lab_meta.get("area_col")
+    horizon_col_meta = lab_meta.get("horizon_col")
+    selected_areas = lab_meta.get("areas") or []
+    selected_horizons = lab_meta.get("horizons") or []
+    if not area_col_meta or not horizon_col_meta or not selected_areas or not selected_horizons:
+        st.warning(
+            "Для расчета Брукса-Кори сначала во вкладке «Лаборатория» выберите площади и горизонты "
+            "и нажмите «Применить фильтр и сохранить выбор…»."
+        )
+        return
+    if area_col_meta not in bc_lab_df.columns or horizon_col_meta not in bc_lab_df.columns:
+        st.error(
+            "В лабораторном источнике БК нет колонок площади/горизонта из последнего выбора во вкладке «Лаборатория». "
+            "Переоткройте «Лаборатория», выберите корректные колонки и сохраните фильтр."
+        )
+        return
+    bc_lab_df = bc_lab_df.copy()
+    bc_lab_df[area_col_meta] = bc_lab_df[area_col_meta].astype(str).str.strip()
+    bc_lab_df[horizon_col_meta] = bc_lab_df[horizon_col_meta].astype(str).str.strip()
+    bc_lab_df = bc_lab_df[
+        bc_lab_df[area_col_meta].isin([str(x).strip() for x in selected_areas])
+        & bc_lab_df[horizon_col_meta].isin([str(x).strip() for x in selected_horizons])
+    ].copy()
+    if bc_lab_df.empty:
+        st.error("После применения фильтра из вкладки «Лаборатория» не осталось данных для Брукса-Кори.")
+        return
+    st.caption(f"Для БК используется отфильтрованная лабораторная выборка: {len(bc_lab_df)} строк.")
+
+    with st.sidebar:
+        st.header("Геологическая модель для Брукса-Кори")
+        wells_file = st.file_uploader("Файл скважин (для БК)", type=["csv", "xlsx", "xls", "txt"], key="bc_wells_file")
+        prod_file = st.file_uploader("Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key="bc_prod_file")
+        maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=180, step=10, key="bc_maxiter")
+        popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=18, step=1, key="bc_popsize")
+
+    if wells_file is not None:
+        st.session_state["bc_wells_path"] = _persist_uploaded_file(wells_file, "bc_wells")
+    if prod_file is not None:
+        st.session_state["bc_prod_path"] = _persist_uploaded_file(prod_file, "bc_prod")
+    wells_path = st.session_state.get("bc_wells_path")
+    if not wells_path:
+        st.info("Загрузите файл скважин для расчета Брукса-Кори.")
+        return
+
+    try:
+        df_geo_raw = _clean_wells_cached(_read_table_from_path(wells_path))
+        df_prod = _clean_prod_cached(_read_table_from_path(st.session_state["bc_prod_path"])) if st.session_state.get("bc_prod_path") else None
+        df_geo = prepare_brooks_training_data(df_geo_raw, df_prod)
+    except Exception as e:
+        st.error(f"Ошибка чтения геологической модели: {e}")
+        return
+
+    required = {"PORO_GDM", "PC", "Кнг_W", "PVTNUM_GDM"}
+    missing = [c for c in required if c not in df_geo.columns]
+    if missing:
+        st.error(f"В файле геомодели отсутствуют колонки: {missing}")
+        return
+
+    if "weight" not in df_geo.columns:
+        df_geo["weight"] = 1.0
+
+    st.subheader("Сопоставление колонок лабораторной таблицы Брукса-Кори")
+    st.caption("Предпросмотр исходной лабораторной таблицы (первые строки):")
+    st.dataframe(bc_lab_df.head(12), use_container_width=True)
+    cols = list(bc_lab_df.columns)
+    c1, c2, c3 = st.columns(3)
+    horizon_col = c1.selectbox("Код горизонта", cols, index=cols.index(_guess_col(cols, ["ГОРИЗ", "HORIZ", "КОД"])))
+    poro_col = c2.selectbox("Poro (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PORO", "ПОР"])))
+    swl_col = c3.selectbox("Swi/Swl (лаборатория)", cols, index=cols.index(_guess_col(cols, ["SWL", "SWI", "ВОДОНАС"])))
+    c4, c5, c6 = st.columns(3)
+    perm_col = c4.selectbox("Perm (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PERM", "ПРОНИ"])))
+    pvit_col = c5.selectbox("Pvit (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PVIT", "PENTRY", "PВХ"])))
+    n_col = c6.selectbox("n (лаборатория)", cols, index=cols.index(_guess_col(cols, [" N", "LAMB", "ПОКАЗ", "N_"])))
+    st.caption(
+        f"В расчетах БК используются выбранные столбцы: горизонт=`{horizon_col}`, poro=`{poro_col}`, "
+        f"swl=`{swl_col}`, perm=`{perm_col}`, pvit=`{pvit_col}`, n=`{n_col}`."
+    )
+    swl_dbg = pd.to_numeric(bc_lab_df[swl_col], errors="coerce")
+    swl_zero_share = float((swl_dbg == 0).mean()) if swl_dbg.notna().sum() > 0 else np.nan
+    d1, d2, d3 = st.columns(3)
+    d1.metric("swl min", f"{swl_dbg.min():.4g}" if swl_dbg.notna().sum() else "nan")
+    d2.metric("swl max", f"{swl_dbg.max():.4g}" if swl_dbg.notna().sum() else "nan")
+    d3.metric("доля нулей swl", f"{100*swl_zero_share:.2f}%" if np.isfinite(swl_zero_share) else "nan")
+    if np.isfinite(swl_zero_share) and swl_zero_share > 0.25:
+        st.warning(
+            "У выбранного swl-столбца высокая доля нулей. Проверьте, что выбран корректный столбец "
+            "(часто путают `Sw_min` с фактической водонасыщенностью образца)."
+        )
+
+    lab = bc_lab_df.copy()
+    lab = lab.rename(
+        columns={
+            horizon_col: "HORIZON",
+            poro_col: "PORO_LAB",
+            swl_col: "SWL_LAB",
+            perm_col: "PERM_LAB",
+            pvit_col: "PVIT_LAB",
+            n_col: "N_LAB",
+        }
+    )
+    for c in ["PORO_LAB", "SWL_LAB", "PERM_LAB", "PVIT_LAB", "N_LAB"]:
+        lab[c] = pd.to_numeric(lab[c], errors="coerce")
+    # Пористость в долях (<1) для всех формул
+    lab["PORO_LAB_FRAC"] = np.where(lab["PORO_LAB"] > 1, lab["PORO_LAB"] / 100.0, lab["PORO_LAB"])
+    lab["perm_poro"] = np.sqrt(lab["PERM_LAB"] / lab["PORO_LAB_FRAC"].replace(0, np.nan))
+    lab = lab.dropna(subset=["PORO_LAB_FRAC", "SWL_LAB", "PERM_LAB", "PVIT_LAB", "N_LAB", "perm_poro"])
+    lab = lab[
+        (lab["PORO_LAB_FRAC"] > 0)
+        & (lab["SWL_LAB"] > 0)
+        & (lab["PERM_LAB"] > 0)
+        & (lab["PVIT_LAB"] > 0)
+        & (lab["N_LAB"] > 0)
+        & (lab["perm_poro"] > 0)
+    ]
+    # Для БК используем только одну строку на каждый образец каждой скважины
+    dedup_keys = [c for c in ["Скважина", "Номер образца", "Порядковый номер образца"] if c in lab.columns]
+    if dedup_keys:
+        lab = lab.sort_values(dedup_keys).drop_duplicates(subset=dedup_keys, keep="first").reset_index(drop=True)
+    lab["HORIZON"] = lab["HORIZON"].astype(str).str.strip()
+    st.caption("Подготовленная таблица для БК (с новыми столбцами и фильтром 1 строка на образец/скважину):")
+    preview_cols = [c for c in ["Скважина", "Номер образца", "Порядковый номер образца", "HORIZON", "PORO_LAB_FRAC", "SWL_LAB", "PERM_LAB", "perm_poro", "PVIT_LAB", "N_LAB"] if c in lab.columns]
+    st.dataframe(lab[preview_cols].head(20), use_container_width=True)
+
+    pvts = sorted(pd.to_numeric(df_geo["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
+    horizons = sorted(lab["HORIZON"].unique().tolist())
+    st.subheader("Связь горизонт -> PVTNUM (Брукса-Кори)")
+    pvt_h_map = st.session_state.get("bc_pvt_h_map", {})
+    for p in pvts:
+        pvt_h_map[p] = st.multiselect(
+            f"Горизонты для PVTNUM {p}",
+            options=horizons,
+            default=pvt_h_map.get(p, []),
+            key=f"bc_map_{p}",
+        )
+    st.session_state["bc_pvt_h_map"] = pvt_h_map
+
+    if st.button("Рассчитать Брукса-Кори", type="primary"):
+        if any(not pvt_h_map.get(p) for p in pvts):
+            st.error("Выберите горизонты для каждого PVTNUM.")
+            return
+
+        results = []
+        params_rows = []
+        bc_meta = {}
+        timing_rows = []
+        t0_total = time.perf_counter()
+        for p in pvts:
+            t0_pvt = time.perf_counter()
+            g = df_geo[pd.to_numeric(df_geo["PVTNUM_GDM"], errors="coerce") == float(p)].copy()
+            h = pvt_h_map[p]
+            lsub = lab[lab["HORIZON"].isin(h)].copy()
+            if g.empty or lsub.empty:
+                continue
+
+            swl_info = auto_power_bounds(lsub["PORO_LAB_FRAC"].to_numpy(), lsub["SWL_LAB"].to_numpy())
+            perm_info = auto_power_bounds(lsub["SWL_LAB"].to_numpy(), lsub["PERM_LAB"].to_numpy())
+            pvit_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["PVIT_LAB"].to_numpy())
+            n_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["N_LAB"].to_numpy())
+            b_swl = swl_info["bounds"]
+            b_perm = perm_info["bounds"]
+            b_pvit = pvit_info["bounds"]
+            b_n = n_info["bounds"]
+
+            bounds = {"swl": b_swl, "perm": b_perm, "pvit": b_pvit, "n": b_n}
+            envelopes = {
+                "swl": {
+                    "lower": swl_info["lower"],
+                    "upper": swl_info["upper"],
+                    "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float),
+                },
+                "perm": {
+                    "lower": perm_info["lower"],
+                    "upper": perm_info["upper"],
+                    "x": lsub["SWL_LAB"].to_numpy(dtype=float),
+                },
+                "pvit": {
+                    "lower": pvit_info["lower"],
+                    "upper": pvit_info["upper"],
+                    "x": lsub["perm_poro"].to_numpy(dtype=float),
+                },
+                "n": {
+                    "lower": n_info["lower"],
+                    "upper": n_info["upper"],
+                    "x": lsub["perm_poro"].to_numpy(dtype=float),
+                },
+            }
+            params = optimize_brooks_corey_for_region(
+                g,
+                bounds=bounds,
+                envelopes=envelopes,
+                maxiter=maxiter,
+                popsize=popsize,
+            )
+            elapsed = float(time.perf_counter() - t0_pvt)
+            if not params:
+                continue
+            pred = compute_soil_from_params(g, params)
+            g["Kng_BC_model"] = pred
+            results.append(g)
+            params_rows.append({"PVTNUM_GDM": p, **params})
+            timing_rows.append(
+                {
+                    "PVTNUM_GDM": int(p),
+                    "rows_geo": int(len(g)),
+                    "rows_lab": int(len(lsub)),
+                    "elapsed_sec": elapsed,
+                }
+            )
+            bc_meta[p] = {
+                "lab": lsub.copy(),
+                "bounds": bounds,
+                "centers": {
+                    "swl": swl_info.get("center"),
+                    "perm": perm_info.get("center"),
+                    "pvit": pvit_info.get("center"),
+                    "n": n_info.get("center"),
+                },
+                "envelopes": {
+                    "swl": {"lower": swl_info.get("lower"), "upper": swl_info.get("upper"), "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float)},
+                    "perm": {"lower": perm_info.get("lower"), "upper": perm_info.get("upper"), "x": lsub["SWL_LAB"].to_numpy(dtype=float)},
+                    "pvit": {"lower": pvit_info.get("lower"), "upper": pvit_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
+                    "n": {"lower": n_info.get("lower"), "upper": n_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
+                },
+            }
+
+        if not results:
+            st.error("Не удалось рассчитать параметры Брукса-Кори.")
+            return
+        bc_res = pd.concat(results, ignore_index=True)
+        bc_params = pd.DataFrame(params_rows)
+        bc_qa = _compute_qa_metrics(bc_res, "Кнг_W", "Kng_BC_model")
+        bc_timing = pd.DataFrame(timing_rows).sort_values("PVTNUM_GDM").reset_index(drop=True) if timing_rows else pd.DataFrame()
+        total_elapsed = float(time.perf_counter() - t0_total)
+        st.session_state["bc_result_df"] = bc_res
+        st.session_state["bc_params_df"] = bc_params
+        st.session_state["bc_qa_df"] = bc_qa
+        st.session_state["bc_timing_df"] = bc_timing
+        st.session_state["bc_total_elapsed_sec"] = total_elapsed
+        st.session_state["bc_meta"] = bc_meta
+        st.success("Расчет Брукса-Кори завершен.")
+
+    bc_res: pd.DataFrame | None = st.session_state.get("bc_result_df")
+    bc_params: pd.DataFrame | None = st.session_state.get("bc_params_df")
+    bc_qa: pd.DataFrame | None = st.session_state.get("bc_qa_df")
+    bc_timing: pd.DataFrame | None = st.session_state.get("bc_timing_df")
+    bc_total_elapsed = st.session_state.get("bc_total_elapsed_sec")
+    if bc_res is None or bc_params is None or bc_res.empty:
+        return
+
+    cpar, cqa = st.columns(2)
+    with cpar:
+        st.subheader("Параметры Брукса-Кори по регионам")
+        st.dataframe(bc_params.round(3), use_container_width=True)
+    with cqa:
+        st.subheader("Метрики качества Брукса-Кори")
+        if bc_qa is not None and not bc_qa.empty:
+            st.dataframe(bc_qa.round(3), use_container_width=True)
+            st.metric("GLOBAL SCORE (БК)", f"{bc_qa['SCORE'].mean():.3f}")
+            if bc_timing is not None and not bc_timing.empty:
+                st.subheader("Статистика времени расчета БК")
+                st.dataframe(bc_timing.round(3), use_container_width=True)
+                if bc_total_elapsed is not None:
+                    st.metric("Общее время расчета БК, сек", f"{float(bc_total_elapsed):.2f}")
+        else:
+            st.info("Метрики пока недоступны.")
+
+    pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
+    psel = st.selectbox("Регион для графиков БК", pvt_opts, key="bc_plot_pvt")
+    g = bc_res[pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce") == float(psel)].copy()
+    g = g.dropna(subset=["Кнг_W", "Kng_BC_model"])
+    if g.empty:
+        return
+
+    bc_meta = st.session_state.get("bc_meta", {})
+    m = bc_meta.get(psel, {})
+    lab_pvt = m.get("lab", pd.DataFrame()).copy()
+    if not lab_pvt.empty:
+        st.subheader("Оптимальные зависимости Брукса-Кори по облакам")
+        horizons_for_plot = sorted(lab_pvt["HORIZON"].astype(str).unique().tolist())
+        selected_h = st.multiselect(
+            "Горизонты для отображения зависимостей",
+            options=horizons_for_plot,
+            default=horizons_for_plot,
+            key="bc_h_plot",
+        )
+        lab_plot = lab_pvt[lab_pvt["HORIZON"].astype(str).isin(selected_h)] if selected_h else lab_pvt
+        prow = bc_params[bc_params["PVTNUM_GDM"].astype(int) == int(psel)]
+        if not prow.empty and not lab_plot.empty:
+            pp = prow.iloc[0]
+            env = m.get("envelopes", {})
+            fig1 = _plot_bc_cloud(
+                lab_plot,
+                "PORO_LAB_FRAC",
+                "SWL_LAB",
+                f"PVT {psel}: swl(poro_frac)",
+                lower_ab=env.get("swl", {}).get("lower"),
+                upper_ab=env.get("swl", {}).get("upper"),
+                opt_ab=(float(pp["a_swl"]), float(pp["b_swl"])),
+            )
+            fig2 = _plot_bc_cloud(
+                lab_plot,
+                "SWL_LAB",
+                "PERM_LAB",
+                f"PVT {psel}: perm(swl)",
+                lower_ab=env.get("perm", {}).get("lower"),
+                upper_ab=env.get("perm", {}).get("upper"),
+                opt_ab=(float(pp["a_perm"]), float(pp["b_perm"])),
+            )
+            fig3 = _plot_bc_cloud(
+                lab_plot,
+                "perm_poro",
+                "PVIT_LAB",
+                f"PVT {psel}: pvit(perm_poro)",
+                lower_ab=env.get("pvit", {}).get("lower"),
+                upper_ab=env.get("pvit", {}).get("upper"),
+                opt_ab=(float(pp["a_pvit"]), float(pp["b_pvit"])),
+            )
+            fig4 = _plot_bc_cloud(
+                lab_plot,
+                "perm_poro",
+                "N_LAB",
+                f"PVT {psel}: n(perm_poro)",
+                lower_ab=env.get("n", {}).get("lower"),
+                upper_ab=env.get("n", {}).get("upper"),
+                opt_ab=(float(pp["a_n"]), float(pp["b_n"])),
+            )
+            c1, c2 = st.columns(2)
+            c1.plotly_chart(fig1, use_container_width=True)
+            c2.plotly_chart(fig2, use_container_width=True)
+            c3, c4 = st.columns(2)
+            c3.plotly_chart(fig3, use_container_width=True)
+            c4.plotly_chart(fig4, use_container_width=True)
+
+    st.subheader("Кроссплоты Брукса-Кори")
+    g_conv = _filter_convergence_points(g.rename(columns={"Kng_BC_model": "Kng_model"})).rename(columns={"Kng_model": "Kng_BC_model"})
+    if g_conv.empty:
+        st.warning("Нет валидных точек сходимости для кроссплотов БК.")
+        return
+    bc_color_mode = st.radio("Палитра БК", options=("По весу", "По толщине"), horizontal=True, key="bc_scatter_color")
+    depth_col = _pick_depth_column(g_conv)
+    if bc_color_mode == "По толщине" and depth_col is not None and "WELL_NAME" in g_conv.columns:
+        g_conv[depth_col] = pd.to_numeric(g_conv[depth_col], errors="coerce")
+        tdf = g_conv.dropna(subset=[depth_col]).groupby("WELL_NAME")[depth_col].agg(["min", "max"]).reset_index()
+        tdf["thickness"] = tdf["max"] - tdf["min"]
+        g_conv = g_conv.merge(tdf[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left")
+        bc_color = "thickness"
+    else:
+        bc_color = "weight" if "weight" in g_conv.columns else None
+
+    fig = px.scatter(
+        g_conv,
+        x="Кнг_W",
+        y="Kng_BC_model",
+        color=bc_color,
+        color_continuous_scale="Viridis",
+        hover_data=[c for c in ["WELL_NAME", "PC", "PORO_GDM", "Kng_BC_model", "Кнг_W", "thickness", "weight"] if c in g_conv.columns],
+        title=f"PVT {psel}: историческое vs предсказанное (Брукса-Кори)",
+        opacity=0.75,
+    )
+    fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+    st.plotly_chart(fig, use_container_width=True)
+
+    if "WELL_NAME" in g_conv.columns:
+        cross = _well_weighted_crossplot_df(g_conv.rename(columns={"Kng_BC_model": "Kng_model"})).rename(columns={"Kng_model_wmean": "Kng_BC_wmean"})
+        if not cross.empty:
+            figw = px.scatter(
+                cross,
+                x="Кнг_W_wmean",
+                y="Kng_BC_wmean",
+                color="convergence_percent",
+                color_continuous_scale="Turbo",
+                hover_data=["WELL_NAME", "points", "avg_weight", "convergence_percent"],
+                title=f"PVT {psel}: кроссплот по скважинам (БК, средневзвешенно)",
+            )
+            figw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+            st.plotly_chart(figw, use_container_width=True)
+
+        st.subheader("Просмотр скважины (Брукса-Кори)")
+        wells = sorted(g_conv["WELL_NAME"].astype(str).unique().tolist())
+        well = st.selectbox("Скважина", wells, key="bc_well_sel")
+        wd = g_conv[g_conv["WELL_NAME"].astype(str) == well].copy()
+        dcol = _pick_depth_column(wd)
+        if dcol is None:
+            st.warning("Не найдена колонка глубины для скважины.")
+        elif "ACTNUM_GDM" not in wd.columns:
+            st.warning("В данных отсутствует ACTNUM_GDM.")
+        else:
+            wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
+            wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
+            curve = wd[[dcol, "ACTNUM_GDM", "Кнг_W", "Kng_BC_model"]].rename(columns={"Кнг_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"})
+            melt = curve.melt(id_vars=[dcol], value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"], var_name="Кривая", value_name="Значение")
+            fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
+            fig_prof.update_yaxes(autorange="reversed")
+            st.plotly_chart(fig_prof, use_container_width=True)
+
+
 def main() -> None:
-    page = st.sidebar.radio("Раздел", options=["Подбор J функции Леверетта", "Лаборатория"])
+    page = st.sidebar.radio("Раздел", options=["Подбор J функции Леверетта", "Лаборатория", "Брукса-Кори"])
     if page == "Подбор J функции Леверетта":
         leverett_tab()
-    else:
+    elif page == "Лаборатория":
         laboratory_tab()
+    else:
+        brooks_corey_tab()
 
 
 if __name__ == "__main__":

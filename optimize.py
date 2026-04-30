@@ -62,7 +62,8 @@ def _safe_series(df: pd.DataFrame, col: str) -> np.ndarray:
 
 
 def calc_kng_vector(df: pd.DataFrame, a: float, b: float, sigma: float) -> np.ndarray:
-    poro = _safe_series(df, "PORO_GDM")
+    poro_col = "PORO_FRAC" if "PORO_FRAC" in df.columns else "PORO_GDM"
+    poro = _safe_series(df, poro_col)
     perm = _safe_series(df, "PERM_GDM")
     pc = _safe_series(df, "PC")
     swl = _safe_series(df, "SWL_GDM")
@@ -234,11 +235,16 @@ def prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
+    # Нормализованная пористость в долях (<1)
+    if "PORO_GDM" in df.columns:
+        poro = pd.to_numeric(df["PORO_GDM"], errors="coerce")
+        df["PORO_FRAC"] = np.where(poro > 1, poro / 100.0, poro)
+
     if "Кнг_W" in df.columns:
         mask = df["Кнг_W"] > 1
         df.loc[mask, "Кнг_W"] = df.loc[mask, "Кнг_W"] / 100
 
-    required_for_model = ["PORO_GDM", "PERM_GDM", "PC", "SWL_GDM", "Кнг_W", "PVTNUM_GDM"]
+    required_for_model = ["PORO_FRAC", "PERM_GDM", "PC", "SWL_GDM", "Кнг_W", "PVTNUM_GDM"]
     df = df.dropna(subset=required_for_model)
 
     if "ACTNUM_GDM" in df.columns:
