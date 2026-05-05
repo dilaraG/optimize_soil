@@ -12,6 +12,7 @@ import streamlit as st
 
 from brooks_corey import (
     PowerBounds,
+    auto_exp_bounds_swl_poro,
     auto_power_bounds,
     compute_soil_from_params,
     envelope_max_violation,
@@ -376,22 +377,19 @@ def _add_pvit_n_if_missing(df: pd.DataFrame) -> pd.DataFrame:
 def _get_bc_source_df() -> tuple[pd.DataFrame | None, str]:
     """
     Приоритет источников БК:
-    1) Загруженный спец-файл БК
-    2) Первый загруженный файл лаборатории (ККД) / данные из БД
-    3) Существующая БД
+    1) Только пользовательский файл БК (вкладка «Лаборатория»), если он загружен — без подмешивания ККД/БД.
+    2) Иначе — данные из БД ККД (sqlite).
     """
-    bc = st.session_state.get("bc_lab_df")
-    if isinstance(bc, pd.DataFrame) and not bc.empty:
-        return _add_pvit_n_if_missing(_normalize_columns(bc)), "спец-файл Брукса-Кори"
+    user = st.session_state.get("bc_user_upload_df")
+    if isinstance(user, pd.DataFrame) and not user.empty:
+        return _add_pvit_n_if_missing(_normalize_columns(user)), "пользовательский файл БК"
 
     try:
         db_file = sqlite_path()
         if db_file.is_file():
             kkd_df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
             if isinstance(kkd_df, pd.DataFrame) and not kkd_df.empty:
-                kkd_df = _add_pvit_n_if_missing(_normalize_columns(kkd_df))
-                st.session_state["bc_lab_df"] = kkd_df
-                return kkd_df, "файл/БД ККД"
+                return _add_pvit_n_if_missing(_normalize_columns(kkd_df)), "файл/БД ККД"
     except Exception:
         pass
     return None, ""
@@ -403,6 +401,15 @@ def _power_curve_from_ab(x: np.ndarray, a: float, b: float) -> np.ndarray:
     return np.nan_to_num(y, nan=np.nan, posinf=np.nan, neginf=np.nan)
 
 
+def _swl_a_exp_b_poro_curve(x: np.ndarray, a: float, b: float) -> np.ndarray:
+    """swl = a*exp(b*poro) для графика (как в расчёте)."""
+    p = np.asarray(x, dtype=float)
+    z = np.clip(p * float(b), -60.0, 60.0)
+    with np.errstate(over="ignore"):
+        y = float(a) * np.exp(z)
+    return np.clip(y, 1e-12, 1.0)
+
+
 def _plot_bc_cloud(
     df: pd.DataFrame,
     x_col: str,
@@ -411,6 +418,8 @@ def _plot_bc_cloud(
     lower_ab: tuple[float, float] | None = None,
     upper_ab: tuple[float, float] | None = None,
     opt_ab: tuple[float, float] | None = None,
+    *,
+    curve_kind: str = "power",
 ) -> go.Figure:
     fig = px.scatter(df, x=x_col, y=y_col, color="HORIZON" if "HORIZON" in df.columns else None, opacity=0.65, title=title)
     x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
@@ -418,6 +427,41 @@ def _plot_bc_cloud(
     if len(x) == 0:
         return fig
     grid = np.linspace(float(np.min(x)), float(np.max(x)), 150)
+    if curve_kind == "swl_exp_ab":
+        if lower_ab is not None:
+            yl = _swl_a_exp_b_poro_curve(grid, lower_ab[0], lower_ab[1])
+            fig.add_trace(
+                go.Scatter(
+                    x=grid,
+                    y=yl,
+                    mode="lines",
+                    name=f"Нижняя swl: a={lower_ab[0]:.3g}, b={lower_ab[1]:.3g}",
+                    line=dict(color="steelblue", dash="dash"),
+                )
+            )
+        if upper_ab is not None:
+            yu = _swl_a_exp_b_poro_curve(grid, upper_ab[0], upper_ab[1])
+            fig.add_trace(
+                go.Scatter(
+                    x=grid,
+                    y=yu,
+                    mode="lines",
+                    name=f"Верхняя swl: a={upper_ab[0]:.3g}, b={upper_ab[1]:.3g}",
+                    line=dict(color="darkorange", dash="dashdot"),
+                )
+            )
+        if opt_ab is not None:
+            yo = _swl_a_exp_b_poro_curve(grid, opt_ab[0], opt_ab[1])
+            fig.add_trace(
+                go.Scatter(
+                    x=grid,
+                    y=yo,
+                    mode="lines",
+                    name=f"swl=a·exp(b·Кп): a={opt_ab[0]:.3g}, b={opt_ab[1]:.3g}",
+                    line=dict(color="crimson", width=3),
+                )
+            )
+        return fig
     if lower_ab is not None:
         yl = _power_curve_from_ab(grid, lower_ab[0], lower_ab[1])
         fig.add_trace(go.Scatter(x=grid, y=yl, mode="lines", name=f"Нижняя: a={lower_ab[0]:.3g}, b={lower_ab[1]:.3g}", line=dict(color="steelblue", dash="dash")))
@@ -628,8 +672,10 @@ def laboratory_tab() -> None:
         try:
             bc_df = _read_table(bc_file)
             bc_df = _add_pvit_n_if_missing(_normalize_columns(bc_df))
-            st.session_state["bc_lab_df"] = bc_df
-            st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк")
+            st.session_state["bc_user_upload_df"] = bc_df
+            # Сброс виджетов фильтра БК (площади/горизонты), чтобы списки брались из нового файла
+            st.session_state["bc_user_upload_rev"] = int(time.time() * 1000) % 1_000_000_000
+            st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк (используются только они, без ККД из БД).")
         except Exception as e:
             st.error(f"Ошибка загрузки данных Брукса-Кори: {e}")
 
@@ -1101,17 +1147,18 @@ def leverett_tab() -> None:
 
 def brooks_corey_tab() -> None:
     st.title("Метод Брукса-Кори")
-    st.write("Подбор 4 степенных зависимостей: swl(poro), perm(swl), pvit(perm/poro), n(perm/poro).")
 
     bc_lab_df, bc_source = _get_bc_source_df()
     if bc_lab_df is None or bc_lab_df.empty:
-        st.info("Нет данных для Брукса-Кори: загрузите файл ККД/БК во вкладке «Лаборатория» или убедитесь, что доступна БД.")
+        st.info(
+            "Нет данных для Брукса-Кори: загрузите свой файл во вкладке «Лаборатория» "
+            "(блок Брукса-Кори) или убедитесь, что доступна БД ККД."
+        )
         return
     st.caption(f"Источник лабораторных данных БК: {bc_source}")
 
-    # Для источника ККД используем выбор из вкладки "Лаборатория".
-    # Для пользовательского БК-файла фильтр задается прямо во вкладке БК после сопоставления колонок.
-    use_lab_meta_filter = (bc_source != "спец-файл Брукса-Кори")
+    # Для ККД — фильтр из «Лаборатория». Для своего файла БК — только он и фильтры ниже по колонкам файла.
+    use_lab_meta_filter = bc_source != "пользовательский файл БК"
     lab_meta = st.session_state.get("lab_meta") or {}
     area_col_meta = lab_meta.get("area_col")
     horizon_col_meta = lab_meta.get("horizon_col")
@@ -1148,6 +1195,15 @@ def brooks_corey_tab() -> None:
 
     with st.sidebar:
         st.header("Геологическая модель для Брукса-Кори")
+        st.number_input(
+            "Макс. проницаемость Кпр, мД (лаборатория и модель)",
+            min_value=10.0,
+            max_value=100_000.0,
+            value=float(st.session_state.get("bc_perm_cap", 5000.0)),
+            step=100.0,
+            key="bc_perm_cap",
+            help="Значения проницаемости обрезаются сверху при подготовке лабораторных данных и при расчёте Кпр.",
+        )
         wells_file = st.file_uploader("Файл скважин (для БК)", type=["csv", "xlsx", "xls", "txt"], key="bc_wells_file")
         prod_file = st.file_uploader("Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key="bc_prod_file")
         maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=180, step=10, key="bc_maxiter")
@@ -1207,21 +1263,41 @@ def brooks_corey_tab() -> None:
             "(часто путают `Sw_min` с фактической водонасыщенностью образца)."
         )
     if not use_lab_meta_filter:
-        st.caption("Для пользовательского БК-файла фильтры задаются здесь, после сопоставления колонок.")
-        areas_bc = sorted(pd.Series(bc_lab_df.get("Площадь", pd.Series(dtype=object))).dropna().astype(str).str.strip().unique().tolist()) if "Площадь" in bc_lab_df.columns else []
+        st.caption("Для вашего файла БК используются только его данные; фильтры — по колонкам этого файла.")
+        _bc_urev = int(st.session_state.get("bc_user_upload_rev", 0))
         horizons_bc = sorted(pd.Series(bc_lab_df[horizon_col]).dropna().astype(str).str.strip().unique().tolist())
-        sel_h_bc = st.multiselect("Горизонты для БК", options=horizons_bc, default=horizons_bc, key="bc_self_horizons")
-        sel_a_bc = st.multiselect("Площади для БК (опционально)", options=areas_bc, default=areas_bc, key="bc_self_areas") if areas_bc else []
+        sel_h_bc = st.multiselect(
+            "Горизонты для БК (из загруженного файла)",
+            options=horizons_bc,
+            default=horizons_bc,
+            key=f"bc_self_horizons_{_bc_urev}",
+        )
+        # Фильтр по площади только из колонки с точным именем «Площадь» (как в шаблоне файла)
+        area_col_name = "Площадь"
+        area_ok = area_col_name in bc_lab_df.columns and horizon_col != area_col_name
+        sel_a_bc: list[str] = []
+        if area_ok:
+            areas_bc = sorted(
+                pd.Series(bc_lab_df[area_col_name]).dropna().astype(str).str.strip().unique().tolist()
+            )
+            sel_a_bc = st.multiselect(
+                "Площади для БК (колонка «Площадь» в вашем файле; опционально)",
+                options=areas_bc,
+                default=areas_bc,
+                key=f"bc_self_areas_{_bc_urev}",
+            )
+        elif "Площадь" not in bc_lab_df.columns:
+            st.caption("В файле нет колонки «Площадь» — фильтр только по горизонтам.")
         bc_lab_df[horizon_col] = bc_lab_df[horizon_col].astype(str).str.strip()
         hmask_self = bc_lab_df[horizon_col].isin([str(x).strip() for x in sel_h_bc]) if sel_h_bc else pd.Series(False, index=bc_lab_df.index)
-        if areas_bc and sel_a_bc:
-            bc_lab_df["Площадь"] = bc_lab_df["Площадь"].astype(str).str.strip()
-            amask_self = bc_lab_df["Площадь"].isin([str(x).strip() for x in sel_a_bc])
+        if area_ok and sel_a_bc:
+            bc_lab_df[area_col_name] = bc_lab_df[area_col_name].astype(str).str.strip()
+            amask_self = bc_lab_df[area_col_name].isin([str(x).strip() for x in sel_a_bc])
             bc_lab_df = bc_lab_df[hmask_self & amask_self].copy()
         else:
             bc_lab_df = bc_lab_df[hmask_self].copy()
         if bc_lab_df.empty:
-            st.error("После фильтрации пользовательского БК-файла не осталось данных.")
+            st.error("После фильтрации вашего файла БК не осталось данных.")
             return
 
     lab = bc_lab_df.copy()
@@ -1239,6 +1315,9 @@ def brooks_corey_tab() -> None:
         lab[c] = pd.to_numeric(lab[c], errors="coerce")
     # Пористость в долях (<1) для всех формул
     lab["PORO_LAB_FRAC"] = np.where(lab["PORO_LAB"] > 1, lab["PORO_LAB"] / 100.0, lab["PORO_LAB"])
+    perm_cap = float(st.session_state.get("bc_perm_cap", 5000.0))
+    if np.isfinite(perm_cap) and perm_cap > 0:
+        lab["PERM_LAB"] = np.clip(lab["PERM_LAB"], 0.0, perm_cap)
     lab["perm_poro"] = np.sqrt(lab["PERM_LAB"] / lab["PORO_LAB_FRAC"].replace(0, np.nan))
     lab = lab.dropna(subset=["PORO_LAB_FRAC", "SWL_LAB", "PERM_LAB", "PVIT_LAB", "N_LAB", "perm_poro"])
     lab = lab[
@@ -1279,12 +1358,26 @@ def brooks_corey_tab() -> None:
             with st.expander(f"PVTNUM {p}: коэффициенты", expanded=False):
                 c1, c2 = st.columns(2)
                 with c1:
-                    a_swl = st.number_input(f"a_swl | PVT {p}", value=0.2, format="%.6f", key=f"man_a_swl_{p}")
+                    a_swl = st.number_input(
+                        f"a (swl=a·exp(b·Кп)) | PVT {p}",
+                        value=0.15,
+                        min_value=1e-6,
+                        max_value=25.0,
+                        format="%.6f",
+                        key=f"man_a_swl_{p}",
+                    )
                     a_perm = st.number_input(f"a_perm | PVT {p}", value=1.0, format="%.6f", key=f"man_a_perm_{p}")
                     a_pvit = st.number_input(f"a_pvit | PVT {p}", value=1.0, format="%.6f", key=f"man_a_pvit_{p}")
                     a_n = st.number_input(f"a_n | PVT {p}", value=1.0, format="%.6f", key=f"man_a_n_{p}")
                 with c2:
-                    b_swl = st.number_input(f"b_swl | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_swl_{p}")
+                    b_swl = st.number_input(
+                        f"b (swl=a·exp(b·Кп)) | PVT {p}",
+                        value=-0.5,
+                        min_value=-80.0,
+                        max_value=80.0,
+                        format="%.6f",
+                        key=f"man_b_swl_{p}",
+                    )
                     b_perm = st.number_input(f"b_perm | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_perm_{p}")
                     b_pvit = st.number_input(f"b_pvit | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_pvit_{p}")
                     b_n = st.number_input(f"b_n | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_n_{p}")
@@ -1314,14 +1407,15 @@ def brooks_corey_tab() -> None:
                     lsub,
                     "PORO_LAB_FRAC",
                     "SWL_LAB",
-                    f"PVT {p_preview}: swl(poro_frac) — ручные коэффициенты",
+                    f"PVT {p_preview}: swl=a·exp(b·Кп) — ручные коэффициенты",
                     opt_ab=(prm["a_swl"], prm["b_swl"]),
+                    curve_kind="swl_exp_ab",
                 )
                 fig2 = _plot_bc_cloud(
                     lsub,
                     "SWL_LAB",
                     "PERM_LAB",
-                    f"PVT {p_preview}: perm(swl) — ручные коэффициенты",
+                    f"PVT {p_preview}: Кпр(Кво) — ручные коэффициенты",
                     opt_ab=(prm["a_perm"], prm["b_perm"]),
                 )
                 fig3 = _plot_bc_cloud(
@@ -1350,6 +1444,8 @@ def brooks_corey_tab() -> None:
             st.error("Выберите горизонты для каждого PVTNUM.")
             return
 
+        perm_cap_run = float(st.session_state.get("bc_perm_cap", 5000.0))
+
         results = []
         params_rows = []
         bc_meta = {}
@@ -1363,11 +1459,14 @@ def brooks_corey_tab() -> None:
             if g.empty or lsub.empty:
                 continue
 
-            swl_info = auto_power_bounds(lsub["PORO_LAB_FRAC"].to_numpy(), lsub["SWL_LAB"].to_numpy())
+            swl_exp_info = auto_exp_bounds_swl_poro(
+                lsub["PORO_LAB_FRAC"].to_numpy(),
+                lsub["SWL_LAB"].to_numpy(),
+            )
             perm_info = auto_power_bounds(lsub["SWL_LAB"].to_numpy(), lsub["PERM_LAB"].to_numpy())
             pvit_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["PVIT_LAB"].to_numpy())
             n_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["N_LAB"].to_numpy())
-            b_swl = swl_info["bounds"]
+            b_swl = swl_exp_info["bounds"]
             b_perm = perm_info["bounds"]
             b_pvit = pvit_info["bounds"]
             b_n = n_info["bounds"]
@@ -1375,8 +1474,9 @@ def brooks_corey_tab() -> None:
             bounds = {"swl": b_swl, "perm": b_perm, "pvit": b_pvit, "n": b_n}
             envelopes = {
                 "swl": {
-                    "lower": swl_info["lower"],
-                    "upper": swl_info["upper"],
+                    "kind": "exp_ab",
+                    "lower": swl_exp_info["lower"],
+                    "upper": swl_exp_info["upper"],
                     "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float),
                 },
                 "perm": {
@@ -1396,10 +1496,11 @@ def brooks_corey_tab() -> None:
                 },
             }
             if use_manual_bc:
-                params = manual_params_by_pvt.get(p, {})
+                mp = manual_params_by_pvt.get(p, {})
+                params = {**mp, "perm_max_md": perm_cap_run}
             else:
                 baseline = {
-                    "a_swl": 0.2,
+                    "a_swl": 0.15,
                     "b_swl": -0.5,
                     "a_perm": 1.0,
                     "b_perm": -0.5,
@@ -1407,16 +1508,18 @@ def brooks_corey_tab() -> None:
                     "b_pvit": -0.5,
                     "a_n": 1.0,
                     "b_n": -0.5,
+                    "perm_max_md": perm_cap_run,
                 }
                 corr = {
-                    "a_swl": float(swl_info.get("center")[0]),
-                    "b_swl": float(swl_info.get("center")[1]),
+                    "a_swl": float(swl_exp_info.get("center")[0]),
+                    "b_swl": float(swl_exp_info.get("center")[1]),
                     "a_perm": float(perm_info.get("center")[0]),
                     "b_perm": float(perm_info.get("center")[1]),
                     "a_pvit": float(pvit_info.get("center")[0]),
                     "b_pvit": float(pvit_info.get("center")[1]),
                     "a_n": float(n_info.get("center")[0]),
                     "b_n": float(n_info.get("center")[1]),
+                    "perm_max_md": perm_cap_run,
                 }
                 params = optimize_brooks_corey_for_region(
                     g,
@@ -1425,17 +1528,19 @@ def brooks_corey_tab() -> None:
                     maxiter=maxiter,
                     popsize=popsize,
                     initial_guess={
-                        "swl": swl_info.get("center"),
+                        "swl": swl_exp_info.get("center"),
                         "perm": perm_info.get("center"),
                         "pvit": pvit_info.get("center"),
                         "n": n_info.get("center"),
                     },
                     baseline_params=baseline,
+                    perm_max_md=perm_cap_run,
                 )
                 # Финальный выбор по SCORE региона: авто/корреляция/дефолт
                 cand = [("auto", params), ("corr", corr), ("default", baseline)]
                 best_name, best_params, best_score = None, None, -np.inf
                 for nm, cp in cand:
+                    cp = {**cp, "perm_max_md": perm_cap_run}
                     if envelope_max_violation(cp, envelopes) > 1e-9:
                         continue
                     score = evaluate_brooks_score(g, cp)
@@ -1461,14 +1566,20 @@ def brooks_corey_tab() -> None:
             bc_meta[p] = {
                 "lab": lsub.copy(),
                 "bounds": bounds,
+                "perm_max_md": perm_cap_run,
                 "centers": {
-                    "swl": swl_info.get("center"),
+                    "swl": swl_exp_info.get("center"),
                     "perm": perm_info.get("center"),
                     "pvit": pvit_info.get("center"),
                     "n": n_info.get("center"),
                 },
                 "envelopes": {
-                    "swl": {"lower": swl_info.get("lower"), "upper": swl_info.get("upper"), "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float)},
+                    "swl": {
+                        "kind": "exp_ab",
+                        "lower": swl_exp_info.get("lower"),
+                        "upper": swl_exp_info.get("upper"),
+                        "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float),
+                    },
                     "perm": {"lower": perm_info.get("lower"), "upper": perm_info.get("upper"), "x": lsub["SWL_LAB"].to_numpy(dtype=float)},
                     "pvit": {"lower": pvit_info.get("lower"), "upper": pvit_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
                     "n": {"lower": n_info.get("lower"), "upper": n_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
@@ -1544,16 +1655,17 @@ def brooks_corey_tab() -> None:
                 lab_plot,
                 "PORO_LAB_FRAC",
                 "SWL_LAB",
-                f"PVT {psel}: swl(poro_frac)",
+                f"PVT {psel}: swl = a·exp(b·Кп)",
                 lower_ab=env.get("swl", {}).get("lower"),
                 upper_ab=env.get("swl", {}).get("upper"),
                 opt_ab=(float(pp["a_swl"]), float(pp["b_swl"])),
+                curve_kind="swl_exp_ab",
             )
             fig2 = _plot_bc_cloud(
                 lab_plot,
                 "SWL_LAB",
                 "PERM_LAB",
-                f"PVT {psel}: perm(swl)",
+                f"PVT {psel}: Кпр(Кво)",
                 lower_ab=env.get("perm", {}).get("lower"),
                 upper_ab=env.get("perm", {}).get("upper"),
                 opt_ab=(float(pp["a_perm"]), float(pp["b_perm"])),

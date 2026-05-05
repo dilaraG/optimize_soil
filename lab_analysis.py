@@ -16,9 +16,39 @@ def _norm(s: str) -> str:
 
 
 def guess_area_column(columns: list[str]) -> str | None:
+    """
+    Колонка площади месторождения. Не путать с «Площадность»/пористостью (там есть подстрока «площад»).
+    """
+    exclude = (
+        "площадност",
+        "porosit",
+        "порист",
+        "насыщ",
+        "прониц",
+        "проницаем",
+    )
+
+    def _ok_name(c: str) -> bool:
+        t = _norm(c)
+        if any(ex in t for ex in exclude):
+            return False
+        if "площадност" in t:
+            return False
+        return True
+
+    # Точное «Площадь» в приоритете
+    for c in columns:
+        if not _ok_name(c):
+            continue
+        if _norm(c) == "площадь":
+            return c
+
     keys = ("площад", "площ", "area", "местор", "куст", "field")
     for c in columns:
-        if any(k in _norm(c) for k in keys):
+        if not _ok_name(c):
+            continue
+        t = _norm(c)
+        if any(k in t for k in keys):
             return c
     return None
 

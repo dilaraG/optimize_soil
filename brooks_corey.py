@@ -9,6 +9,8 @@ from scipy.optimize import differential_evolution
 
 from optimize import huber_loss, prepare_input_df, prepare_weights
 
+DEFAULT_PERM_MAX_MD = 5000.0
+
 
 @dataclass
 class PowerBounds:
@@ -30,6 +32,69 @@ def _power(x: np.ndarray, a: float, b: float) -> np.ndarray:
     with np.errstate(divide="ignore", invalid="ignore", over="ignore"):
         y = a * (x**b)
     return np.nan_to_num(y, nan=np.nan, posinf=np.nan, neginf=np.nan)
+
+
+def swl_a_exp_b_poro(poro: np.ndarray, a: float, b: float) -> np.ndarray:
+    """swl = a * exp(b * poro), poro — пористость (доля); результат обрезается до (0, 1]."""
+    p = np.asarray(poro, dtype=float)
+    z = np.clip(p * float(b), -60.0, 60.0)
+    with np.errstate(over="ignore"):
+        y = float(a) * np.exp(z)
+    return np.clip(y, 1e-12, 1.0)
+
+
+def _fit_swl_exp_ab_center(xx: np.ndarray, yy: np.ndarray) -> tuple[float, float]:
+    """Оценка (a, b) по ln(swl) ≈ ln(a) + b*poro."""
+    m = np.isfinite(xx) & np.isfinite(yy) & (xx > 0) & (yy > 1e-12)
+    if m.sum() < 3:
+        return 0.15, -0.5
+    xs = xx[m].astype(float)
+    ys = np.clip(yy[m].astype(float), 1e-12, 1.0)
+    try:
+        b0, ln_a = np.polyfit(xs, np.log(ys), 1)
+        a0 = float(np.exp(ln_a))
+        a0 = float(np.clip(a0, 1e-4, 25.0))
+        b0 = float(np.clip(b0, -80.0, 80.0))
+        return a0, b0
+    except Exception:
+        return 0.15, -0.5
+
+
+def auto_exp_bounds_swl_poro(
+    x: np.ndarray,
+    y: np.ndarray,
+    pad_a: float = 0.2,
+    pad_b: float = 3.0,
+) -> dict[str, Any]:
+    """
+    Границы и огибающие для swl(poro) = a*exp(b*poro).
+    lower/upper — пары (a, b) для огибающих кривых.
+    """
+    a0, b0 = _fit_swl_exp_ab_center(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
+    alo = max(1e-4, a0 * (1.0 - pad_a))
+    ahi = min(25.0, a0 * (1.0 + pad_a))
+    if ahi <= alo:
+        ahi = min(25.0, alo * 1.1)
+    blo = float(np.clip(b0 - pad_b, -80.0, 80.0))
+    bhi = float(np.clip(b0 + pad_b, -80.0, 80.0))
+    if blo >= bhi:
+        blo, bhi = b0 - 1.0, b0 + 1.0
+    lower = (alo, blo)
+    upper = (ahi, bhi)
+    center = (a0, b0)
+    b_de_lo = float(min(blo, bhi, b0) - 2.0)
+    b_de_hi = float(max(blo, bhi, b0) + 2.0)
+    b_de_lo = max(b_de_lo, -80.0)
+    b_de_hi = min(b_de_hi, 80.0)
+    if b_de_lo >= b_de_hi:
+        b_de_lo, b_de_hi = -80.0, 80.0
+
+    return {
+        "bounds": PowerBounds((max(1e-4, alo * 0.5), min(25.0, ahi * 1.2)), (b_de_lo, b_de_hi)),
+        "center": center,
+        "lower": lower,
+        "upper": upper,
+    }
 
 
 def _envelopes(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
@@ -83,25 +148,48 @@ def auto_power_bounds(x: np.ndarray, y: np.ndarray, pad_a: float = 0.08, pad_b: 
 
 
 def compute_soil_from_params(df: pd.DataFrame, params: dict[str, float]) -> np.ndarray:
+    """
+    Цепочка БК:
+    1) swl(Кп) = a*exp(b*Кп), обрезка до (0,1].
+    2) Кпр(Кво) — степень.
+    3) Pvit(√(Кпр/Кп)), n(√(Кпр/Кп)) — степени; Кпр ограничена сверху (мД).
+    4) Swat по Corey; если Swat>1 или Pc=0 → Swat=1; если Swat<0 → Swat=0.
+    5) Soil = 1 - Swat (сопоставление с Кнг нефти).
+    """
     poro_col = "PORO_FRAC" if "PORO_FRAC" in df.columns else "PORO_GDM"
     poro = pd.to_numeric(df[poro_col], errors="coerce").to_numpy()
     pc = pd.to_numeric(df["PC"], errors="coerce").to_numpy()
-    valid = np.isfinite(poro) & np.isfinite(pc) & (poro > 0) & (pc > 0)
+    valid = np.isfinite(poro) & np.isfinite(pc) & (poro > 0)
     out = np.full(len(df), np.nan)
     if valid.sum() == 0:
         return out
     poro_v = poro[valid]
     pc_v = pc[valid]
 
-    swl = np.clip(_power(poro_v, params["a_swl"], params["b_swl"]), 0.0, 1.0)
-    perm_pred = np.clip(_power(np.clip(swl, 1e-8, None), params["a_perm"], params["b_perm"]), 1e-12, None)
-    ratio = np.clip(perm_pred / np.clip(poro_v, 1e-8, None), 1e-12, None)
+    perm_max = float(params.get("perm_max_md", DEFAULT_PERM_MAX_MD))
+    if not np.isfinite(perm_max) or perm_max <= 0:
+        perm_max = DEFAULT_PERM_MAX_MD
+
+    # 1) swl = a*exp(b*poro)
+    kvo = swl_a_exp_b_poro(poro_v, params["a_swl"], params["b_swl"])
+    # 2) Кпр(Кво)
+    perm_pred = np.clip(
+        _power(np.clip(kvo, 1e-8, 1.0 - 1e-8), params["a_perm"], params["b_perm"]),
+        1e-12,
+        perm_max,
+    )
+    # 3) √(Кпр/Кп)
+    ratio = np.sqrt(np.clip(perm_pred / np.clip(poro_v, 1e-8, None), 1e-12, None))
     pvit = np.clip(_power(ratio, params["a_pvit"], params["b_pvit"]), 1e-8, None)
     n_val = np.clip(_power(ratio, params["a_n"], params["b_n"]), 1e-3, None)
 
     with np.errstate(divide="ignore", invalid="ignore"):
-        soil = swl + (1 - swl) * (pvit / pc_v) ** (1 / n_val)
-    out[valid] = np.clip(soil, 0, 1)
+        swat = kvo + (1.0 - kvo) * (pvit / np.where(pc_v > 0, pc_v, np.nan)) ** (1.0 / n_val)
+    swat = np.where(~np.isfinite(swat) | (pc_v == 0) | (swat > 1.0), 1.0, swat)
+    swat = np.where(swat < 0.0, 0.0, swat)
+    swat = np.clip(swat, 0.0, 1.0)
+    soil = 1.0 - swat
+    out[valid] = np.clip(soil, 0.0, 1.0)
     return out
 
 
@@ -120,7 +208,7 @@ def evaluate_brooks_score(df: pd.DataFrame, params: dict[str, float]) -> float:
 
 def envelope_max_violation(
     params: dict[str, float],
-    envelopes: dict[str, dict[str, tuple[float, float]]] | None,
+    envelopes: dict[str, dict[str, Any]] | None,
 ) -> float:
     """
     Максимальное нарушение огибающих для 4 зависимостей.
@@ -144,9 +232,14 @@ def envelope_max_violation(
             continue
         lo_a, lo_b = env["lower"]
         up_a, up_b = env["upper"]
-        y = _power(x, float(params[a_name]), float(params[b_name]))
-        ylo = _power(x, lo_a, lo_b)
-        yhi = _power(x, up_a, up_b)
+        if key == "swl" and env.get("kind") == "exp_ab":
+            y = swl_a_exp_b_poro(x, float(params[a_name]), float(params[b_name]))
+            ylo = swl_a_exp_b_poro(x, float(lo_a), float(lo_b))
+            yhi = swl_a_exp_b_poro(x, float(up_a), float(up_b))
+        else:
+            y = _power(x, float(params[a_name]), float(params[b_name]))
+            ylo = _power(x, lo_a, lo_b)
+            yhi = _power(x, up_a, up_b)
         v = np.maximum(0.0, np.minimum(ylo, yhi) - y) + np.maximum(0.0, y - np.maximum(ylo, yhi))
         if np.isfinite(v).any():
             vmax = max(vmax, float(np.nanmax(v)))
@@ -187,11 +280,12 @@ def _filter_target_like_j(df: pd.DataFrame) -> pd.DataFrame:
 def optimize_brooks_corey_for_region(
     df_region: pd.DataFrame,
     bounds: dict[str, PowerBounds],
-    envelopes: dict[str, dict[str, tuple[float, float]]] | None = None,
+    envelopes: dict[str, dict[str, Any]] | None = None,
     maxiter: int = 180,
     popsize: int = 18,
     initial_guess: dict[str, tuple[float, float]] | None = None,
     baseline_params: dict[str, float] | None = None,
+    perm_max_md: float = DEFAULT_PERM_MAX_MD,
 ) -> dict[str, float]:
     """
     Подбор параметров методом differential_evolution
@@ -201,6 +295,13 @@ def optimize_brooks_corey_for_region(
     train = _filter_target_like_j(df_region)
     if train.empty:
         return {}
+
+    poro_col = "PORO_FRAC" if "PORO_FRAC" in train.columns else "PORO_GDM"
+    poro_all = pd.to_numeric(train[poro_col], errors="coerce").to_numpy(dtype=float)
+    poro_pos = poro_all[np.isfinite(poro_all) & (poro_all > 0)]
+    if len(poro_pos) == 0:
+        return {}
+    resolved_perm_max = float(perm_max_md) if np.isfinite(perm_max_md) and perm_max_md > 0 else DEFAULT_PERM_MAX_MD
 
     param_names = ["a_swl", "b_swl", "a_perm", "b_perm", "a_pvit", "b_pvit", "a_n", "b_n"]
     de_bounds = [
@@ -241,9 +342,14 @@ def optimize_brooks_corey_for_region(
                 continue
             lo_a, lo_b = env["lower"]
             up_a, up_b = env["upper"]
-            y = _power(x, p[a_name], p[b_name])
-            ylo = _power(x, lo_a, lo_b)
-            yhi = _power(x, up_a, up_b)
+            if key == "swl" and env.get("kind") == "exp_ab":
+                y = swl_a_exp_b_poro(x, p[a_name], p[b_name])
+                ylo = swl_a_exp_b_poro(x, lo_a, lo_b)
+                yhi = swl_a_exp_b_poro(x, up_a, up_b)
+            else:
+                y = _power(x, p[a_name], p[b_name])
+                ylo = _power(x, lo_a, lo_b)
+                yhi = _power(x, up_a, up_b)
             avg_v, max_v = _viol(y, np.minimum(ylo, yhi), np.maximum(ylo, yhi))
             pen += avg_v
             hard_max = max(hard_max, max_v)
@@ -255,10 +361,15 @@ def optimize_brooks_corey_for_region(
 
     def loss(vec: np.ndarray) -> float:
         p = {k: float(v) for k, v in zip(param_names, vec)}
+        p["perm_max_md"] = resolved_perm_max
         # Жесткие физические ограничения
-        if any(p[k] <= 0 for k in ["a_swl", "a_perm", "a_pvit", "a_n"]):
+        if not (1e-9 < p["a_swl"] <= 100.0):
             return 1e12
-        if any(p[k] >= 0 for k in ["b_swl", "b_perm", "b_pvit", "b_n"]):
+        if not np.isfinite(p["b_swl"]) or abs(p["b_swl"]) > 120.0:
+            return 1e12
+        if any(p[k] <= 0 for k in ["a_perm", "a_pvit", "a_n"]):
+            return 1e12
+        if any(p[k] >= 0 for k in ["b_perm", "b_pvit", "b_n"]):
             return 1e12
         pred = compute_soil_from_params(train, p)
         m = np.isfinite(pred) & np.isfinite(y_true)
@@ -286,8 +397,7 @@ def optimize_brooks_corey_for_region(
     lb = np.array([b[0] for b in de_bounds], dtype=float)
     ub = np.array([b[1] for b in de_bounds], dtype=float)
     x0 = np.clip(x0, lb, ub)
-    # физика: b < 0
-    for idx in [1, 3, 5, 7]:
+    for idx in [3, 5, 7]:
         x0[idx] = min(x0[idx], -1e-3)
     # init популяции с центром вокруг корреляционного приближения
     rng = np.random.default_rng(42)
@@ -298,6 +408,8 @@ def optimize_brooks_corey_for_region(
     for i in range(1, min(6, n_pop)):
         jitter = rng.normal(0.0, 0.05, size=n_dim) * (ub - lb)
         init_pop[i] = np.clip(x0 + jitter, lb, ub)
+        for idx in [3, 5, 7]:
+            init_pop[i][idx] = min(init_pop[i][idx], -1e-3)
 
     res = differential_evolution(
         loss,
@@ -308,12 +420,15 @@ def optimize_brooks_corey_for_region(
         init=init_pop,
     )
     best = {k: float(v) for k, v in zip(param_names, res.x)}
+    best["perm_max_md"] = resolved_perm_max
     best_val = float(loss(np.array([best[k] for k in param_names], dtype=float)))
 
     # Fallback: сравниваем с базовыми наборами коэффициентов и берём лучший
     candidates: list[dict[str, float]] = []
     if baseline_params:
-        candidates.append({k: float(baseline_params[k]) for k in param_names if k in baseline_params})
+        bp = {k: float(baseline_params[k]) for k in param_names if k in baseline_params}
+        bp["perm_max_md"] = resolved_perm_max
+        candidates.append(bp)
     if initial_guess:
         ig = {
             "a_swl": float(initial_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[0]),
@@ -324,6 +439,7 @@ def optimize_brooks_corey_for_region(
             "b_pvit": float(initial_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[1]),
             "a_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[0]),
             "b_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[1]),
+            "perm_max_md": resolved_perm_max,
         }
         candidates.append(ig)
 
@@ -334,11 +450,12 @@ def optimize_brooks_corey_for_region(
             continue
         vec = np.array([cand[k] for k in param_names], dtype=float)
         vec = np.clip(vec, lb, ub)
-        for idx in [1, 3, 5, 7]:
+        for idx in [3, 5, 7]:
             vec[idx] = min(vec[idx], -1e-3)
         val = float(loss(vec))
         if val < best_val:
             best_val = val
             best = {k: float(v) for k, v in zip(param_names, vec)}
+            best["perm_max_md"] = resolved_perm_max
 
     return best
