@@ -9,6 +9,7 @@ import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
+import streamlit.components.v1 as components
 
 from brooks_corey import (
     PowerBounds,
@@ -259,6 +260,599 @@ def _compute_qa_metrics(df: pd.DataFrame, true_col: str, pred_col: str) -> pd.Da
     return qa
 
 
+def _build_well_snapshot(df: pd.DataFrame, model_col: str) -> pd.DataFrame:
+    if "WELL_NAME" not in df.columns or "Кнг_W" not in df.columns or model_col not in df.columns:
+        return pd.DataFrame()
+    work = df.copy()
+    work["WELL_NAME"] = work["WELL_NAME"].astype(str)
+    depth_col = _pick_depth_column(work)
+    if depth_col is None:
+        work["_AXIS"] = work.groupby("WELL_NAME").cumcount() + 1
+        axis_kind = "index"
+    else:
+        work["_AXIS"] = pd.to_numeric(work[depth_col], errors="coerce")
+        axis_kind = "depth"
+    work["Кнг_hist"] = pd.to_numeric(work["Кнг_W"], errors="coerce")
+    work["Кнг_model"] = pd.to_numeric(work[model_col], errors="coerce")
+    keep_cols = ["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"]
+    if "PVTNUM_GDM" in work.columns:
+        keep_cols.append("PVTNUM_GDM")
+    if "weight" in work.columns:
+        keep_cols.append("weight")
+    if "ACTNUM_GDM" in work.columns:
+        keep_cols.append("ACTNUM_GDM")
+    out = work[keep_cols].dropna(subset=["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"]).copy()
+    if out.empty:
+        return out
+    out["AXIS_KIND"] = axis_kind
+    out = out.sort_values(["WELL_NAME", "_AXIS"]).reset_index(drop=True)
+    return out
+
+
+def _save_well_snapshot(df: pd.DataFrame, model_col: str, method_tag: str) -> tuple[bool, str]:
+    snap = _build_well_snapshot(df, model_col=model_col)
+    if snap.empty:
+        return False, "Не удалось сохранить: нет валидных скважинных точек (WELL_NAME/Кнг_W/модель)."
+    now = pd.Timestamp.now()
+    snap_id = f"{method_tag}-{now.strftime('%Y%m%d-%H%M%S')}"
+    snap["METHOD"] = method_tag
+    snap["SNAPSHOT_ID"] = snap_id
+    snap["SNAPSHOT_LABEL"] = f"{method_tag} | {now.strftime('%Y-%m-%d %H:%M:%S')}"
+    snap["SAVED_AT"] = now.isoformat()
+    all_snaps = st.session_state.get("well_method_snapshots")
+    if not isinstance(all_snaps, pd.DataFrame) or all_snaps.empty:
+        st.session_state["well_method_snapshots"] = snap
+    else:
+        st.session_state["well_method_snapshots"] = pd.concat([all_snaps, snap], ignore_index=True)
+    return True, f"Сохранено: {snap['WELL_NAME'].nunique()} скв., {len(snap)} точек ({method_tag})."
+
+
+def _snapshot_catalog(method_tag: str) -> pd.DataFrame:
+    snaps = st.session_state.get("well_method_snapshots")
+    if not isinstance(snaps, pd.DataFrame) or snaps.empty:
+        return pd.DataFrame()
+    sub = snaps[snaps["METHOD"] == method_tag].copy()
+    if sub.empty:
+        return sub
+    cat = (
+        sub.groupby(["SNAPSHOT_ID", "SNAPSHOT_LABEL"], as_index=False)
+        .agg(wells=("WELL_NAME", "nunique"), points=("WELL_NAME", "size"), saved_at=("SAVED_AT", "max"))
+        .sort_values("saved_at", ascending=False)
+        .reset_index(drop=True)
+    )
+    return cat
+
+
+def _render_methods_comparison_block(block_key: str = "compare_methods") -> None:
+    cat_j = _snapshot_catalog("J")
+    cat_bc = _snapshot_catalog("BC")
+    if cat_j.empty or cat_bc.empty:
+        st.info("Сохраните результаты обоих методов кнопкой «Запомнить результаты по скважинам».")
+        return
+
+    def _calc_metrics(df_snap: pd.DataFrame) -> dict[str, float]:
+        y = pd.to_numeric(df_snap["Кнг_hist"], errors="coerce").to_numpy(dtype=float)
+        p = pd.to_numeric(df_snap["Кнг_model"], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(y) & np.isfinite(p) & (np.abs(y) > 1e-15)
+        if m.sum() == 0:
+            return {"MAE": np.nan, "RMSE": np.nan, "BIAS": np.nan, "CORR": np.nan, "SCORE": np.nan}
+        e = p[m] - y[m]
+        mae = float(np.mean(np.abs(e)))
+        rmse = float(np.sqrt(np.mean(e**2)))
+        bias = float(np.mean(e))
+        corr = float(np.corrcoef(y[m], p[m])[0, 1]) if m.sum() > 2 else np.nan
+        score = float(1 - np.mean(np.abs(e)))
+        return {"MAE": mae, "RMSE": rmse, "BIAS": bias, "CORR": corr, "SCORE": score}
+
+    def _calc_metrics_by_horizon(df_snap: pd.DataFrame) -> pd.DataFrame:
+        if "PVTNUM_GDM" not in df_snap.columns or df_snap["PVTNUM_GDM"].isna().all():
+            row = _calc_metrics(df_snap)
+            row["PVTNUM_GDM"] = "—"
+            row["N_points"] = int(
+                (
+                    np.isfinite(pd.to_numeric(df_snap["Кнг_hist"], errors="coerce"))
+                    & np.isfinite(pd.to_numeric(df_snap["Кнг_model"], errors="coerce"))
+                    & (np.abs(pd.to_numeric(df_snap["Кнг_hist"], errors="coerce")) > 1e-15)
+                ).sum()
+            )
+            return pd.DataFrame([row])
+        out_rows = []
+        for pvt, g in df_snap.groupby("PVTNUM_GDM", dropna=False):
+            m = _calc_metrics(g)
+            m["PVTNUM_GDM"] = pvt
+            y = pd.to_numeric(g["Кнг_hist"], errors="coerce")
+            p = pd.to_numeric(g["Кнг_model"], errors="coerce")
+            m["N_points"] = int(
+                (y.notna() & p.notna() & (y.abs() > 1e-15)).sum()
+            )
+            out_rows.append(m)
+        tab = pd.DataFrame(out_rows)
+        tab["_ord"] = pd.to_numeric(tab["PVTNUM_GDM"], errors="coerce")
+        tab = tab.sort_values("_ord", na_position="last").drop(columns="_ord").reset_index(drop=True)
+        return tab
+
+    def _crossplot_df(df_snap: pd.DataFrame) -> pd.DataFrame:
+        if df_snap.empty:
+            return df_snap
+        y = pd.to_numeric(df_snap["Кнг_hist"], errors="coerce")
+        p = pd.to_numeric(df_snap["Кнг_model"], errors="coerce")
+        mask = y.notna() & p.notna() & (y.abs() > 1e-15)
+        return df_snap.loc[mask].copy()
+
+    def _weighted_region_table(df_snap: pd.DataFrame) -> pd.DataFrame:
+        if df_snap.empty:
+            return pd.DataFrame()
+        work = df_snap.copy()
+        work["Кнг_hist"] = pd.to_numeric(work["Кнг_hist"], errors="coerce")
+        work["Кнг_model"] = pd.to_numeric(work["Кнг_model"], errors="coerce")
+        work["weight"] = pd.to_numeric(work.get("weight", 1.0), errors="coerce").fillna(1.0)
+        work = work[np.isfinite(work["Кнг_hist"]) & np.isfinite(work["Кнг_model"]) & (work["weight"] > 0)]
+        if work.empty:
+            return pd.DataFrame()
+        region_col = "PVTNUM_GDM" if "PVTNUM_GDM" in work.columns else None
+        if region_col is None:
+            work["_REGION"] = "Все"
+            region_col = "_REGION"
+        rows = []
+        for region, g in work.groupby(region_col, dropna=False):
+            w = g["weight"].to_numpy(dtype=float)
+            sw = float(np.sum(w))
+            if sw <= 0:
+                continue
+            hist_w = float(np.sum(w * g["Кнг_hist"].to_numpy(dtype=float)) / sw)
+            model_w = float(np.sum(w * g["Кнг_model"].to_numpy(dtype=float)) / sw)
+            rows.append(
+                {
+                    "Регион": region,
+                    "Средневзвешенное Кнг (история)": hist_w,
+                    "Средневзвешенное Кнг (модель)": model_w,
+                    "Дельта": model_w - hist_w,
+                    "Точек": int(len(g)),
+                }
+            )
+        if not rows:
+            return pd.DataFrame()
+        tab = pd.DataFrame(rows)
+        tab["_ord"] = pd.to_numeric(tab["Регион"], errors="coerce")
+        tab = tab.sort_values("_ord", na_position="last").drop(columns="_ord").reset_index(drop=True)
+        return tab
+
+    def _hist_percent(df_snap: pd.DataFrame, region_pick: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if df_snap.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        work = df_snap.copy()
+        work["Кнг_hist"] = pd.to_numeric(work["Кнг_hist"], errors="coerce")
+        work["Кнг_model"] = pd.to_numeric(work["Кнг_model"], errors="coerce")
+        work = work[np.isfinite(work["Кнг_hist"]) & np.isfinite(work["Кнг_model"])]
+        if work.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        if (region_pick != "Все регионы") and ("PVTNUM_GDM" in work.columns):
+            work = work[work["PVTNUM_GDM"].astype(str) == str(region_pick)]
+        if work.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        hist = work["Кнг_hist"].to_numpy(dtype=float)
+        model = work["Кнг_model"].to_numpy(dtype=float)
+        lo = float(np.nanmin(np.r_[hist, model]))
+        hi = float(np.nanmax(np.r_[hist, model]))
+        if not np.isfinite(lo) or not np.isfinite(hi):
+            return pd.DataFrame(), pd.DataFrame()
+        if hi <= lo:
+            hi = lo + 1e-6
+        step = 0.02
+        lo_b = 0.5
+        hi_b = step * np.ceil(hi / step)
+        if hi_b <= lo_b:
+            hi_b = lo_b + step
+        bins = np.arange(lo_b, hi_b + step * 1.001, step)
+        if len(bins) < 2:
+            bins = np.array([lo_b, lo_b + step], dtype=float)
+        h_hist, edges = np.histogram(hist, bins=bins)
+        h_model, _ = np.histogram(model, bins=bins)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        denom_h = max(1, int(h_hist.sum()))
+        denom_m = max(1, int(h_model.sum()))
+        hist_df = pd.DataFrame(
+            {
+                "Нефтенасыщенность": centers,
+                "История, %": 100.0 * h_hist / denom_h,
+                "Модель, %": 100.0 * h_model / denom_m,
+            }
+        )
+        stats = pd.DataFrame(
+            {
+                "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
+                "История": [
+                    float(np.nanmin(hist)),
+                    float(np.nanmax(hist)),
+                    float(np.nanmean(hist)),
+                    float(np.nanmedian(hist)),
+                    float(np.nanstd(hist)),
+                ],
+                "Модель": [
+                    float(np.nanmin(model)),
+                    float(np.nanmax(model)),
+                    float(np.nanmean(model)),
+                    float(np.nanmedian(model)),
+                    float(np.nanstd(model)),
+                ],
+            }
+        )
+        return hist_df, stats
+
+    def _models_hist_percent(
+        df_j: pd.DataFrame, df_bc: pd.DataFrame, region_pick: str
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        if df_j.empty or df_bc.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        j = df_j.copy()
+        b = df_bc.copy()
+        for frame in (j, b):
+            frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce").round(3)
+            frame["WELL_NAME"] = frame["WELL_NAME"].astype(str)
+        mj = j[["WELL_NAME", "_AXIS_R", "Кнг_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
+            columns={"Кнг_model": "J_model", "PVTNUM_GDM": "PVT_J"}
+        )
+        mb = b[["WELL_NAME", "_AXIS_R", "Кнг_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in b.columns else [])].rename(
+            columns={"Кнг_model": "BC_model", "PVTNUM_GDM": "PVT_BC"}
+        )
+        m = mj.merge(mb, on=["WELL_NAME", "_AXIS_R"], how="inner")
+        if m.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        if "PVT_J" in m.columns:
+            m["PVTNUM_GDM"] = m["PVT_J"]
+        elif "PVT_BC" in m.columns:
+            m["PVTNUM_GDM"] = m["PVT_BC"]
+        if (region_pick != "Все регионы") and ("PVTNUM_GDM" in m.columns):
+            m = m[m["PVTNUM_GDM"].astype(str) == str(region_pick)]
+        m["J_model"] = pd.to_numeric(m["J_model"], errors="coerce")
+        m["BC_model"] = pd.to_numeric(m["BC_model"], errors="coerce")
+        m = m[np.isfinite(m["J_model"]) & np.isfinite(m["BC_model"])]
+        if m.empty:
+            return pd.DataFrame(), pd.DataFrame()
+        jv = m["J_model"].to_numpy(dtype=float)
+        bv = m["BC_model"].to_numpy(dtype=float)
+        lo = float(np.nanmin(np.r_[jv, bv]))
+        hi = float(np.nanmax(np.r_[jv, bv]))
+        if hi <= lo:
+            hi = lo + 1e-6
+        step = 0.02
+        lo_b = 0.5
+        hi_b = step * np.ceil(hi / step)
+        if hi_b <= lo_b:
+            hi_b = lo_b + step
+        bins = np.arange(lo_b, hi_b + step * 1.001, step)
+        if len(bins) < 2:
+            bins = np.array([lo_b, lo_b + step], dtype=float)
+        h_j, edges = np.histogram(jv, bins=bins)
+        h_b, _ = np.histogram(bv, bins=bins)
+        centers = 0.5 * (edges[:-1] + edges[1:])
+        hist_df = pd.DataFrame(
+            {
+                "Нефтенасыщенность": centers,
+                "J-функция, %": 100.0 * h_j / max(1, int(h_j.sum())),
+                "Брукс-Кори, %": 100.0 * h_b / max(1, int(h_b.sum())),
+            }
+        )
+        stats_df = pd.DataFrame(
+            {
+                "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
+                "J-функция": [
+                    float(np.nanmin(jv)),
+                    float(np.nanmax(jv)),
+                    float(np.nanmean(jv)),
+                    float(np.nanmedian(jv)),
+                    float(np.nanstd(jv)),
+                ],
+                "Брукс-Кори": [
+                    float(np.nanmin(bv)),
+                    float(np.nanmax(bv)),
+                    float(np.nanmean(bv)),
+                    float(np.nanmedian(bv)),
+                    float(np.nanstd(bv)),
+                ],
+            }
+        )
+        return hist_df, stats_df
+
+    def _corr(a: np.ndarray, b: np.ndarray) -> float:
+        m = np.isfinite(a) & np.isfinite(b)
+        if m.sum() < 3:
+            return float("nan")
+        return float(np.corrcoef(a[m], b[m])[0, 1])
+
+    def _trend_match(a: np.ndarray, b: np.ndarray) -> float:
+        da = np.diff(a)
+        db = np.diff(b)
+        m = np.isfinite(da) & np.isfinite(db) & (np.abs(da) > 1e-9) & (np.abs(db) > 1e-9)
+        if m.sum() == 0:
+            return float("nan")
+        return float(100.0 * np.mean(np.sign(da[m]) == np.sign(db[m])))
+
+    j_labels = [f"{r.SNAPSHOT_LABEL} | скв:{int(r.wells)} тчк:{int(r.points)}" for r in cat_j.itertuples()]
+    bc_labels = [f"{r.SNAPSHOT_LABEL} | скв:{int(r.wells)} тчк:{int(r.points)}" for r in cat_bc.itertuples()]
+    map_j = dict(zip(j_labels, cat_j["SNAPSHOT_ID"]))
+    map_bc = dict(zip(bc_labels, cat_bc["SNAPSHOT_ID"]))
+    c1, c2 = st.columns(2)
+    j_pick = c1.selectbox("Снимок J-функции", options=j_labels, key=f"{block_key}_j_pick")
+    bc_pick = c2.selectbox("Снимок Брукса-Кори", options=bc_labels, key=f"{block_key}_bc_pick")
+    sid_j = map_j[j_pick]
+    sid_bc = map_bc[bc_pick]
+
+    snaps = st.session_state.get("well_method_snapshots").copy()
+    sj = snaps[(snaps["METHOD"] == "J") & (snaps["SNAPSHOT_ID"] == sid_j)].copy()
+    sb = snaps[(snaps["METHOD"] == "BC") & (snaps["SNAPSHOT_ID"] == sid_bc)].copy()
+    common_wells = sorted(set(sj["WELL_NAME"].astype(str)) & set(sb["WELL_NAME"].astype(str)))
+    if not common_wells:
+        st.warning("Между выбранными снимками нет общих скважин.")
+        return
+    st.caption(f"Общих скважин: {len(common_wells)}")
+
+    st.markdown("### Метрики по каждому методу (по горизонтам, PVTNUM_GDM)")
+    st.caption("Точки с Кнг_hist = 0 не участвуют в метриках и на кроссплотах.")
+    tab_j = _calc_metrics_by_horizon(sj)
+    tab_b = _calc_metrics_by_horizon(sb)
+    cjm, cbm = st.columns(2)
+    cjm.dataframe(_round_df(tab_j.set_index("PVTNUM_GDM")), use_container_width=True)
+    cbm.dataframe(_round_df(tab_b.set_index("PVTNUM_GDM")), use_container_width=True)
+
+    st.markdown("### Кроссплоты по методам")
+    c3, c4 = st.columns(2)
+    sj_x = _crossplot_df(sj)
+    sb_x = _crossplot_df(sb)
+    if sj_x.empty:
+        c3.info("Нет точек для кроссплота J после исключения Кнг_hist = 0.")
+    else:
+        fig_j = px.scatter(
+            sj_x,
+            x="Кнг_hist",
+            y="Кнг_model",
+            color="PVTNUM_GDM" if "PVTNUM_GDM" in sj_x.columns else None,
+            hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sj_x.columns],
+            title="J: расчетное(историческое) (без Кнг_hist = 0)",
+            opacity=0.65,
+        )
+        fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        c3.plotly_chart(fig_j, use_container_width=True)
+    if sb_x.empty:
+        c4.info("Нет точек для кроссплота БК после исключения Кнг_hist = 0.")
+    else:
+        fig_bc = px.scatter(
+            sb_x,
+            x="Кнг_hist",
+            y="Кнг_model",
+            color="PVTNUM_GDM" if "PVTNUM_GDM" in sb_x.columns else None,
+            hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sb_x.columns],
+            title="БК: расчетное(историческое) (без Кнг_hist = 0)",
+            opacity=0.65,
+        )
+        fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        c4.plotly_chart(fig_bc, use_container_width=True)
+
+    st.markdown("### Региональные средневзвешенные значения и распределения")
+    meth_tab_j, meth_tab_bc, meth_tab_cmp = st.tabs(["J-функция", "Брукс-Кори", "J vs БК"])
+
+    with meth_tab_j:
+        tab_reg_j = _weighted_region_table(sj)
+        if tab_reg_j.empty:
+            st.info("Недостаточно данных для региональной сводки J-функции.")
+        else:
+            st.dataframe(_round_df(tab_reg_j), use_container_width=True)
+            reg_opts = ["Все регионы"] + [str(x) for x in tab_reg_j["Регион"].tolist()]
+            reg_pick = st.selectbox("Регион для гистограммы (J)", options=reg_opts, key=f"{block_key}_hist_reg_j")
+            hist_df, stats_df = _hist_percent(sj, reg_pick)
+            if hist_df.empty:
+                st.info("Нет данных для гистограммы J-функции.")
+            else:
+                cc1, cc2 = st.columns([2, 1])
+                fig_h = px.bar(
+                    hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
+                    x="Нефтенасыщенность",
+                    y="Проценты",
+                    color="Источник",
+                    barmode="overlay",
+                    opacity=0.6,
+                    title=f"J-функция: распределение Кнг ({reg_pick})",
+                )
+                fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+                cc1.plotly_chart(fig_h, use_container_width=True)
+                cc1.download_button(
+                    "Скачать данные гистограммы (J, CSV)",
+                    data=_csv_bytes(hist_df),
+                    file_name=f"hist_j_{str(reg_pick).replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key=f"{block_key}_dl_hist_j",
+                )
+                cc2.dataframe(_round_df(stats_df), use_container_width=True)
+                cc2.download_button(
+                    "Скачать статистику (J, CSV)",
+                    data=_csv_bytes(stats_df),
+                    file_name=f"hist_j_stats_{str(reg_pick).replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key=f"{block_key}_dl_hist_j_stats",
+                )
+
+    with meth_tab_bc:
+        tab_reg_b = _weighted_region_table(sb)
+        if tab_reg_b.empty:
+            st.info("Недостаточно данных для региональной сводки Брукса-Кори.")
+        else:
+            st.dataframe(_round_df(tab_reg_b), use_container_width=True)
+            reg_opts = ["Все регионы"] + [str(x) for x in tab_reg_b["Регион"].tolist()]
+            reg_pick = st.selectbox("Регион для гистограммы (БК)", options=reg_opts, key=f"{block_key}_hist_reg_bc")
+            hist_df, stats_df = _hist_percent(sb, reg_pick)
+            if hist_df.empty:
+                st.info("Нет данных для гистограммы Брукса-Кори.")
+            else:
+                cc1, cc2 = st.columns([2, 1])
+                fig_h = px.bar(
+                    hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
+                    x="Нефтенасыщенность",
+                    y="Проценты",
+                    color="Источник",
+                    barmode="overlay",
+                    opacity=0.6,
+                    title=f"Брукс-Кори: распределение Кнг ({reg_pick})",
+                )
+                fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+                cc1.plotly_chart(fig_h, use_container_width=True)
+                cc1.download_button(
+                    "Скачать данные гистограммы (БК, CSV)",
+                    data=_csv_bytes(hist_df),
+                    file_name=f"hist_bc_{str(reg_pick).replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key=f"{block_key}_dl_hist_bc",
+                )
+                cc2.dataframe(_round_df(stats_df), use_container_width=True)
+                cc2.download_button(
+                    "Скачать статистику (БК, CSV)",
+                    data=_csv_bytes(stats_df),
+                    file_name=f"hist_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
+                    mime="text/csv",
+                    key=f"{block_key}_dl_hist_bc_stats",
+                )
+
+    with meth_tab_cmp:
+        pvt_vals = sorted(
+            set(
+                [str(x) for x in pd.to_numeric(sj.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
+                + [str(x) for x in pd.to_numeric(sb.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
+            )
+        )
+        reg_opts = ["Все регионы"] + pvt_vals
+        reg_pick = st.selectbox("Регион для гистограммы (J vs БК)", options=reg_opts, key=f"{block_key}_hist_reg_jbc")
+        hist_df, stats_df = _models_hist_percent(sj, sb, reg_pick)
+        if hist_df.empty:
+            st.info("Недостаточно общих точек J и БК для построения гистограммы.")
+        else:
+            c1, c2 = st.columns([2, 1])
+            fig_cmp = px.bar(
+                hist_df.melt(id_vars="Нефтенасыщенность", var_name="Модель", value_name="Проценты"),
+                x="Нефтенасыщенность",
+                y="Проценты",
+                color="Модель",
+                barmode="overlay",
+                opacity=0.6,
+                title=f"Распределения предсказанной Кнг: J vs БК ({reg_pick})",
+            )
+            fig_cmp.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+            c1.plotly_chart(fig_cmp, use_container_width=True)
+            c1.download_button(
+                "Скачать данные гистограммы (J_vs_БК, CSV)",
+                data=_csv_bytes(hist_df),
+                file_name=f"hist_j_bc_{str(reg_pick).replace(' ', '_')}.csv",
+                mime="text/csv",
+                key=f"{block_key}_dl_hist_jbc",
+            )
+            c2.dataframe(_round_df(stats_df), use_container_width=True)
+            c2.download_button(
+                "Скачать статистику (J_vs_БК, CSV)",
+                data=_csv_bytes(stats_df),
+                file_name=f"hist_j_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
+                mime="text/csv",
+                key=f"{block_key}_dl_hist_jbc_stats",
+            )
+
+    st.markdown("### Поскважинное сравнение и кластеры согласованности")
+    st.caption(
+        "Для каждой скважины на общей сетке по глубине сравниваются **тренды** рассчитанных кривых "
+        "J-функции и Брукса–Кори (корреляция и совпадение знака приращений). Связь с историей РИГИС "
+        "приведена для справки."
+    )
+    rows = []
+    for well in common_wells:
+        wj = sj[sj["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
+        wb = sb[sb["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
+        if wj.empty or wb.empty:
+            continue
+        tj = wj.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+        tb = wb.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+        x_lo = max(float(tj["_AXIS"].min()), float(tb["_AXIS"].min()))
+        x_hi = min(float(tj["_AXIS"].max()), float(tb["_AXIS"].max()))
+        if x_hi <= x_lo:
+            grid = np.array(sorted(set(tj["_AXIS"].tolist() + tb["_AXIS"].tolist())), dtype=float)
+        else:
+            grid = np.linspace(x_lo, x_hi, int(max(30, min(180, 2 * min(len(tj), len(tb))))))
+        if len(grid) < 5:
+            continue
+        hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_hist"].to_numpy(dtype=float))
+        hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_hist"].to_numpy(dtype=float))
+        hist = 0.5 * (hj + hb)
+        pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_model"].to_numpy(dtype=float))
+        pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_model"].to_numpy(dtype=float))
+        rows.append(
+            {
+                "WELL_NAME": str(well),
+                "corr_j_bc": _corr(pj, pb),
+                "trend_j_bc": _trend_match(pj, pb),
+                "corr_j_hist": _corr(pj, hist),
+                "corr_bc_hist": _corr(pb, hist),
+                "points_interp": int(len(grid)),
+            }
+        )
+    cmp_df = pd.DataFrame(rows)
+    if cmp_df.empty:
+        st.warning("Недостаточно данных для поскважинного сравнения.")
+        return
+
+    cmp_df["good_match"] = (cmp_df["corr_j_bc"] >= 0.8) & (cmp_df["trend_j_bc"] >= 65.0)
+    st.metric("Скважины с хорошим совпадением J и БК (по трендам)", int(cmp_df["good_match"].sum()))
+    disp_cols = ["WELL_NAME", "corr_j_bc", "trend_j_bc", "corr_j_hist", "corr_bc_hist", "good_match", "points_interp"]
+    st.dataframe(
+        _round_df(cmp_df[disp_cols].sort_values(["good_match", "corr_j_bc", "trend_j_bc"], ascending=[False, False, False])),
+        use_container_width=True,
+    )
+
+    feat = cmp_df[["corr_j_bc", "trend_j_bc"]].copy()
+    feat = feat.fillna(feat.median(numeric_only=True))
+    try:
+        from sklearn.cluster import KMeans
+
+        k = int(max(2, min(4, len(feat))))
+        km = KMeans(n_clusters=k, random_state=42, n_init=10)
+        cmp_df["cluster"] = km.fit_predict(feat).astype(str)
+    except Exception:
+        cmp_df["cluster"] = np.where(cmp_df["good_match"], "good", "other")
+
+    fig_cluster = px.scatter(
+        cmp_df,
+        x="corr_j_bc",
+        y="trend_j_bc",
+        color="cluster",
+        symbol="good_match",
+        hover_data=["WELL_NAME", "corr_j_hist", "corr_bc_hist", "points_interp"],
+        title="Кластеры: согласованность J-функции и Брукса–Кори (корреляция и тренд)",
+    )
+    st.plotly_chart(fig_cluster, use_container_width=True)
+
+    well = st.selectbox("Скважина для детального сравнения", options=sorted(cmp_df["WELL_NAME"].unique().tolist()), key=f"{block_key}_well")
+    wj = sj[sj["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
+    wb = sb[sb["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
+    if wj.empty or wb.empty:
+        return
+    tj = wj.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+    tb = wb.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+    x_lo = max(float(tj["_AXIS"].min()), float(tb["_AXIS"].min()))
+    x_hi = min(float(tj["_AXIS"].max()), float(tb["_AXIS"].max()))
+    if x_hi <= x_lo:
+        grid = np.array(sorted(set(tj["_AXIS"].tolist() + tb["_AXIS"].tolist())), dtype=float)
+    else:
+        grid = np.linspace(x_lo, x_hi, int(max(40, min(250, 2 * min(len(tj), len(tb))))))
+    hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_hist"].to_numpy(dtype=float))
+    hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_hist"].to_numpy(dtype=float))
+    hist = 0.5 * (hj + hb)
+    pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_model"].to_numpy(dtype=float))
+    pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_model"].to_numpy(dtype=float))
+    plot_df = pd.DataFrame({"_AXIS": grid, "Кн историческая": hist, "Кн J-функция": pj, "Кн Брукса-Кори": pb}).melt(
+        id_vars="_AXIS", var_name="Кривая", value_name="Кн"
+    )
+    fig = px.line(plot_df, x="Кн", y="_AXIS", color="Кривая", title=f"Скважина {well}: сравнение профилей")
+    if (wj["AXIS_KIND"].iloc[0] == "depth") and (wb["AXIS_KIND"].iloc[0] == "depth"):
+        fig.update_yaxes(autorange="reversed", title="Глубина")
+    else:
+        fig.update_yaxes(title="Индекс точки")
+    st.plotly_chart(fig, use_container_width=True)
+
+
 def _default_bounds_for_pvts(pvts: list[int]) -> dict[int, dict[str, tuple[float, float]]]:
     return {pvt: {"a": (0.05, 0.30), "b": (-3.0, -0.5), "sigma": (25.0, 35.0)} for pvt in pvts}
 
@@ -309,6 +903,176 @@ def _validate_columns(df_wells: pd.DataFrame, df_prod: pd.DataFrame | None) -> l
         if not prod_ok:
             errors.append("Файл добычи должен содержать колонки скважины и региона (PVTNUM).")
     return errors
+
+
+def _coalesce_path(*keys: str) -> str | None:
+    for k in keys:
+        v = st.session_state.get(k)
+        if isinstance(v, str) and v.strip():
+            return v
+    return None
+
+
+def _scroll_page_top() -> None:
+    components.html(
+        """
+        <script>
+        (function() {
+          const doc = window.parent.document;
+          if (!doc) return;
+
+          // Снимаем фокус с активного элемента, чтобы не "держался" низ страницы
+          if (doc.activeElement && typeof doc.activeElement.blur === 'function') {
+            doc.activeElement.blur();
+          }
+
+          // Ищем реальные scroll-контейнеры Streamlit и принудительно ставим в начало
+          const candidates = [
+            doc.scrollingElement,
+            doc.documentElement,
+            doc.body,
+            doc.querySelector('section.main'),
+            doc.querySelector('[data-testid="stAppViewContainer"]'),
+            doc.querySelector('[data-testid="stMain"]')
+          ].filter(Boolean);
+
+          candidates.forEach((el) => {
+            try {
+              el.scrollTop = 0;
+              if (typeof el.scrollTo === 'function') {
+                el.scrollTo({ top: 0, left: 0, behavior: 'auto' });
+              }
+            } catch (e) {}
+          });
+
+          // Якорь-фокус вверху для стабильного старта "активной" области
+          let topAnchor = doc.getElementById('__cursor_top_anchor__');
+          if (!topAnchor) {
+            topAnchor = doc.createElement('div');
+            topAnchor.id = '__cursor_top_anchor__';
+            topAnchor.setAttribute('tabindex', '-1');
+            topAnchor.style.position = 'absolute';
+            topAnchor.style.top = '0';
+            topAnchor.style.left = '0';
+            topAnchor.style.width = '1px';
+            topAnchor.style.height = '1px';
+            topAnchor.style.opacity = '0';
+            doc.body.prepend(topAnchor);
+          }
+          try {
+            topAnchor.focus({ preventScroll: true });
+            topAnchor.scrollIntoView({ block: 'start', inline: 'nearest', behavior: 'auto' });
+          } catch (e) {}
+        })();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
+def _safe_guess_col(cols: list[str], candidates: list[str]) -> str:
+    if not cols:
+        return ""
+    try:
+        return _guess_col(cols, candidates)
+    except Exception:
+        return cols[0]
+
+
+def _csv_bytes(df: pd.DataFrame) -> bytes:
+    out = df.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > 0:
+        out[num_cols] = out[num_cols].round(3)
+    return out.to_csv(index=False).encode("utf-8-sig")
+
+
+def _round_df(df: pd.DataFrame, digits: int = 3) -> pd.DataFrame:
+    out = df.copy()
+    num_cols = out.select_dtypes(include=[np.number]).columns
+    if len(num_cols) > 0:
+        out[num_cols] = out[num_cols].round(digits)
+    return out
+
+
+def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: str) -> pd.DataFrame:
+    df = _normalize_columns(raw_wells.copy())
+    cols = list(df.columns)
+    st.subheader(title)
+    st.caption("Выберите соответствия колонок сверху, затем проверьте предпросмотр.")
+    if not cols:
+        return df
+    mapping_rules: list[tuple[str, list[str]]] = [
+        ("WELL_NAME", ["WELL_NAME", "СКВАЖ", "WELL", "STVOL"]),
+        ("PVTNUM_GDM", ["PVTNUM", "PVT", "ЭКСПЛ", "OBJECT", "OBJ"]),
+        ("PORO_GDM", ["PORO", "ПОР", "PHI"]),
+        ("PERM_GDM", ["PERM", "ПРОНИ", "KPR", "K_PR"]),
+        ("PC", ["PC", "КАПИЛ", "P_CAP"]),
+        ("SWL_GDM", ["SWL", "SWI", "SW_MIN", "КВО"]),
+        ("Кнг_W", ["КНГ", "KNG", "НЕФТЕНАС", "RIGIS"]),
+    ]
+    defaults = {target: _safe_guess_col(cols, hints) for target, hints in mapping_rules}
+    pick: dict[str, str] = {}
+    cols_ui = st.columns(4)
+    for i, (target, _) in enumerate(mapping_rules):
+        host = cols_ui[i % 4]
+        default = defaults[target]
+        idx = cols.index(default) if default in cols else 0
+        pick[target] = host.selectbox(
+            f"{target}",
+            options=cols,
+            index=idx,
+            key=f"{key_prefix}_map_wells_{target}",
+        )
+    if len(set(pick.values())) != len(pick):
+        st.error("Для обязательных полей скважин выбраны повторяющиеся колонки. Выберите уникальные соответствия.")
+        return pd.DataFrame()
+    rename_map = {src: dst for dst, src in pick.items()}
+    mapped = df.rename(columns=rename_map)
+    return mapped
+
+
+def _map_uploaded_prod_df(raw_prod: pd.DataFrame | None, *, key_prefix: str, title: str) -> pd.DataFrame | None:
+    if raw_prod is None or raw_prod.empty:
+        return None
+    df = _normalize_columns(raw_prod.copy())
+    cols = list(df.columns)
+    st.subheader(title)
+    st.caption("Опционально: сопоставьте колонки файла добычи в таблице ниже, затем проверьте предпросмотр.")
+    if not cols:
+        return df
+    rules: list[tuple[str, list[str]]] = [
+        ("WELL_NAME", ["WELL_NAME", "СТВОЛ", "СКВАЖ", "WELL"]),
+        ("PVTNUM_GDM", ["PVTNUM", "ЭКСПЛ", "ОБЪЕКТ", "OBJECT"]),
+    ]
+    defaults = {target: _safe_guess_col(cols, hints) for target, hints in rules}
+    map_df = pd.DataFrame([defaults])
+    col_cfg = {
+        target: st.column_config.SelectboxColumn(
+            label=target,
+            options=cols,
+            required=True,
+            help=f"Колонка файла добычи для {target}",
+        )
+        for target, _ in rules
+    }
+    edited = st.data_editor(
+        map_df,
+        hide_index=True,
+        num_rows="fixed",
+        use_container_width=True,
+        key=f"{key_prefix}_map_table_prod",
+        column_config=col_cfg,
+    )
+    st.caption("Предпросмотр загруженного файла добычи:")
+    st.dataframe(_round_df(df.head(12)), use_container_width=True)
+    picks = {target: str(edited.iloc[0][target]) for target, _ in rules}
+    if len(set(picks.values())) != len(picks):
+        st.error("Для файла добычи выбраны повторяющиеся колонки сопоставления.")
+        return pd.DataFrame()
+    rename_map = {src: dst for dst, src in picks.items()}
+    return df.rename(columns=rename_map)
 
 
 @st.cache_data(show_spinner=False)
@@ -683,7 +1447,7 @@ def laboratory_tab() -> None:
     if cloud is None or cloud.empty:
         return
 
-    st.subheader("График J vs Swn (лаборатория)")
+    st.subheader("График J(Swn) (лаборатория)")
     fit = st.session_state.get("lab_trend_fit") or {}
     fig = _fig_j_swn_lab(cloud, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
     st.plotly_chart(fig, use_container_width=True)
@@ -714,11 +1478,15 @@ def leverett_tab() -> None:
         popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
 
     if wells_file is not None:
-        st.session_state["wells_file_path"] = _persist_uploaded_file(wells_file, "wells")
+        p = _persist_uploaded_file(wells_file, "wells")
+        st.session_state["wells_file_path"] = p
+        st.session_state["shared_wells_file_path"] = p
     if prod_file is not None:
-        st.session_state["prod_file_path"] = _persist_uploaded_file(prod_file, "prod")
+        p = _persist_uploaded_file(prod_file, "prod")
+        st.session_state["prod_file_path"] = p
+        st.session_state["shared_prod_file_path"] = p
 
-    wells_path = st.session_state.get("wells_file_path")
+    wells_path = _coalesce_path("wells_file_path", "shared_wells_file_path", "bc_wells_path")
     if not wells_path:
         st.info("Загрузите файл скважин, чтобы продолжить.")
         return
@@ -726,10 +1494,17 @@ def leverett_tab() -> None:
     try:
         raw_wells = _read_table_from_path(wells_path)
         raw_prod = None
-        if st.session_state.get("prod_file_path"):
-            raw_prod = _read_table_from_path(st.session_state["prod_file_path"])
-        df_wells = _clean_wells_cached(raw_wells)
-        df_prod = _clean_prod_cached(raw_prod)
+        prod_path = _coalesce_path("prod_file_path", "shared_prod_file_path", "bc_prod_path")
+        if prod_path:
+            raw_prod = _read_table_from_path(prod_path)
+        mapped_wells = _map_uploaded_wells_df(raw_wells, key_prefix="j", title="Сопоставление колонок файла скважин")
+        if mapped_wells.empty:
+            return
+        mapped_prod = _map_uploaded_prod_df(raw_prod, key_prefix="j", title="Сопоставление колонок файла добычи")
+        if isinstance(mapped_prod, pd.DataFrame) and mapped_prod.empty:
+            return
+        df_wells = _clean_wells_cached(mapped_wells)
+        df_prod = _clean_prod_cached(mapped_prod)
     except Exception as e:
         st.error(f"Ошибка чтения файла: {e}")
         return
@@ -747,7 +1522,7 @@ def leverett_tab() -> None:
         return
 
     st.subheader("Предпросмотр данных")
-    st.dataframe(df_wells.head(30), use_container_width=True)
+    st.dataframe(_round_df(df_wells.head(30)), use_container_width=True)
     st.caption(f"Строк после очистки: {len(df_wells)}")
 
     pvt_horizon_map: dict[int, list[str]] = st.session_state.get("pvt_horizon_map", {})
@@ -943,13 +1718,19 @@ def leverett_tab() -> None:
     c1, c2 = st.columns(2)
     with c1:
         st.subheader("Параметры")
-        st.dataframe(params_df.round(3), use_container_width=True)
+        st.dataframe(_round_df(params_df), use_container_width=True)
     with c2:
         st.subheader("Метрики")
-        st.dataframe(qa_df.round(3), use_container_width=True)
+        st.dataframe(_round_df(qa_df), use_container_width=True)
+    if st.button("Запомнить результаты по скважинам (J-функция)", key="save_j_snapshot"):
+        ok, msg = _save_well_snapshot(result_df, model_col="Kng_model", method_tag="J")
+        if ok:
+            st.success(msg)
+        else:
+            st.warning(msg)
 
     if lab_ready and cloud is not None and not cloud.empty:
-        st.subheader("J vs Swn: лаборатория + степенная модель с оптимальными a, b")
+        st.subheader("J(Swn): лаборатория + степенная модель с оптимальными a, b")
         region = st.selectbox(
             "Регион для графика J–Swn",
             options=sorted(pd.to_numeric(params_df["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique()),
@@ -1031,7 +1812,7 @@ def leverett_tab() -> None:
         color=color_col if color_col in region_df.columns else None,
         color_continuous_scale="Viridis",
         hover_data=hover_cols,
-        title=f"PVT {region}: историческое vs предсказанное Кнг ({'вес' if color_col == 'weight' else 'толщина'})",
+        title=f"PVT {region}: предсказанное Кнг(историческое) ({'вес' if color_col == 'weight' else 'толщина'})",
         opacity=0.7,
     )
     fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
@@ -1075,7 +1856,7 @@ def leverett_tab() -> None:
             .sort_values(["avg_weight", "max_weight"], ascending=False)
         )
         st.markdown("**Скважины с наибольшими весами (в целом по выборке)**")
-        st.dataframe(weight_summary.head(15).round(3), use_container_width=True)
+        st.dataframe(_round_df(weight_summary.head(15)), use_container_width=True)
 
     if not qa_df.empty:
         qa_row = qa_df[qa_df["PVTNUM_GDM"] == int(region)]
@@ -1210,17 +1991,30 @@ def brooks_corey_tab() -> None:
         popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=18, step=1, key="bc_popsize")
 
     if wells_file is not None:
-        st.session_state["bc_wells_path"] = _persist_uploaded_file(wells_file, "bc_wells")
+        p = _persist_uploaded_file(wells_file, "bc_wells")
+        st.session_state["bc_wells_path"] = p
+        st.session_state["shared_wells_file_path"] = p
     if prod_file is not None:
-        st.session_state["bc_prod_path"] = _persist_uploaded_file(prod_file, "bc_prod")
-    wells_path = st.session_state.get("bc_wells_path")
+        p = _persist_uploaded_file(prod_file, "bc_prod")
+        st.session_state["bc_prod_path"] = p
+        st.session_state["shared_prod_file_path"] = p
+    wells_path = _coalesce_path("bc_wells_path", "shared_wells_file_path", "wells_file_path")
     if not wells_path:
         st.info("Загрузите файл скважин для расчета Брукса-Кори.")
         return
 
     try:
-        df_geo_raw = _clean_wells_cached(_read_table_from_path(wells_path))
-        df_prod = _clean_prod_cached(_read_table_from_path(st.session_state["bc_prod_path"])) if st.session_state.get("bc_prod_path") else None
+        raw_geo = _read_table_from_path(wells_path)
+        prod_path = _coalesce_path("bc_prod_path", "shared_prod_file_path", "prod_file_path")
+        raw_prod = _read_table_from_path(prod_path) if prod_path else None
+        mapped_geo = _map_uploaded_wells_df(raw_geo, key_prefix="bc", title="Сопоставление колонок файла скважин (БК)")
+        if mapped_geo.empty:
+            return
+        mapped_prod = _map_uploaded_prod_df(raw_prod, key_prefix="bc", title="Сопоставление колонок файла добычи (БК)")
+        if isinstance(mapped_prod, pd.DataFrame) and mapped_prod.empty:
+            return
+        df_geo_raw = _clean_wells_cached(mapped_geo)
+        df_prod = _clean_prod_cached(mapped_prod)
         df_geo = prepare_brooks_training_data(df_geo_raw, df_prod)
     except Exception as e:
         st.error(f"Ошибка чтения геологической модели: {e}")
@@ -1237,16 +2031,34 @@ def brooks_corey_tab() -> None:
 
     st.subheader("Сопоставление колонок лабораторной таблицы Брукса-Кори")
     st.caption("Предпросмотр исходной лабораторной таблицы (первые строки):")
-    st.dataframe(bc_lab_df.head(12), use_container_width=True)
     cols = list(bc_lab_df.columns)
-    c1, c2, c3 = st.columns(3)
-    horizon_col = c1.selectbox("Код горизонта", cols, index=cols.index(_guess_col(cols, ["ГОРИЗ", "HORIZ", "КОД"])))
-    poro_col = c2.selectbox("Poro (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PORO", "ПОР"])))
-    swl_col = c3.selectbox("Swi/Swl (лаборатория)", cols, index=cols.index(_guess_col(cols, ["SWL", "SWI", "ВОДОНАС"])))
-    c4, c5, c6 = st.columns(3)
-    perm_col = c4.selectbox("Perm (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PERM", "ПРОНИ"])))
-    pvit_col = c5.selectbox("Pvit (лаборатория)", cols, index=cols.index(_guess_col(cols, ["PVIT", "PENTRY", "PВХ"])))
-    n_col = c6.selectbox("n (лаборатория)", cols, index=cols.index(_guess_col(cols, [" N", "LAMB", "ПОКАЗ", "N_"])))
+    defaults_lab = {
+        "Код горизонта": _safe_guess_col(cols, ["ГОРИЗ", "HORIZ", "КОД"]),
+        "Poro (лаборатория)": _safe_guess_col(cols, ["PORO", "ПОР"]),
+        "Swi/Swl (лаборатория)": _safe_guess_col(cols, ["SWL", "SWI", "ВОДОНАС"]),
+        "Perm (лаборатория)": _safe_guess_col(cols, ["PERM", "ПРОНИ"]),
+        "Pvit (лаборатория)": _safe_guess_col(cols, ["PVIT", "PENTRY", "PВХ"]),
+        "n (лаборатория)": _safe_guess_col(cols, [" N", "LAMB", "ПОКАЗ", "N_"]),
+    }
+    lab_map_df = pd.DataFrame([defaults_lab])
+    lab_cfg = {
+        k: st.column_config.SelectboxColumn(label=k, options=cols, required=True) for k in defaults_lab.keys()
+    }
+    lab_edit = st.data_editor(
+        lab_map_df,
+        hide_index=True,
+        num_rows="fixed",
+        use_container_width=True,
+        key="bc_lab_mapping_table",
+        column_config=lab_cfg,
+    )
+    st.dataframe(_round_df(bc_lab_df.head(12)), use_container_width=True)
+    horizon_col = str(lab_edit.iloc[0]["Код горизонта"])
+    poro_col = str(lab_edit.iloc[0]["Poro (лаборатория)"])
+    swl_col = str(lab_edit.iloc[0]["Swi/Swl (лаборатория)"])
+    perm_col = str(lab_edit.iloc[0]["Perm (лаборатория)"])
+    pvit_col = str(lab_edit.iloc[0]["Pvit (лаборатория)"])
+    n_col = str(lab_edit.iloc[0]["n (лаборатория)"])
     st.caption(
         f"В расчетах БК используются выбранные столбцы: горизонт=`{horizon_col}`, poro=`{poro_col}`, "
         f"swl=`{swl_col}`, perm=`{perm_col}`, pvit=`{pvit_col}`, n=`{n_col}`."
@@ -1335,7 +2147,7 @@ def brooks_corey_tab() -> None:
     lab["HORIZON"] = lab["HORIZON"].astype(str).str.strip()
     st.caption("Подготовленная таблица для БК (с новыми столбцами и фильтром 1 строка на образец/скважину):")
     preview_cols = [c for c in ["Скважина", "Номер образца", "Порядковый номер образца", "HORIZON", "PORO_LAB_FRAC", "SWL_LAB", "PERM_LAB", "perm_poro", "PVIT_LAB", "N_LAB"] if c in lab.columns]
-    st.dataframe(lab[preview_cols].head(20), use_container_width=True)
+    st.dataframe(_round_df(lab[preview_cols].head(20)), use_container_width=True)
 
     pvts = sorted(pd.to_numeric(df_geo["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
     horizons = sorted(lab["HORIZON"].unique().tolist())
@@ -1613,19 +2425,25 @@ def brooks_corey_tab() -> None:
     cpar, cqa = st.columns(2)
     with cpar:
         st.subheader("Параметры Брукса-Кори по регионам")
-        st.dataframe(bc_params.round(3), use_container_width=True)
+        st.dataframe(_round_df(bc_params), use_container_width=True)
     with cqa:
         st.subheader("Метрики качества Брукса-Кори")
         if bc_qa is not None and not bc_qa.empty:
-            st.dataframe(bc_qa.round(3), use_container_width=True)
+            st.dataframe(_round_df(bc_qa), use_container_width=True)
             st.metric("GLOBAL SCORE (БК)", f"{bc_qa['SCORE'].mean():.3f}")
             if bc_timing is not None and not bc_timing.empty:
                 st.subheader("Статистика времени расчета БК")
-                st.dataframe(bc_timing.round(3), use_container_width=True)
+                st.dataframe(_round_df(bc_timing), use_container_width=True)
                 if bc_total_elapsed is not None:
                     st.metric("Общее время расчета БК, сек", f"{float(bc_total_elapsed):.2f}")
         else:
             st.info("Метрики пока недоступны.")
+    if st.button("Запомнить результаты по скважинам (Брукса-Кори)", key="save_bc_snapshot"):
+        ok, msg = _save_well_snapshot(bc_res, model_col="Kng_BC_model", method_tag="BC")
+        if ok:
+            st.success(msg)
+        else:
+            st.warning(msg)
 
     pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
     psel = st.selectbox("Регион для графиков БК", pvt_opts, key="bc_plot_pvt")
@@ -1718,7 +2536,7 @@ def brooks_corey_tab() -> None:
         color=bc_color,
         color_continuous_scale="Viridis",
         hover_data=[c for c in ["WELL_NAME", "PC", "PORO_GDM", "Kng_BC_model", "Кнг_W", "thickness", "weight"] if c in g_conv.columns],
-        title=f"PVT {psel}: историческое vs предсказанное (Брукса-Кори)",
+        title=f"PVT {psel}: предсказанное(историческое) (Брукса-Кори)",
         opacity=0.75,
     )
     fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
@@ -1757,15 +2575,26 @@ def brooks_corey_tab() -> None:
             fig_prof.update_yaxes(autorange="reversed")
             st.plotly_chart(fig_prof, use_container_width=True)
 
+def compare_methods_tab() -> None:
+    st.title("Сравнение методов")
+    st.caption("Сначала сохраните результаты по скважинам в вкладках J-функции и Брукса-Кори.")
+    _render_methods_comparison_block(block_key="compare_tab")
+
 
 def main() -> None:
-    page = st.sidebar.radio("Раздел", options=["Подбор J функции Леверетта", "Лаборатория", "Брукса-Кори"])
-    if page == "Подбор J функции Леверетта":
-        leverett_tab()
-    elif page == "Лаборатория":
+    page = st.sidebar.radio("Раздел", options=["Лаборатория", "Подбор J функции Леверетта", "Брукса-Кори", "Сравнение методов"])
+    prev_page = st.session_state.get("_active_page")
+    if prev_page != page:
+        _scroll_page_top()
+    st.session_state["_active_page"] = page
+    if page == "Лаборатория":
         laboratory_tab()
-    else:
+    elif page == "Подбор J функции Леверетта":
+        leverett_tab()
+    elif page == "Брукса-Кори":
         brooks_corey_tab()
+    else:
+        compare_methods_tab()
 
 
 if __name__ == "__main__":
