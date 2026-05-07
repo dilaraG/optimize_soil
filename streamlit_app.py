@@ -608,7 +608,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             y="Кнг_model",
             color="PVTNUM_GDM" if "PVTNUM_GDM" in sj_x.columns else None,
             hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sj_x.columns],
-            title="J: расчетное(историческое) (без Кнг_hist = 0)",
+            title="J: расчетное(историческое)",
             opacity=0.65,
         )
         fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
@@ -622,7 +622,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             y="Кнг_model",
             color="PVTNUM_GDM" if "PVTNUM_GDM" in sb_x.columns else None,
             hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sb_x.columns],
-            title="БК: расчетное(историческое) (без Кнг_hist = 0)",
+            title="БК: расчетное(историческое)",
             opacity=0.65,
         )
         fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
@@ -971,6 +971,53 @@ def _scroll_page_top() -> None:
     )
 
 
+def _ui_lock(is_locked: bool, lock_id: str) -> None:
+    components.html(
+        f"""
+        <script>
+        (function() {{
+          const doc = window.parent.document;
+          if (!doc) return;
+          const lockId = '{lock_id}';
+          const locked = {str(is_locked).lower()};
+          const prev = doc.getElementById(lockId);
+          if (!locked) {{
+            if (prev) prev.remove();
+            doc.querySelectorAll('[data-ui-lock-disabled=\"1\"]').forEach((el) => {{
+              try {{
+                el.disabled = false;
+                el.removeAttribute('data-ui-lock-disabled');
+              }} catch (e) {{}}
+            }});
+            return;
+          }}
+          if (!prev) {{
+            const ov = doc.createElement('div');
+            ov.id = lockId;
+            ov.style.position = 'fixed';
+            ov.style.inset = '0';
+            ov.style.background = 'rgba(255,255,255,0.06)';
+            ov.style.zIndex = '2147483000';
+            ov.style.cursor = 'wait';
+            ov.style.pointerEvents = 'auto';
+            doc.body.appendChild(ov);
+          }}
+          doc.querySelectorAll('button, input, select, textarea').forEach((el) => {{
+            try {{
+              if (!el.disabled) {{
+                el.disabled = true;
+                el.setAttribute('data-ui-lock-disabled', '1');
+              }}
+            }} catch (e) {{}}
+          }});
+        }})();
+        </script>
+        """,
+        height=0,
+        width=0,
+    )
+
+
 def _safe_guess_col(cols: list[str], candidates: list[str]) -> str:
     if not cols:
         return ""
@@ -1003,31 +1050,44 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
     st.caption("Выберите соответствия колонок сверху, затем проверьте предпросмотр.")
     if not cols:
         return df
-    mapping_rules: list[tuple[str, list[str]]] = [
-        ("WELL_NAME", ["WELL_NAME", "СКВАЖ", "WELL", "STVOL"]),
-        ("PVTNUM_GDM", ["PVTNUM", "PVT", "ЭКСПЛ", "OBJECT", "OBJ"]),
-        ("PORO_GDM", ["PORO", "ПОР", "PHI"]),
-        ("PERM_GDM", ["PERM", "ПРОНИ", "KPR", "K_PR"]),
-        ("PC", ["PC", "КАПИЛ", "P_CAP"]),
-        ("SWL_GDM", ["SWL", "SWI", "SW_MIN", "КВО"]),
-        ("Кнг_W", ["КНГ", "KNG", "НЕФТЕНАС", "RIGIS"]),
+    mapping_rules: list[tuple[str, str, list[str]]] = [
+        ("WELL_NAME", "Скважина", ["WELL_NAME", "СКВАЖ", "WELL", "STVOL"]),
+        ("PVTNUM_GDM", "Регион", ["PVTNUM", "PVT", "ЭКСПЛ", "OBJECT", "OBJ"]),
+        ("PORO_GDM", "Пористость", ["PORO", "ПОР", "PHI"]),
+        ("PERM_GDM", "Проницаемость", ["PERM", "ПРОНИ", "KPR", "K_PR"]),
+        ("PC", "Капиллярное давление", ["PC", "КАПИЛ", "P_CAP"]),
+        ("SWL_GDM", "Кво", ["SWL", "SWI", "SW_MIN", "КВО"]),
+        ("Кнг_W", "Нефтенасыщенность", ["КНГ", "KNG", "НЕФТЕНАС", "RIGIS"]),
     ]
-    defaults = {target: _safe_guess_col(cols, hints) for target, hints in mapping_rules}
+    saved_map = st.session_state.get(f"{key_prefix}_wells_map_saved", {})
+    defaults = {}
+    for target, _, hints in mapping_rules:
+        cand = saved_map.get(target)
+        defaults[target] = cand if isinstance(cand, str) and cand in cols else _safe_guess_col(cols, hints)
     pick: dict[str, str] = {}
     cols_ui = st.columns(4)
-    for i, (target, _) in enumerate(mapping_rules):
+    for i, (target, ui_label, _) in enumerate(mapping_rules):
         host = cols_ui[i % 4]
         default = defaults[target]
         idx = cols.index(default) if default in cols else 0
         pick[target] = host.selectbox(
-            f"{target}",
+            ui_label,
             options=cols,
             index=idx,
             key=f"{key_prefix}_map_wells_{target}",
         )
+    row2 = st.columns(4)
+    perf_saved = saved_map.get("Perf_GDM")
+    perf_default = perf_saved if isinstance(perf_saved, str) and perf_saved in cols else _safe_guess_col(cols, ["PERF_GDM", "PERF", "ПЕРФ", "ПЕРФОРА"])
+    perf_options = ["<не использовать>"] + cols
+    perf_idx = perf_options.index(perf_default) if perf_default in perf_options else 0
+    perf_pick = row2[0].selectbox("Перфорация", options=perf_options, index=perf_idx, key=f"{key_prefix}_map_wells_Perf_GDM")
+    if perf_pick != "<не использовать>":
+        pick["Perf_GDM"] = perf_pick
     if len(set(pick.values())) != len(pick):
         st.error("Для обязательных полей скважин выбраны повторяющиеся колонки. Выберите уникальные соответствия.")
         return pd.DataFrame()
+    st.session_state[f"{key_prefix}_wells_map_saved"] = pick.copy()
     rename_map = {src: dst for dst, src in pick.items()}
     mapped = df.rename(columns=rename_map)
     return mapped
@@ -1042,35 +1102,28 @@ def _map_uploaded_prod_df(raw_prod: pd.DataFrame | None, *, key_prefix: str, tit
     st.caption("Опционально: сопоставьте колонки файла добычи в таблице ниже, затем проверьте предпросмотр.")
     if not cols:
         return df
-    rules: list[tuple[str, list[str]]] = [
-        ("WELL_NAME", ["WELL_NAME", "СТВОЛ", "СКВАЖ", "WELL"]),
-        ("PVTNUM_GDM", ["PVTNUM", "ЭКСПЛ", "ОБЪЕКТ", "OBJECT"]),
+    rules: list[tuple[str, str, list[str]]] = [
+        ("WELL_NAME", "Скважина", ["WELL_NAME", "СТВОЛ", "СКВАЖ", "WELL"]),
+        ("PVTNUM_GDM", "Регион", ["PVTNUM", "ЭКСПЛ", "ОБЪЕКТ", "OBJECT"]),
     ]
-    defaults = {target: _safe_guess_col(cols, hints) for target, hints in rules}
-    map_df = pd.DataFrame([defaults])
-    col_cfg = {
-        target: st.column_config.SelectboxColumn(
-            label=target,
-            options=cols,
-            required=True,
-            help=f"Колонка файла добычи для {target}",
-        )
-        for target, _ in rules
-    }
-    edited = st.data_editor(
-        map_df,
-        hide_index=True,
-        num_rows="fixed",
-        use_container_width=True,
-        key=f"{key_prefix}_map_table_prod",
-        column_config=col_cfg,
-    )
+    saved_map = st.session_state.get(f"{key_prefix}_prod_map_saved", {})
+    defaults = {}
+    for target, _, hints in rules:
+        cand = saved_map.get(target)
+        defaults[target] = cand if isinstance(cand, str) and cand in cols else _safe_guess_col(cols, hints)
+    picks: dict[str, str] = {}
+    cols_ui = st.columns(2)
+    for i, (target, ui_label, _) in enumerate(rules):
+        host = cols_ui[i % 2]
+        default = defaults[target]
+        idx = cols.index(default) if default in cols else 0
+        picks[target] = host.selectbox(ui_label, options=cols, index=idx, key=f"{key_prefix}_map_prod_{target}")
     st.caption("Предпросмотр загруженного файла добычи:")
     st.dataframe(_round_df(df.head(12)), use_container_width=True)
-    picks = {target: str(edited.iloc[0][target]) for target, _ in rules}
     if len(set(picks.values())) != len(picks):
         st.error("Для файла добычи выбраны повторяющиеся колонки сопоставления.")
         return pd.DataFrame()
+    st.session_state[f"{key_prefix}_prod_map_saved"] = picks.copy()
     rename_map = {src: dst for dst, src in picks.items()}
     return df.rename(columns=rename_map)
 
@@ -1385,15 +1438,27 @@ def laboratory_tab() -> None:
     horizons = sorted(pd.Series(df[hor_col]).dropna().astype(str).str.strip().unique().tolist())
 
     st.subheader("Фильтр данных")
-    st.caption("Площади — отметьте галочками; горизонты — выберите несколько из списка.")
-    sel_areas: list[str] = []
-    if areas:
-        ncols = min(4, max(1, len(areas)))
-        grid = st.columns(ncols)
-        for i, a in enumerate(areas):
-            if grid[i % ncols].checkbox(str(a), key=f"lab_chk_area_{i}"):
-                sel_areas.append(str(a))
-    sel_hors = st.multiselect("Коды горизонтов (можно несколько)", options=horizons, default=[])
+    st.caption("Площади и горизонты сохраняются в рамках сессии.")
+    if "lab_sel_areas" not in st.session_state:
+        st.session_state["lab_sel_areas"] = areas.copy()
+    if "lab_sel_hors" not in st.session_state:
+        st.session_state["lab_sel_hors"] = []
+    cfa1, cfa2 = st.columns([1, 3])
+    all_selected = set(st.session_state.get("lab_sel_areas", [])) == set(areas) and len(areas) > 0
+    if cfa1.button("Выбрать все (площади)" if not all_selected else "Снять все (площади)", key="lab_toggle_all_areas"):
+        st.session_state["lab_sel_areas"] = [] if all_selected else areas.copy()
+    sel_areas = cfa2.multiselect(
+        "Площади",
+        options=areas,
+        default=[a for a in st.session_state.get("lab_sel_areas", []) if a in areas],
+        key="lab_sel_areas",
+    )
+    sel_hors = st.multiselect(
+        "Коды горизонтов (можно несколько)",
+        options=horizons,
+        default=[h for h in st.session_state.get("lab_sel_hors", []) if h in horizons],
+        key="lab_sel_hors",
+    )
 
     if st.button("Применить фильтр и сохранить выбор для вкладки «Подбор»", type="primary"):
         if not sel_areas or not sel_hors:
@@ -1474,6 +1539,12 @@ def leverett_tab() -> None:
             }[x],
             index=0,
         )
+        use_perf_weights = st.checkbox(
+            "Учитывать перфорации (Perf_GDM) в весах",
+            value=False,
+            key="j_use_perf_weights",
+            help="Если выключено, колонка Perf_GDM игнорируется при расчете весов.",
+        )
         maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=200, step=10)
         popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
 
@@ -1486,7 +1557,7 @@ def leverett_tab() -> None:
         st.session_state["prod_file_path"] = p
         st.session_state["shared_prod_file_path"] = p
 
-    wells_path = _coalesce_path("wells_file_path", "shared_wells_file_path", "bc_wells_path")
+    wells_path = _coalesce_path("shared_wells_file_path", "wells_file_path", "bc_wells_path")
     if not wells_path:
         st.info("Загрузите файл скважин, чтобы продолжить.")
         return
@@ -1494,7 +1565,7 @@ def leverett_tab() -> None:
     try:
         raw_wells = _read_table_from_path(wells_path)
         raw_prod = None
-        prod_path = _coalesce_path("prod_file_path", "shared_prod_file_path", "bc_prod_path")
+        prod_path = _coalesce_path("shared_prod_file_path", "prod_file_path", "bc_prod_path")
         if prod_path:
             raw_prod = _read_table_from_path(prod_path)
         mapped_wells = _map_uploaded_wells_df(raw_wells, key_prefix="j", title="Сопоставление колонок файла скважин")
@@ -1504,10 +1575,16 @@ def leverett_tab() -> None:
         if isinstance(mapped_prod, pd.DataFrame) and mapped_prod.empty:
             return
         df_wells = _clean_wells_cached(mapped_wells)
+        if (not use_perf_weights) and ("Perf_GDM" in df_wells.columns):
+            df_wells = df_wells.drop(columns=["Perf_GDM"])
         df_prod = _clean_prod_cached(mapped_prod)
     except Exception as e:
         st.error(f"Ошибка чтения файла: {e}")
         return
+    st.caption(
+        f"Выбранный файл скважин: `{Path(wells_path).name}`"
+        + (f" | Выбранный файл добычи: `{Path(prod_path).name}`" if prod_path else " | Выбранный файл добычи: не выбран")
+    )
 
     validation_errors = _validate_columns(df_wells, df_prod)
     if validation_errors:
@@ -1652,8 +1729,12 @@ def leverett_tab() -> None:
     use_fixed = st.checkbox("Рассчитать с заданными коэффициентами a, b, sigma (без оптимизации)", value=False)
     fixed_params = _manual_params_ui(pvts) if use_fixed else None
 
-    run_opt = st.button("Рассчитать оптимальные коэффициенты", type="primary")
-    run_fix = st.button("Рассчитать с заданными коэффициентами", type="secondary") if use_fixed else False
+    j_busy = bool(st.session_state.get("j_busy", False))
+    _ui_lock(j_busy, "ui_lock_j")
+    run_opt = st.button("Рассчитать оптимальные коэффициенты", type="primary", disabled=j_busy)
+    run_fix = st.button("Рассчитать с заданными коэффициентами", type="secondary", disabled=j_busy) if use_fixed else False
+    if j_busy:
+        st.warning("Идет расчет J-функции... Пожалуйста, дождитесь завершения.")
 
     def _merge_bounds(partial: dict[int, dict[str, tuple[float, float]]]) -> dict[int, dict[str, tuple[float, float]]]:
         merged = _default_bounds_for_pvts(pvts)
@@ -1666,6 +1747,8 @@ def leverett_tab() -> None:
         elif lab_ready and cloud is not None and any(not (pvt_horizon_map.get(p) or []) for p in pvts):
             st.error("Для режима заданных коэффициентов выберите соответствие горизонтов для каждого PVTNUM.")
         else:
+            st.session_state["j_busy"] = True
+            _ui_lock(True, "ui_lock_j")
             with st.spinner("Применяются заданные коэффициенты..."):
                 try:
                     result_df, params_df, qa_df = run_pipeline(
@@ -1684,11 +1767,16 @@ def leverett_tab() -> None:
                     st.session_state["leverett_params_df"] = params_df
                     st.session_state["leverett_qa_df"] = qa_df
                     st.success("Расчет с заданными коэффициентами завершен.")
+                finally:
+                    st.session_state["j_busy"] = False
+                    _ui_lock(False, "ui_lock_j")
 
     if run_opt:
         if bounds_mode == "Автоподбор по лабораторному облаку" and not bounds_by_pvt:
             st.error("Сначала нажмите «Подобрать границы a, b автоматически по облаку».")
         else:
+            st.session_state["j_busy"] = True
+            _ui_lock(True, "ui_lock_j")
             with st.spinner("Выполняется подбор коэффициентов..."):
                 try:
                     result_df, params_df, qa_df = run_pipeline(
@@ -1707,6 +1795,9 @@ def leverett_tab() -> None:
                     st.session_state["leverett_params_df"] = params_df
                     st.session_state["leverett_qa_df"] = qa_df
                     st.success("Расчет завершен.")
+                finally:
+                    st.session_state["j_busy"] = False
+                    _ui_lock(False, "ui_lock_j")
 
     result_df = st.session_state.get("leverett_result_df")
     params_df = st.session_state.get("leverett_params_df")
@@ -1989,6 +2080,12 @@ def brooks_corey_tab() -> None:
         prod_file = st.file_uploader("Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key="bc_prod_file")
         maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=180, step=10, key="bc_maxiter")
         popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=18, step=1, key="bc_popsize")
+        use_perf_weights = st.checkbox(
+            "Учитывать перфорации (Perf_GDM) в весах БК",
+            value=False,
+            key="bc_use_perf_weights",
+            help="Если выключено, колонка Perf_GDM игнорируется при расчете весов БК.",
+        )
 
     if wells_file is not None:
         p = _persist_uploaded_file(wells_file, "bc_wells")
@@ -1998,14 +2095,14 @@ def brooks_corey_tab() -> None:
         p = _persist_uploaded_file(prod_file, "bc_prod")
         st.session_state["bc_prod_path"] = p
         st.session_state["shared_prod_file_path"] = p
-    wells_path = _coalesce_path("bc_wells_path", "shared_wells_file_path", "wells_file_path")
+    wells_path = _coalesce_path("shared_wells_file_path", "bc_wells_path", "wells_file_path")
     if not wells_path:
         st.info("Загрузите файл скважин для расчета Брукса-Кори.")
         return
 
     try:
         raw_geo = _read_table_from_path(wells_path)
-        prod_path = _coalesce_path("bc_prod_path", "shared_prod_file_path", "prod_file_path")
+        prod_path = _coalesce_path("shared_prod_file_path", "bc_prod_path", "prod_file_path")
         raw_prod = _read_table_from_path(prod_path) if prod_path else None
         mapped_geo = _map_uploaded_wells_df(raw_geo, key_prefix="bc", title="Сопоставление колонок файла скважин (БК)")
         if mapped_geo.empty:
@@ -2014,11 +2111,17 @@ def brooks_corey_tab() -> None:
         if isinstance(mapped_prod, pd.DataFrame) and mapped_prod.empty:
             return
         df_geo_raw = _clean_wells_cached(mapped_geo)
+        if (not use_perf_weights) and ("Perf_GDM" in df_geo_raw.columns):
+            df_geo_raw = df_geo_raw.drop(columns=["Perf_GDM"])
         df_prod = _clean_prod_cached(mapped_prod)
         df_geo = prepare_brooks_training_data(df_geo_raw, df_prod)
     except Exception as e:
         st.error(f"Ошибка чтения геологической модели: {e}")
         return
+    st.caption(
+        f"Выбранный файл скважин: `{Path(wells_path).name}`"
+        + (f" | Выбранный файл добычи: `{Path(prod_path).name}`" if prod_path else " | Выбранный файл добычи: не выбран")
+    )
 
     required = {"PORO_GDM", "PC", "Кнг_W", "PVTNUM_GDM"}
     missing = [c for c in required if c not in df_geo.columns]
@@ -2032,13 +2135,14 @@ def brooks_corey_tab() -> None:
     st.subheader("Сопоставление колонок лабораторной таблицы Брукса-Кори")
     st.caption("Предпросмотр исходной лабораторной таблицы (первые строки):")
     cols = list(bc_lab_df.columns)
+    saved_lab_map = st.session_state.get("bc_lab_col_map", {})
     defaults_lab = {
-        "Код горизонта": _safe_guess_col(cols, ["ГОРИЗ", "HORIZ", "КОД"]),
-        "Poro (лаборатория)": _safe_guess_col(cols, ["PORO", "ПОР"]),
-        "Swi/Swl (лаборатория)": _safe_guess_col(cols, ["SWL", "SWI", "ВОДОНАС"]),
-        "Perm (лаборатория)": _safe_guess_col(cols, ["PERM", "ПРОНИ"]),
-        "Pvit (лаборатория)": _safe_guess_col(cols, ["PVIT", "PENTRY", "PВХ"]),
-        "n (лаборатория)": _safe_guess_col(cols, [" N", "LAMB", "ПОКАЗ", "N_"]),
+        "Код горизонта": saved_lab_map.get("Код горизонта") if saved_lab_map.get("Код горизонта") in cols else _safe_guess_col(cols, ["ГОРИЗ", "HORIZ", "КОД"]),
+        "Poro (лаборатория)": saved_lab_map.get("Poro (лаборатория)") if saved_lab_map.get("Poro (лаборатория)") in cols else _safe_guess_col(cols, ["КП", "PORO", "ПОРИСТ"]),
+        "Swi/Swl (лаборатория)": saved_lab_map.get("Swi/Swl (лаборатория)") if saved_lab_map.get("Swi/Swl (лаборатория)") in cols else _safe_guess_col(cols, ["КВО", "SWL", "SWI"]),
+        "Perm (лаборатория)": saved_lab_map.get("Perm (лаборатория)") if saved_lab_map.get("Perm (лаборатория)") in cols else _safe_guess_col(cols, ["КПР", "ПРОНИЦАЕМОСТ", "PERM"]),
+        "Pvit (лаборатория)": saved_lab_map.get("Pvit (лаборатория)") if saved_lab_map.get("Pvit (лаборатория)") in cols else _safe_guess_col(cols, ["РВЫТ", "PVIT"]),
+        "n (лаборатория)": saved_lab_map.get("n (лаборатория)") if saved_lab_map.get("n (лаборатория)") in cols else _safe_guess_col(cols, [" N", "N_"]),
     }
     lab_map_df = pd.DataFrame([defaults_lab])
     lab_cfg = {
@@ -2059,6 +2163,14 @@ def brooks_corey_tab() -> None:
     perm_col = str(lab_edit.iloc[0]["Perm (лаборатория)"])
     pvit_col = str(lab_edit.iloc[0]["Pvit (лаборатория)"])
     n_col = str(lab_edit.iloc[0]["n (лаборатория)"])
+    st.session_state["bc_lab_col_map"] = {
+        "Код горизонта": horizon_col,
+        "Poro (лаборатория)": poro_col,
+        "Swi/Swl (лаборатория)": swl_col,
+        "Perm (лаборатория)": perm_col,
+        "Pvit (лаборатория)": pvit_col,
+        "n (лаборатория)": n_col,
+    }
     st.caption(
         f"В расчетах БК используются выбранные столбцы: горизонт=`{horizon_col}`, poro=`{poro_col}`, "
         f"swl=`{swl_col}`, perm=`{perm_col}`, pvit=`{pvit_col}`, n=`{n_col}`."
@@ -2153,11 +2265,18 @@ def brooks_corey_tab() -> None:
     horizons = sorted(lab["HORIZON"].unique().tolist())
     st.subheader("Связь горизонт -> PVTNUM (Брукса-Кори)")
     pvt_h_map = st.session_state.get("bc_pvt_h_map", {})
+    # Синхронизация: если горизонт убран из фильтра "Горизонты для БК",
+    # удаляем его из ранее сохраненных связей горизонт -> PVTNUM.
+    allowed_h = set(horizons)
+    for p in list(pvt_h_map.keys()):
+        prev = pvt_h_map.get(p, []) or []
+        pvt_h_map[p] = [h for h in prev if str(h) in allowed_h]
     for p in pvts:
+        prev_sel = [h for h in (pvt_h_map.get(p, []) or []) if str(h) in allowed_h]
         pvt_h_map[p] = st.multiselect(
             f"Горизонты для PVTNUM {p}",
             options=horizons,
-            default=pvt_h_map.get(p, []),
+            default=prev_sel,
             key=f"bc_map_{p}",
         )
     st.session_state["bc_pvt_h_map"] = pvt_h_map
@@ -2251,11 +2370,17 @@ def brooks_corey_tab() -> None:
                 c3.plotly_chart(fig3, use_container_width=True)
                 c4.plotly_chart(fig4, use_container_width=True)
 
-    if st.button("Рассчитать Брукса-Кори", type="primary"):
+    bc_busy = bool(st.session_state.get("bc_busy", False))
+    _ui_lock(bc_busy, "ui_lock_bc")
+    if bc_busy:
+        st.warning("Идет расчет Брукса-Кори... Пожалуйста, дождитесь завершения.")
+    if st.button("Рассчитать Брукса-Кори", type="primary", disabled=bc_busy):
         if any(not pvt_h_map.get(p) for p in pvts):
             st.error("Выберите горизонты для каждого PVTNUM.")
             return
 
+        st.session_state["bc_busy"] = True
+        _ui_lock(True, "ui_lock_bc")
         perm_cap_run = float(st.session_state.get("bc_perm_cap", 5000.0))
 
         results = []
@@ -2270,135 +2395,45 @@ def brooks_corey_tab() -> None:
             lsub = lab[lab["HORIZON"].isin(h)].copy()
             if g.empty or lsub.empty:
                 continue
-
-            swl_exp_info = auto_exp_bounds_swl_poro(
-                lsub["PORO_LAB_FRAC"].to_numpy(),
-                lsub["SWL_LAB"].to_numpy(),
-            )
+            swl_exp_info = auto_exp_bounds_swl_poro(lsub["PORO_LAB_FRAC"].to_numpy(), lsub["SWL_LAB"].to_numpy())
             perm_info = auto_power_bounds(lsub["SWL_LAB"].to_numpy(), lsub["PERM_LAB"].to_numpy())
             pvit_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["PVIT_LAB"].to_numpy())
             n_info = auto_power_bounds(lsub["perm_poro"].to_numpy(), lsub["N_LAB"].to_numpy())
-            b_swl = swl_exp_info["bounds"]
-            b_perm = perm_info["bounds"]
-            b_pvit = pvit_info["bounds"]
-            b_n = n_info["bounds"]
-
+            b_swl = swl_exp_info["bounds"]; b_perm = perm_info["bounds"]; b_pvit = pvit_info["bounds"]; b_n = n_info["bounds"]
             bounds = {"swl": b_swl, "perm": b_perm, "pvit": b_pvit, "n": b_n}
             envelopes = {
-                "swl": {
-                    "kind": "exp_ab",
-                    "lower": swl_exp_info["lower"],
-                    "upper": swl_exp_info["upper"],
-                    "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float),
-                },
-                "perm": {
-                    "lower": perm_info["lower"],
-                    "upper": perm_info["upper"],
-                    "x": lsub["SWL_LAB"].to_numpy(dtype=float),
-                },
-                "pvit": {
-                    "lower": pvit_info["lower"],
-                    "upper": pvit_info["upper"],
-                    "x": lsub["perm_poro"].to_numpy(dtype=float),
-                },
-                "n": {
-                    "lower": n_info["lower"],
-                    "upper": n_info["upper"],
-                    "x": lsub["perm_poro"].to_numpy(dtype=float),
-                },
+                "swl": {"kind": "exp_ab", "lower": swl_exp_info["lower"], "upper": swl_exp_info["upper"], "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float)},
+                "perm": {"lower": perm_info["lower"], "upper": perm_info["upper"], "x": lsub["SWL_LAB"].to_numpy(dtype=float)},
+                "pvit": {"lower": pvit_info["lower"], "upper": pvit_info["upper"], "x": lsub["perm_poro"].to_numpy(dtype=float)},
+                "n": {"lower": n_info["lower"], "upper": n_info["upper"], "x": lsub["perm_poro"].to_numpy(dtype=float)},
             }
             if use_manual_bc:
-                mp = manual_params_by_pvt.get(p, {})
-                params = {**mp, "perm_max_md": perm_cap_run}
+                params = {**manual_params_by_pvt.get(p, {}), "perm_max_md": perm_cap_run}
             else:
-                baseline = {
-                    "a_swl": 0.15,
-                    "b_swl": -0.5,
-                    "a_perm": 1.0,
-                    "b_perm": -0.5,
-                    "a_pvit": 1.0,
-                    "b_pvit": -0.5,
-                    "a_n": 1.0,
-                    "b_n": -0.5,
-                    "perm_max_md": perm_cap_run,
-                }
-                corr = {
-                    "a_swl": float(swl_exp_info.get("center")[0]),
-                    "b_swl": float(swl_exp_info.get("center")[1]),
-                    "a_perm": float(perm_info.get("center")[0]),
-                    "b_perm": float(perm_info.get("center")[1]),
-                    "a_pvit": float(pvit_info.get("center")[0]),
-                    "b_pvit": float(pvit_info.get("center")[1]),
-                    "a_n": float(n_info.get("center")[0]),
-                    "b_n": float(n_info.get("center")[1]),
-                    "perm_max_md": perm_cap_run,
-                }
-                params = optimize_brooks_corey_for_region(
-                    g,
-                    bounds=bounds,
-                    envelopes=envelopes,
-                    maxiter=maxiter,
-                    popsize=popsize,
-                    initial_guess={
-                        "swl": swl_exp_info.get("center"),
-                        "perm": perm_info.get("center"),
-                        "pvit": pvit_info.get("center"),
-                        "n": n_info.get("center"),
-                    },
-                    baseline_params=baseline,
-                    perm_max_md=perm_cap_run,
-                )
-                # Финальный выбор по SCORE региона: авто/корреляция/дефолт
-                cand = [("auto", params), ("corr", corr), ("default", baseline)]
-                best_name, best_params, best_score = None, None, -np.inf
-                for nm, cp in cand:
+                baseline = {"a_swl": 0.15, "b_swl": -0.5, "a_perm": 1.0, "b_perm": -0.5, "a_pvit": 1.0, "b_pvit": -0.5, "a_n": 1.0, "b_n": -0.5, "perm_max_md": perm_cap_run}
+                corr = {"a_swl": float(swl_exp_info.get("center")[0]), "b_swl": float(swl_exp_info.get("center")[1]), "a_perm": float(perm_info.get("center")[0]), "b_perm": float(perm_info.get("center")[1]), "a_pvit": float(pvit_info.get("center")[0]), "b_pvit": float(pvit_info.get("center")[1]), "a_n": float(n_info.get("center")[0]), "b_n": float(n_info.get("center")[1]), "perm_max_md": perm_cap_run}
+                params = optimize_brooks_corey_for_region(g, bounds=bounds, envelopes=envelopes, maxiter=maxiter, popsize=popsize, initial_guess={"swl": swl_exp_info.get("center"), "perm": perm_info.get("center"), "pvit": pvit_info.get("center"), "n": n_info.get("center")}, baseline_params=baseline, perm_max_md=perm_cap_run)
+                best_params, best_score = None, -np.inf
+                for _, cp in [("auto", params), ("corr", corr), ("default", baseline)]:
                     cp = {**cp, "perm_max_md": perm_cap_run}
                     if envelope_max_violation(cp, envelopes) > 1e-9:
                         continue
                     score = evaluate_brooks_score(g, cp)
                     if score > best_score:
-                        best_name, best_params, best_score = nm, cp, score
+                        best_params, best_score = cp, score
                 if best_params is not None:
                     params = best_params
             elapsed = float(time.perf_counter() - t0_pvt)
             if not params:
                 continue
-            pred = compute_soil_from_params(g, params)
-            g["Kng_BC_model"] = pred
+            g["Kng_BC_model"] = compute_soil_from_params(g, params)
             results.append(g)
             params_rows.append({"PVTNUM_GDM": p, **params})
-            timing_rows.append(
-                {
-                    "PVTNUM_GDM": int(p),
-                    "rows_geo": int(len(g)),
-                    "rows_lab": int(len(lsub)),
-                    "elapsed_sec": elapsed,
-                }
-            )
-            bc_meta[p] = {
-                "lab": lsub.copy(),
-                "bounds": bounds,
-                "perm_max_md": perm_cap_run,
-                "centers": {
-                    "swl": swl_exp_info.get("center"),
-                    "perm": perm_info.get("center"),
-                    "pvit": pvit_info.get("center"),
-                    "n": n_info.get("center"),
-                },
-                "envelopes": {
-                    "swl": {
-                        "kind": "exp_ab",
-                        "lower": swl_exp_info.get("lower"),
-                        "upper": swl_exp_info.get("upper"),
-                        "x": lsub["PORO_LAB_FRAC"].to_numpy(dtype=float),
-                    },
-                    "perm": {"lower": perm_info.get("lower"), "upper": perm_info.get("upper"), "x": lsub["SWL_LAB"].to_numpy(dtype=float)},
-                    "pvit": {"lower": pvit_info.get("lower"), "upper": pvit_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
-                    "n": {"lower": n_info.get("lower"), "upper": n_info.get("upper"), "x": lsub["perm_poro"].to_numpy(dtype=float)},
-                },
-            }
-
+            timing_rows.append({"PVTNUM_GDM": int(p), "rows_geo": int(len(g)), "rows_lab": int(len(lsub)), "elapsed_sec": elapsed})
+            bc_meta[p] = {"lab": lsub.copy(), "bounds": bounds, "perm_max_md": perm_cap_run, "centers": {"swl": swl_exp_info.get("center"), "perm": perm_info.get("center"), "pvit": pvit_info.get("center"), "n": n_info.get("center")}, "envelopes": envelopes}
         if not results:
+            st.session_state["bc_busy"] = False
+            _ui_lock(False, "ui_lock_bc")
             st.error("Не удалось рассчитать параметры Брукса-Кори.")
             return
         bc_res = pd.concat(results, ignore_index=True)
@@ -2412,6 +2447,8 @@ def brooks_corey_tab() -> None:
         st.session_state["bc_timing_df"] = bc_timing
         st.session_state["bc_total_elapsed_sec"] = total_elapsed
         st.session_state["bc_meta"] = bc_meta
+        st.session_state["bc_busy"] = False
+        _ui_lock(False, "ui_lock_bc")
         st.success("Расчет Брукса-Кори завершен.")
 
     bc_res: pd.DataFrame | None = st.session_state.get("bc_result_df")
@@ -2426,16 +2463,16 @@ def brooks_corey_tab() -> None:
     with cpar:
         st.subheader("Параметры Брукса-Кори по регионам")
         st.dataframe(_round_df(bc_params), use_container_width=True)
+        if bc_timing is not None and not bc_timing.empty:
+            st.subheader("Статистика времени расчета БК")
+            st.dataframe(_round_df(bc_timing), use_container_width=True)
+            if bc_total_elapsed is not None:
+                st.metric("Общее время расчета БК, сек", f"{float(bc_total_elapsed):.2f}")
     with cqa:
         st.subheader("Метрики качества Брукса-Кори")
         if bc_qa is not None and not bc_qa.empty:
             st.dataframe(_round_df(bc_qa), use_container_width=True)
             st.metric("GLOBAL SCORE (БК)", f"{bc_qa['SCORE'].mean():.3f}")
-            if bc_timing is not None and not bc_timing.empty:
-                st.subheader("Статистика времени расчета БК")
-                st.dataframe(_round_df(bc_timing), use_container_width=True)
-                if bc_total_elapsed is not None:
-                    st.metric("Общее время расчета БК, сек", f"{float(bc_total_elapsed):.2f}")
         else:
             st.info("Метрики пока недоступны.")
     if st.button("Запомнить результаты по скважинам (Брукса-Кори)", key="save_bc_snapshot"):
@@ -2585,6 +2622,13 @@ def main() -> None:
     page = st.sidebar.radio("Раздел", options=["Лаборатория", "Подбор J функции Леверетта", "Брукса-Кори", "Сравнение методов"])
     prev_page = st.session_state.get("_active_page")
     if prev_page != page:
+        # Не запоминаем связь код горизонта -> PVTNUM при переключении разделов
+        st.session_state.pop("pvt_horizon_map", None)
+        st.session_state.pop("bc_pvt_h_map", None)
+        for k in list(st.session_state.keys()):
+            ks = str(k)
+            if ks.startswith("pvt_hor_map_") or ks.startswith("bc_map_"):
+                st.session_state.pop(k, None)
         _scroll_page_top()
     st.session_state["_active_page"] = page
     if page == "Лаборатория":
