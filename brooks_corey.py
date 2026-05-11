@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
-from scipy.optimize import differential_evolution
+from scipy.optimize import differential_evolution, dual_annealing
 
 from optimize import huber_loss, prepare_input_df, prepare_weights
 
@@ -277,6 +277,56 @@ def _filter_target_like_j(df: pd.DataFrame) -> pd.DataFrame:
     return out.loc[sorted(set(keep_idx))]
 
 
+def _clip_bc_vec(vec: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
+    out = np.clip(np.asarray(vec, dtype=float), lb, ub)
+    for idx in (3, 5, 7):
+        out[idx] = min(float(out[idx]), -1e-3)
+    return out
+
+
+def _bc_pso_optimize(
+    loss: Callable[[np.ndarray], float],
+    de_bounds: list[tuple[float, float]],
+    *,
+    maxiter: int,
+    popsize: int,
+    seed: int = 42,
+) -> np.ndarray:
+    """Рой частиц по тем же границам и loss, что и для DE (8 параметров БК)."""
+    lb = np.array([b[0] for b in de_bounds], dtype=float)
+    ub = np.array([b[1] for b in de_bounds], dtype=float)
+    dim = len(de_bounds)
+    rng = np.random.default_rng(seed)
+    particles = int(max(popsize, 12, 2 * dim))
+    x = rng.uniform(lb, ub, size=(particles, dim))
+    for i in range(particles):
+        x[i] = _clip_bc_vec(x[i], lb, ub)
+    v = np.zeros_like(x)
+    pbest = x.copy()
+    pbest_val = np.array([loss(xx) for xx in pbest], dtype=float)
+    gidx = int(np.argmin(pbest_val))
+    gbest = pbest[gidx].copy()
+    gbest_val = float(pbest_val[gidx])
+    w_pso, c1, c2 = 0.72, 1.49, 1.49
+    for _ in range(maxiter):
+        r1 = rng.random((particles, dim))
+        r2 = rng.random((particles, dim))
+        v = w_pso * v + c1 * r1 * (pbest - x) + c2 * r2 * (gbest - x)
+        x = x + v
+        for i in range(particles):
+            x[i] = _clip_bc_vec(x[i], lb, ub)
+        vals = np.array([loss(xx) for xx in x], dtype=float)
+        better = vals < pbest_val
+        pbest[better] = x[better]
+        pbest_val[better] = vals[better]
+        cur_idx = int(np.argmin(pbest_val))
+        cur_val = float(pbest_val[cur_idx])
+        if cur_val < gbest_val:
+            gbest_val = cur_val
+            gbest = pbest[cur_idx].copy()
+    return gbest
+
+
 def optimize_brooks_corey_for_region(
     df_region: pd.DataFrame,
     bounds: dict[str, PowerBounds],
@@ -286,11 +336,11 @@ def optimize_brooks_corey_for_region(
     initial_guess: dict[str, tuple[float, float]] | None = None,
     baseline_params: dict[str, float] | None = None,
     perm_max_md: float = DEFAULT_PERM_MAX_MD,
+    optimizer_method: str = "differential_evolution",
 ) -> dict[str, float]:
     """
-    Подбор параметров методом differential_evolution
-    с целевой функцией как у J-функции (взвешенный huber),
-    и штрафом за выход оптимальной кривой за лабораторные огибающие.
+    Подбор параметров глобальной оптимизацией (differential_evolution / dual_annealing / pso):
+    взвешенный Huber по невязке Кнг + штраф за огибающие лаборатории.
     """
     train = _filter_target_like_j(df_region)
     if train.empty:
@@ -396,30 +446,34 @@ def optimize_brooks_corey_for_region(
     )
     lb = np.array([b[0] for b in de_bounds], dtype=float)
     ub = np.array([b[1] for b in de_bounds], dtype=float)
-    x0 = np.clip(x0, lb, ub)
-    for idx in [3, 5, 7]:
-        x0[idx] = min(x0[idx], -1e-3)
-    # init популяции с центром вокруг корреляционного приближения
-    rng = np.random.default_rng(42)
-    n_dim = len(de_bounds)
-    n_pop = max(popsize * n_dim, 24)
-    init_pop = rng.uniform(lb, ub, size=(n_pop, n_dim))
-    init_pop[0] = x0
-    for i in range(1, min(6, n_pop)):
-        jitter = rng.normal(0.0, 0.05, size=n_dim) * (ub - lb)
-        init_pop[i] = np.clip(x0 + jitter, lb, ub)
-        for idx in [3, 5, 7]:
-            init_pop[i][idx] = min(init_pop[i][idx], -1e-3)
+    x0 = _clip_bc_vec(x0, lb, ub)
 
-    res = differential_evolution(
-        loss,
-        bounds=de_bounds,
-        maxiter=maxiter,
-        popsize=popsize,
-        seed=42,
-        init=init_pop,
-    )
-    best = {k: float(v) for k, v in zip(param_names, res.x)}
+    method = (optimizer_method or "differential_evolution").lower()
+    if method == "pso":
+        res_x = _bc_pso_optimize(loss, de_bounds, maxiter=maxiter, popsize=popsize, seed=42)
+    elif method == "dual_annealing":
+        da_res = dual_annealing(loss, bounds=de_bounds, maxiter=maxiter, seed=42)
+        res_x = _clip_bc_vec(np.asarray(da_res.x, dtype=float), lb, ub)
+    else:
+        rng = np.random.default_rng(42)
+        n_dim = len(de_bounds)
+        n_pop = max(popsize * n_dim, 24)
+        init_pop = rng.uniform(lb, ub, size=(n_pop, n_dim))
+        init_pop[0] = x0
+        for i in range(1, min(6, n_pop)):
+            jitter = rng.normal(0.0, 0.05, size=n_dim) * (ub - lb)
+            init_pop[i] = _clip_bc_vec(x0 + jitter, lb, ub)
+        res = differential_evolution(
+            loss,
+            bounds=de_bounds,
+            maxiter=maxiter,
+            popsize=popsize,
+            seed=42,
+            init=init_pop,
+        )
+        res_x = np.asarray(res.x, dtype=float)
+
+    best = {k: float(v) for k, v in zip(param_names, res_x)}
     best["perm_max_md"] = resolved_perm_max
     best_val = float(loss(np.array([best[k] for k in param_names], dtype=float)))
 

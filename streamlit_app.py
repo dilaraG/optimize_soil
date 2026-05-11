@@ -2263,6 +2263,17 @@ def brooks_corey_tab() -> None:
         prod_file = st.file_uploader("Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key="bc_prod_file")
         maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=180, step=10, key="bc_maxiter")
         popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=18, step=1, key="bc_popsize")
+        bc_optimizer_method = st.selectbox(
+            "Метод оптимизации БК",
+            options=["differential_evolution", "pso", "dual_annealing"],
+            format_func=lambda x: {
+                "differential_evolution": "Дифференциальная эволюция",
+                "pso": "Рой частиц (PSO)",
+                "dual_annealing": "Dual Annealing",
+            }[x],
+            index=0,
+            key="bc_optimizer_method",
+        )
         use_perf_weights = st.checkbox(
             "Учитывать перфорации (Perf_GDM) в весах БК",
             value=False,
@@ -2595,7 +2606,22 @@ def brooks_corey_tab() -> None:
             else:
                 baseline = {"a_swl": 0.15, "b_swl": -0.5, "a_perm": 1.0, "b_perm": -0.5, "a_pvit": 1.0, "b_pvit": -0.5, "a_n": 1.0, "b_n": -0.5, "perm_max_md": perm_cap_run}
                 corr = {"a_swl": float(swl_exp_info.get("center")[0]), "b_swl": float(swl_exp_info.get("center")[1]), "a_perm": float(perm_info.get("center")[0]), "b_perm": float(perm_info.get("center")[1]), "a_pvit": float(pvit_info.get("center")[0]), "b_pvit": float(pvit_info.get("center")[1]), "a_n": float(n_info.get("center")[0]), "b_n": float(n_info.get("center")[1]), "perm_max_md": perm_cap_run}
-                params = optimize_brooks_corey_for_region(g, bounds=bounds, envelopes=envelopes, maxiter=maxiter, popsize=popsize, initial_guess={"swl": swl_exp_info.get("center"), "perm": perm_info.get("center"), "pvit": pvit_info.get("center"), "n": n_info.get("center")}, baseline_params=baseline, perm_max_md=perm_cap_run)
+                params = optimize_brooks_corey_for_region(
+                    g,
+                    bounds=bounds,
+                    envelopes=envelopes,
+                    maxiter=maxiter,
+                    popsize=popsize,
+                    initial_guess={
+                        "swl": swl_exp_info.get("center"),
+                        "perm": perm_info.get("center"),
+                        "pvit": pvit_info.get("center"),
+                        "n": n_info.get("center"),
+                    },
+                    baseline_params=baseline,
+                    perm_max_md=perm_cap_run,
+                    optimizer_method=bc_optimizer_method,
+                )
                 best_params, best_score = None, -np.inf
                 for _, cp in [("auto", params), ("corr", corr), ("default", baseline)]:
                     cp = {**cp, "perm_max_md": perm_cap_run}
