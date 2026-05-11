@@ -587,13 +587,13 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         return
     st.caption(f"Общих скважин: {len(common_wells)}")
 
-    st.markdown("### Метрики по каждому методу (по горизонтам, PVTNUM_GDM)")
+    st.markdown("### Метрики по каждому методу (по горизонтам, Регион)")
     st.caption("Точки с Кнг_hist = 0 не участвуют в метриках и на кроссплотах.")
     tab_j = _calc_metrics_by_horizon(sj)
     tab_b = _calc_metrics_by_horizon(sb)
     cjm, cbm = st.columns(2)
-    cjm.dataframe(_round_df(tab_j.set_index("PVTNUM_GDM")), use_container_width=True)
-    cbm.dataframe(_round_df(tab_b.set_index("PVTNUM_GDM")), use_container_width=True)
+    cjm.dataframe(_round_df(tab_j.rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")), use_container_width=True)
+    cbm.dataframe(_round_df(tab_b.rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")), use_container_width=True)
 
     st.markdown("### Кроссплоты по методам")
     c3, c4 = st.columns(2)
@@ -602,30 +602,42 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     if sj_x.empty:
         c3.info("Нет точек для кроссплота J после исключения Кнг_hist = 0.")
     else:
+        sj_plot = sj_x.copy()
+        if "PVTNUM_GDM" in sj_plot.columns:
+            sj_plot["Регион"] = pd.to_numeric(sj_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
         fig_j = px.scatter(
-            sj_x,
+            sj_plot,
             x="Кнг_hist",
             y="Кнг_model",
-            color="PVTNUM_GDM" if "PVTNUM_GDM" in sj_x.columns else None,
-            hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sj_x.columns],
+            color="Регион" if "Регион" in sj_plot.columns else None,
+            color_discrete_sequence=px.colors.qualitative.Dark24,
+            hover_data=[c for c in ["WELL_NAME", "_AXIS", "Регион"] if c in sj_plot.columns],
             title="J: расчетное(историческое)",
             opacity=0.65,
         )
         fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        fig_j.update_traces(hovertemplate="Кнг_hist=%{x:.3f}<br>Кнг_model=%{y:.3f}<extra></extra>")
+        fig_j.update_layout(legend_title_text="Регион")
         c3.plotly_chart(fig_j, use_container_width=True)
     if sb_x.empty:
         c4.info("Нет точек для кроссплота БК после исключения Кнг_hist = 0.")
     else:
+        sb_plot = sb_x.copy()
+        if "PVTNUM_GDM" in sb_plot.columns:
+            sb_plot["Регион"] = pd.to_numeric(sb_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
         fig_bc = px.scatter(
-            sb_x,
+            sb_plot,
             x="Кнг_hist",
             y="Кнг_model",
-            color="PVTNUM_GDM" if "PVTNUM_GDM" in sb_x.columns else None,
-            hover_data=[c for c in ["WELL_NAME", "_AXIS"] if c in sb_x.columns],
+            color="Регион" if "Регион" in sb_plot.columns else None,
+            color_discrete_sequence=px.colors.qualitative.Dark24,
+            hover_data=[c for c in ["WELL_NAME", "_AXIS", "Регион"] if c in sb_plot.columns],
             title="БК: расчетное(историческое)",
             opacity=0.65,
         )
         fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        fig_bc.update_traces(hovertemplate="Кнг_hist=%{x:.3f}<br>Кнг_model=%{y:.3f}<extra></extra>")
+        fig_bc.update_layout(legend_title_text="Регион")
         c4.plotly_chart(fig_bc, use_container_width=True)
 
     st.markdown("### Региональные средневзвешенные значения и распределения")
@@ -662,6 +674,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                     mime="text/csv",
                     key=f"{block_key}_dl_hist_j",
                 )
+                cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
                 cc2.dataframe(_round_df(stats_df), use_container_width=True)
                 cc2.download_button(
                     "Скачать статистику (J, CSV)",
@@ -702,6 +715,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                     mime="text/csv",
                     key=f"{block_key}_dl_hist_bc",
                 )
+                cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
                 cc2.dataframe(_round_df(stats_df), use_container_width=True)
                 cc2.download_button(
                     "Скачать статистику (БК, CSV)",
@@ -743,6 +757,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 mime="text/csv",
                 key=f"{block_key}_dl_hist_jbc",
             )
+            c2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
             c2.dataframe(_round_df(stats_df), use_container_width=True)
             c2.download_button(
                 "Скачать статистику (J_vs_БК, CSV)",
@@ -797,6 +812,16 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     cmp_df["good_match"] = (cmp_df["corr_j_bc"] >= 0.8) & (cmp_df["trend_j_bc"] >= 65.0)
     st.metric("Скважины с хорошим совпадением J и БК (по трендам)", int(cmp_df["good_match"].sum()))
     disp_cols = ["WELL_NAME", "corr_j_bc", "trend_j_bc", "corr_j_hist", "corr_bc_hist", "good_match", "points_interp"]
+    with st.expander("Как интерпретировать таблицу сравнения", expanded=False):
+        st.markdown(
+            "- `WELL_NAME` — название скважины.\n"
+            "- `corr_j_bc` — корреляция между профилями J и БК (ближе к 1 — лучше согласие).\n"
+            "- `trend_j_bc` — доля совпадающих направлений изменения J и БК по глубине, %.\n"
+            "- `corr_j_hist` — корреляция профиля J с историческим профилем.\n"
+            "- `corr_bc_hist` — корреляция профиля БК с историческим профилем.\n"
+            "- `good_match` — флаг хорошего совпадения (истина, если `corr_j_bc >= 0.8` и `trend_j_bc >= 65%`).\n"
+            "- `points_interp` — число интерполированных точек, по которым считались метрики."
+        )
     st.dataframe(
         _round_df(cmp_df[disp_cols].sort_values(["good_match", "corr_j_bc", "trend_j_bc"], ascending=[False, False, False])),
         use_container_width=True,
@@ -822,6 +847,17 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         hover_data=["WELL_NAME", "corr_j_hist", "corr_bc_hist", "points_interp"],
         title="Кластеры: согласованность J-функции и Брукса–Кори (корреляция и тренд)",
     )
+    fig_cluster.update_traces(hovertemplate="corr_j_bc=%{x:.3f}<br>trend_j_bc=%{y:.3f}<extra></extra>")
+    with st.expander("Как интерпретировать график кластеров", expanded=False):
+        st.markdown(
+            "- Каждая точка — одна скважина.\n"
+            "- Ось X (`corr_j_bc`) показывает, насколько форма кривых J и БК похожа.\n"
+            "- Ось Y (`trend_j_bc`) показывает долю совпадения направления изменений по глубине, %.\n"
+            "- Чем правее и выше точка, тем лучше согласованность методов по скважине.\n"
+            "- `cluster` — метка кластера (группа скважин с похожей комбинацией `corr_j_bc` и `trend_j_bc`).\n"
+            "- `good_match=True` — скважина в зоне хорошего согласия: `corr_j_bc >= 0.8` и `trend_j_bc >= 65%`.\n"
+            "- `good_match=False` (или `0`) — хотя бы один из критериев не выполнен, согласованность ниже целевой."
+        )
     st.plotly_chart(fig_cluster, use_container_width=True)
 
     well = st.selectbox("Скважина для детального сравнения", options=sorted(cmp_df["WELL_NAME"].unique().tolist()), key=f"{block_key}_well")
@@ -1043,6 +1079,16 @@ def _round_df(df: pd.DataFrame, digits: int = 3) -> pd.DataFrame:
     return out
 
 
+def _fmt_float3(x: object) -> str:
+    try:
+        xf = float(x)  # type: ignore[arg-type]
+        if not np.isfinite(xf):
+            return "—"
+        return f"{xf:.3f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
 def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: str) -> pd.DataFrame:
     df = _normalize_columns(raw_wells.copy())
     cols = list(df.columns)
@@ -1239,6 +1285,8 @@ def _plot_bc_cloud(
     curve_kind: str = "power",
 ) -> go.Figure:
     fig = px.scatter(df, x=x_col, y=y_col, color="HORIZON" if "HORIZON" in df.columns else None, opacity=0.65, title=title)
+    fig.update_layout(legend_title_text="Регион")
+    fig.update_traces(hovertemplate=f"{x_col}=%{{x:.3f}}<br>{y_col}=%{{y:.3f}}<extra></extra>")
     x = pd.to_numeric(df[x_col], errors="coerce").to_numpy(dtype=float)
     x = x[np.isfinite(x) & (x > 0)]
     if len(x) == 0:
@@ -1418,20 +1466,20 @@ def laboratory_tab() -> None:
     area_guess = guess_area_column(cols)
     hor_guess = guess_horizon_column(cols)
     j_guess = guess_j_column(cols)
-    swn_pick, swn_list = pick_second_swn_column(cols)
+    _, swn_list = pick_second_swn_column(cols)
 
     st.subheader("Сопоставление колонок")
     c1, c2, c3, c4 = st.columns(4)
     area_col = c1.selectbox("Колонка площади", options=cols, index=_idx_or_zero(area_guess))
     hor_col = c2.selectbox("Колонка кода горизонта", options=cols, index=_idx_or_zero(hor_guess))
     j_col = c3.selectbox("J (функция Леверетта)", options=cols, index=_idx_or_zero(j_guess))
-    default_swn = swn_pick if swn_pick in cols else cols[0]
+    default_swn = "Swn" if "Swn" in cols else cols[0]
     swn_idx = cols.index(default_swn) if default_swn in cols else 0
     swn_col = c4.selectbox(
-        "Swn (по умолчанию — «второй» SWn-кандидат, если есть)",
+        "Swn",
         options=cols,
         index=swn_idx,
-        help=f"Найденные SWn-колонки: {swn_list}",
+        help=(f"Найденные кандидаты SWn: {swn_list}" if swn_list else None),
     )
 
     areas = sorted(pd.Series(df[area_col]).dropna().astype(str).str.strip().unique().tolist())
@@ -1441,22 +1489,20 @@ def laboratory_tab() -> None:
     st.caption("Площади и горизонты сохраняются в рамках сессии.")
     if "lab_sel_areas" not in st.session_state:
         st.session_state["lab_sel_areas"] = areas.copy()
+    else:
+        st.session_state["lab_sel_areas"] = [a for a in st.session_state["lab_sel_areas"] if a in areas]
     if "lab_sel_hors" not in st.session_state:
         st.session_state["lab_sel_hors"] = []
+    else:
+        st.session_state["lab_sel_hors"] = [h for h in st.session_state["lab_sel_hors"] if h in horizons]
     cfa1, cfa2 = st.columns([1, 3])
     all_selected = set(st.session_state.get("lab_sel_areas", [])) == set(areas) and len(areas) > 0
     if cfa1.button("Выбрать все (площади)" if not all_selected else "Снять все (площади)", key="lab_toggle_all_areas"):
         st.session_state["lab_sel_areas"] = [] if all_selected else areas.copy()
-    sel_areas = cfa2.multiselect(
-        "Площади",
-        options=areas,
-        default=[a for a in st.session_state.get("lab_sel_areas", []) if a in areas],
-        key="lab_sel_areas",
-    )
+    sel_areas = cfa2.multiselect("Площади", options=areas, key="lab_sel_areas")
     sel_hors = st.multiselect(
         "Коды горизонтов (можно несколько)",
         options=horizons,
-        default=[h for h in st.session_state.get("lab_sel_hors", []) if h in horizons],
         key="lab_sel_hors",
     )
 
@@ -1488,12 +1534,22 @@ def laboratory_tab() -> None:
         }
         fit = fit_power_j_swn(filt["Swn"].to_numpy(), filt["J_lab"].to_numpy())
         st.session_state["lab_trend_fit"] = fit
-        st.success(f"Сохранено точек: {len(filt)}. Лаб. тренд: a={fit.get('a')}, b={fit.get('b')}, R²={fit.get('r2')}")
+        st.success(
+            f"Сохранено точек: {_fmt_float3(len(filt))}. Лаб. тренд: "
+            f"a={_fmt_float3(fit.get('a'))}, b={_fmt_float3(fit.get('b'))}, R²={_fmt_float3(fit.get('r2'))}"
+        )
+
+    cloud = st.session_state.get("lab_cloud")
+    if cloud is not None and not cloud.empty:
+        st.subheader("График J(Swn) (лаборатория)")
+        fit = st.session_state.get("lab_trend_fit") or {}
+        fig = _fig_j_swn_lab(cloud, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
+        st.plotly_chart(fig, use_container_width=True)
 
     st.divider()
     st.subheader("Лаборатория: загрузка данных для метода Брукса-Кори")
     bc_file = st.file_uploader(
-        "Загрузить таблицу лабораторных точек (файл зависимости_оболако_точек)",
+        "Загрузить таблицу лабораторных точек (файл зависимости_облако_точек)",
         type=["csv", "xlsx", "xls"],
         key="bc_lab_upload",
     )
@@ -1507,15 +1563,6 @@ def laboratory_tab() -> None:
             st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк (используются только они, без ККД из БД).")
         except Exception as e:
             st.error(f"Ошибка загрузки данных Брукса-Кори: {e}")
-
-    cloud = st.session_state.get("lab_cloud")
-    if cloud is None or cloud.empty:
-        return
-
-    st.subheader("График J(Swn) (лаборатория)")
-    fit = st.session_state.get("lab_trend_fit") or {}
-    fig = _fig_j_swn_lab(cloud, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
-    st.plotly_chart(fig, use_container_width=True)
 
 
 def leverett_tab() -> None:
@@ -1813,6 +1860,13 @@ def leverett_tab() -> None:
     with c2:
         st.subheader("Метрики")
         st.dataframe(_round_df(qa_df), use_container_width=True)
+    csv_result = result_df.to_csv(index=False).encode("utf-8")
+    csv_params = params_df.to_csv(index=False).encode("utf-8")
+    csv_qa = qa_df.to_csv(index=False).encode("utf-8")
+    c3, c4, c5 = st.columns(3)
+    c3.download_button("Скачать результат", data=csv_result, file_name="leverett_result.csv", mime="text/csv")
+    c4.download_button("Скачать параметры", data=csv_params, file_name="leverett_params.csv", mime="text/csv")
+    c5.download_button("Скачать метрики", data=csv_qa, file_name="leverett_metrics.csv", mime="text/csv")
     if st.button("Запомнить результаты по скважинам (J-функция)", key="save_j_snapshot"):
         ok, msg = _save_well_snapshot(result_df, model_col="Kng_model", method_tag="J")
         if ok:
@@ -1892,6 +1946,7 @@ def leverett_tab() -> None:
         for c in ["WELL_NAME", "PC", "PORO_GDM", "PERM_GDM", "SWL_GDM", "Кнг_W", "Kng_model", "weight", "thickness"]
         if c in region_df.columns
     ]
+    hover_fmt = {c: (True if c == "WELL_NAME" else ":.3f") for c in hover_cols}
     color_col = "weight"
     if color_mode == "По толщине" and "thickness" in region_df.columns:
         color_col = "thickness"
@@ -1902,7 +1957,7 @@ def leverett_tab() -> None:
         y="Kng_model",
         color=color_col if color_col in region_df.columns else None,
         color_continuous_scale="Viridis",
-        hover_data=hover_cols,
+        hover_data=hover_fmt,
         title=f"PVT {region}: предсказанное Кнг(историческое) ({'вес' if color_col == 'weight' else 'толщина'})",
         opacity=0.7,
     )
@@ -1922,10 +1977,16 @@ def leverett_tab() -> None:
                 y="Kng_model_wmean",
                 color="convergence_percent",
                 color_continuous_scale="Turbo",
-                hover_data=["WELL_NAME", "points", "avg_weight", "convergence_percent"],
+                hover_data={
+                    "WELL_NAME": True,
+                    "points": ":.3f",
+                    "avg_weight": ":.3f",
+                    "convergence_percent": ":.3f",
+                },
                 title=f"PVT {region}: кроссплот по скважинам (средневзвешенно)",
                 opacity=0.85,
             )
+            fig_well_cross.update_traces(hovertemplate="Кнг_W_wmean=%{x:.3f}<br>Kng_model_wmean=%{y:.3f}<extra></extra>")
             fig_well_cross.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             fig_well_cross.update_layout(
                 xaxis_title="Кнг_W (средневзвеш.)",
@@ -1933,12 +1994,12 @@ def leverett_tab() -> None:
             )
             st.plotly_chart(fig_well_cross, use_container_width=True)
 
-    st.markdown("#### Аналитика по выбранному региону")
+    st.markdown(f"#### Аналитика по выбранному региону (PVTNUM={region})")
     region_wells_count = region_df["WELL_NAME"].astype(str).nunique() if "WELL_NAME" in region_df.columns else 0
     region_points_count = len(region_df)
     m1, m2 = st.columns(2)
-    m1.metric("Уникальных скважин (PVTNUM)", int(region_wells_count))
-    m2.metric("Всего точек (PVTNUM)", int(region_points_count))
+    m1.metric(f"Уникальных скважин (PVTNUM={region})", int(region_wells_count))
+    m2.metric(f"Всего точек (PVTNUM={region})", int(region_points_count))
 
     if "weight" in result_df.columns and "WELL_NAME" in result_df.columns:
         weight_summary = (
@@ -1947,7 +2008,15 @@ def leverett_tab() -> None:
             .sort_values(["avg_weight", "max_weight"], ascending=False)
         )
         st.markdown("**Скважины с наибольшими весами (в целом по выборке)**")
-        st.dataframe(_round_df(weight_summary.head(15)), use_container_width=True)
+        weight_summary_ru = weight_summary.rename(
+            columns={
+                "WELL_NAME": "Скважина",
+                "avg_weight": "Средний вес",
+                "max_weight": "Максимальный вес",
+                "points": "Количество точек",
+            }
+        )
+        st.dataframe(_round_df(weight_summary_ru.head(15)), use_container_width=True)
 
     if not qa_df.empty:
         qa_row = qa_df[qa_df["PVTNUM_GDM"] == int(region)]
@@ -2000,6 +2069,7 @@ def leverett_tab() -> None:
                 title=f"Скважина {well}: вертикальный профиль",
             )
             fig_well.update_traces(mode="lines")
+            fig_well.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
             fig_well.update_yaxes(autorange="reversed")
             fig_well.update_layout(xaxis_title="Значение", yaxis_title="Глубина")
             st.plotly_chart(fig_well, use_container_width=True)
@@ -2007,15 +2077,6 @@ def leverett_tab() -> None:
             conv_percent = _well_convergence_percent_weighted(well_df)
             if np.isfinite(conv_percent):
                 st.metric("Сходимость для скважины (средневзвеш.), %", f"{conv_percent:.2f}")
-
-    csv_result = result_df.to_csv(index=False).encode("utf-8")
-    csv_params = params_df.to_csv(index=False).encode("utf-8")
-    csv_qa = qa_df.to_csv(index=False).encode("utf-8")
-    c3, c4, c5 = st.columns(3)
-    c3.download_button("Скачать результат", data=csv_result, file_name="leverett_result.csv", mime="text/csv")
-    c4.download_button("Скачать параметры", data=csv_params, file_name="leverett_params.csv", mime="text/csv")
-    c5.download_button("Скачать метрики", data=csv_qa, file_name="leverett_metrics.csv", mime="text/csv")
-
 
 def brooks_corey_tab() -> None:
     st.title("Метод Брукса-Кори")
@@ -2465,7 +2526,20 @@ def brooks_corey_tab() -> None:
         st.dataframe(_round_df(bc_params), use_container_width=True)
         if bc_timing is not None and not bc_timing.empty:
             st.subheader("Статистика времени расчета БК")
-            st.dataframe(_round_df(bc_timing), use_container_width=True)
+            bc_timing_ru = bc_timing.rename(
+                columns={
+                    "PVTNUM_GDM": "Регион (PVTNUM)",
+                    "rows_geo": "Строк геологии",
+                    "rows_lab": "Лабораторных точек",
+                    "elapsed_sec": "Время расчета, сек",
+                }
+            )
+            st.dataframe(
+                _round_df(bc_timing_ru),
+                use_container_width=True,
+                hide_index=True,
+                height=min(600, 35 * (len(bc_timing_ru) + 1)),
+            )
             if bc_total_elapsed is not None:
                 st.metric("Общее время расчета БК, сек", f"{float(bc_total_elapsed):.2f}")
     with cqa:
@@ -2475,6 +2549,13 @@ def brooks_corey_tab() -> None:
             st.metric("GLOBAL SCORE (БК)", f"{bc_qa['SCORE'].mean():.3f}")
         else:
             st.info("Метрики пока недоступны.")
+    csv_bc_result = bc_res.to_csv(index=False).encode("utf-8")
+    csv_bc_params = bc_params.to_csv(index=False).encode("utf-8")
+    csv_bc_qa = (bc_qa if isinstance(bc_qa, pd.DataFrame) else pd.DataFrame()).to_csv(index=False).encode("utf-8")
+    cd1, cd2, cd3 = st.columns(3)
+    cd1.download_button("Скачать результат", data=csv_bc_result, file_name="brooks_corey_result.csv", mime="text/csv")
+    cd2.download_button("Скачать параметры", data=csv_bc_params, file_name="brooks_corey_params.csv", mime="text/csv")
+    cd3.download_button("Скачать метрики", data=csv_bc_qa, file_name="brooks_corey_metrics.csv", mime="text/csv")
     if st.button("Запомнить результаты по скважинам (Брукса-Кори)", key="save_bc_snapshot"):
         ok, msg = _save_well_snapshot(bc_res, model_col="Kng_BC_model", method_tag="BC")
         if ok:
@@ -2572,7 +2653,11 @@ def brooks_corey_tab() -> None:
         y="Kng_BC_model",
         color=bc_color,
         color_continuous_scale="Viridis",
-        hover_data=[c for c in ["WELL_NAME", "PC", "PORO_GDM", "Kng_BC_model", "Кнг_W", "thickness", "weight"] if c in g_conv.columns],
+        hover_data={
+            c: (True if c == "WELL_NAME" else ":.3f")
+            for c in ["WELL_NAME", "PC", "PORO_GDM", "Kng_BC_model", "Кнг_W", "thickness", "weight"]
+            if c in g_conv.columns
+        },
         title=f"PVT {psel}: предсказанное(историческое) (Брукса-Кори)",
         opacity=0.75,
     )
@@ -2588,9 +2673,15 @@ def brooks_corey_tab() -> None:
                 y="Kng_BC_wmean",
                 color="convergence_percent",
                 color_continuous_scale="Turbo",
-                hover_data=["WELL_NAME", "points", "avg_weight", "convergence_percent"],
+                hover_data={
+                    "WELL_NAME": True,
+                    "points": ":.3f",
+                    "avg_weight": ":.3f",
+                    "convergence_percent": ":.3f",
+                },
                 title=f"PVT {psel}: кроссплот по скважинам (БК, средневзвешенно)",
             )
+            figw.update_traces(hovertemplate="Кнг_W_wmean=%{x:.3f}<br>Kng_BC_wmean=%{y:.3f}<extra></extra>")
             figw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             st.plotly_chart(figw, use_container_width=True)
 
@@ -2609,6 +2700,7 @@ def brooks_corey_tab() -> None:
             curve = wd[[dcol, "ACTNUM_GDM", "Кнг_W", "Kng_BC_model"]].rename(columns={"Кнг_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"})
             melt = curve.melt(id_vars=[dcol], value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"], var_name="Кривая", value_name="Значение")
             fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
+            fig_prof.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
             fig_prof.update_yaxes(autorange="reversed")
             st.plotly_chart(fig_prof, use_container_width=True)
 
