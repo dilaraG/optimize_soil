@@ -487,7 +487,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         j = df_j.copy()
         b = df_bc.copy()
         for frame in (j, b):
-            frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce").round(3)
+            frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce")
             frame["WELL_NAME"] = frame["WELL_NAME"].astype(str)
         mj = j[["WELL_NAME", "_AXIS_R", "Кнг_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
             columns={"Кнг_model": "J_model", "PVTNUM_GDM": "PVT_J"}
@@ -503,7 +503,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         elif "PVT_BC" in m.columns:
             m["PVTNUM_GDM"] = m["PVT_BC"]
         if (region_pick != "Все регионы") and ("PVTNUM_GDM" in m.columns):
-            m = m[m["PVTNUM_GDM"].astype(str) == str(region_pick)]
+            m = m[pd.to_numeric(m["PVTNUM_GDM"], errors="coerce") == float(region_pick)]
         m["J_model"] = pd.to_numeric(m["J_model"], errors="coerce")
         m["BC_model"] = pd.to_numeric(m["BC_model"], errors="coerce")
         m = m[np.isfinite(m["J_model"]) & np.isfinite(m["BC_model"])]
@@ -1111,23 +1111,36 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
         cand = saved_map.get(target)
         defaults[target] = cand if isinstance(cand, str) and cand in cols else _safe_guess_col(cols, hints)
     pick: dict[str, str] = {}
-    cols_ui = st.columns(4)
-    for i, (target, ui_label, _) in enumerate(mapping_rules):
-        host = cols_ui[i % 4]
+    row1_rules = mapping_rules[:4]
+    row2_rules = mapping_rules[4:]
+
+    row1 = st.columns(4)
+    for i, (target, ui_label, _) in enumerate(row1_rules):
         default = defaults[target]
         idx = cols.index(default) if default in cols else 0
-        pick[target] = host.selectbox(
+        pick[target] = row1[i].selectbox(
             ui_label,
             options=cols,
             index=idx,
             key=f"{key_prefix}_map_wells_{target}",
         )
+
     row2 = st.columns(4)
+    for i, (target, ui_label, _) in enumerate(row2_rules):
+        default = defaults[target]
+        idx = cols.index(default) if default in cols else 0
+        pick[target] = row2[i].selectbox(
+            ui_label,
+            options=cols,
+            index=idx,
+            key=f"{key_prefix}_map_wells_{target}",
+        )
+
     perf_saved = saved_map.get("Perf_GDM")
     perf_default = perf_saved if isinstance(perf_saved, str) and perf_saved in cols else _safe_guess_col(cols, ["PERF_GDM", "PERF", "ПЕРФ", "ПЕРФОРА"])
     perf_options = ["<не использовать>"] + cols
     perf_idx = perf_options.index(perf_default) if perf_default in perf_options else 0
-    perf_pick = row2[0].selectbox("Перфорация", options=perf_options, index=perf_idx, key=f"{key_prefix}_map_wells_Perf_GDM")
+    perf_pick = row2[3].selectbox("Перфорация", options=perf_options, index=perf_idx, key=f"{key_prefix}_map_wells_Perf_GDM")
     if perf_pick != "<не использовать>":
         pick["Perf_GDM"] = perf_pick
     if len(set(pick.values())) != len(pick):
