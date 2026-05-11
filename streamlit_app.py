@@ -34,6 +34,17 @@ from lab_analysis import (
 from optimize import run_pipeline
 
 st.set_page_config(page_title="J-функция Леверетта", layout="wide")
+st.markdown(
+    """
+    <style>
+    /* Стабилизирует прокрутку при первом rerun после изменения виджетов */
+    html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+        overflow-anchor: none;
+    }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
