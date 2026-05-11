@@ -778,6 +778,103 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 key=f"{block_key}_dl_hist_jbc_stats",
             )
 
+    st.markdown("### Кроссплоты по скважинам (средневзвешенно, все регионы)")
+    cw1, cw2 = st.columns(2)
+
+    sj_cross_src = _crossplot_df(sj)
+    if sj_cross_src.empty:
+        cw1.info("Недостаточно данных для кроссплота по скважинам (J).")
+    else:
+        sj_cross_src = sj_cross_src.rename(columns={"Кнг_hist": "Кнг_W", "Кнг_model": "Kng_model"})
+        if "weight" not in sj_cross_src.columns:
+            sj_cross_src["weight"] = 1.0
+        sj_cross = _well_weighted_crossplot_df(sj_cross_src)
+        if sj_cross.empty:
+            cw1.info("Недостаточно данных для кроссплота по скважинам (J).")
+        else:
+            if "PVTNUM_GDM" in sj_cross_src.columns:
+                well_region_j = (
+                    sj_cross_src.assign(_pvt_num=pd.to_numeric(sj_cross_src["PVTNUM_GDM"], errors="coerce"))
+                    .dropna(subset=["_pvt_num"])
+                    .groupby("WELL_NAME", as_index=False)["_pvt_num"]
+                    .median()
+                    .rename(columns={"_pvt_num": "Регион"})
+                )
+                well_region_j["Регион"] = well_region_j["Регион"].astype(int).astype(str)
+                sj_cross = sj_cross.merge(well_region_j, on="WELL_NAME", how="left")
+            fig_jw = px.scatter(
+                sj_cross,
+                x="Кнг_W_wmean",
+                y="Kng_model_wmean",
+                color="Регион" if "Регион" in sj_cross.columns else None,
+                color_discrete_sequence=px.colors.qualitative.Dark24,
+                hover_data={
+                    "WELL_NAME": True,
+                    "Регион": True,
+                    "points": ":.3f",
+                    "avg_weight": ":.3f",
+                    "convergence_percent": ":.3f",
+                },
+                title="J: кроссплот по скважинам",
+                opacity=0.85,
+            )
+            fig_jw.update_traces(hovertemplate="Кнг_hist_wmean=%{x:.3f}<br>Кнг_J_wmean=%{y:.3f}<extra></extra>")
+            fig_jw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+            fig_jw.update_layout(
+                xaxis_title="Кнг_hist (средневзвеш.)",
+                yaxis_title="Кнг_J (средневзвеш.)",
+                legend_title_text="Регион",
+            )
+            cw1.plotly_chart(fig_jw, use_container_width=True)
+            cw1.caption(f"Скважин (точек кроссплота): {len(sj_cross)}")
+
+    sb_cross_src = _crossplot_df(sb)
+    if sb_cross_src.empty:
+        cw2.info("Недостаточно данных для кроссплота по скважинам (БК).")
+    else:
+        sb_cross_src = sb_cross_src.rename(columns={"Кнг_hist": "Кнг_W", "Кнг_model": "Kng_model"})
+        if "weight" not in sb_cross_src.columns:
+            sb_cross_src["weight"] = 1.0
+        sb_cross = _well_weighted_crossplot_df(sb_cross_src).rename(columns={"Kng_model_wmean": "Kng_BC_wmean"})
+        if sb_cross.empty:
+            cw2.info("Недостаточно данных для кроссплота по скважинам (БК).")
+        else:
+            if "PVTNUM_GDM" in sb_cross_src.columns:
+                well_region_b = (
+                    sb_cross_src.assign(_pvt_num=pd.to_numeric(sb_cross_src["PVTNUM_GDM"], errors="coerce"))
+                    .dropna(subset=["_pvt_num"])
+                    .groupby("WELL_NAME", as_index=False)["_pvt_num"]
+                    .median()
+                    .rename(columns={"_pvt_num": "Регион"})
+                )
+                well_region_b["Регион"] = well_region_b["Регион"].astype(int).astype(str)
+                sb_cross = sb_cross.merge(well_region_b, on="WELL_NAME", how="left")
+            fig_bw = px.scatter(
+                sb_cross,
+                x="Кнг_W_wmean",
+                y="Kng_BC_wmean",
+                color="Регион" if "Регион" in sb_cross.columns else None,
+                color_discrete_sequence=px.colors.qualitative.Dark24,
+                hover_data={
+                    "WELL_NAME": True,
+                    "Регион": True,
+                    "points": ":.3f",
+                    "avg_weight": ":.3f",
+                    "convergence_percent": ":.3f",
+                },
+                title="БК: кроссплот по скважинам",
+                opacity=0.85,
+            )
+            fig_bw.update_traces(hovertemplate="Кнг_hist_wmean=%{x:.3f}<br>Кнг_БК_wmean=%{y:.3f}<extra></extra>")
+            fig_bw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+            fig_bw.update_layout(
+                xaxis_title="Кнг_hist (средневзвеш.)",
+                yaxis_title="Кнг_БК (средневзвеш.)",
+                legend_title_text="Регион",
+            )
+            cw2.plotly_chart(fig_bw, use_container_width=True)
+            cw2.caption(f"Скважин (точек кроссплота): {len(sb_cross)}")
+
     st.markdown("### Поскважинное сравнение и кластеры согласованности")
     st.caption(
         "Для каждой скважины на общей сетке по глубине сравниваются **тренды** рассчитанных кривых "
@@ -893,6 +990,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         id_vars="_AXIS", var_name="Кривая", value_name="Кн"
     )
     fig = px.line(plot_df, x="Кн", y="_AXIS", color="Кривая", title=f"Скважина {well}: сравнение профилей")
+    fig.update_traces(hovertemplate="Кн=%{x:.3f}<br>Глубина/индекс=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
     if (wj["AXIS_KIND"].iloc[0] == "depth") and (wb["AXIS_KIND"].iloc[0] == "depth"):
         fig.update_yaxes(autorange="reversed", title="Глубина")
     else:
