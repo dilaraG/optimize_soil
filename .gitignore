@@ -4,6 +4,8 @@
 *.xlsx
 *.xls
 data/
+docs/
+scripts/
 
 # Python
 __pycache__/
