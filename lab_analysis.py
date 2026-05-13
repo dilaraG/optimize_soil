@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import re
-from typing import Any
+from typing import Any, Sequence
 
 import numpy as np
 import pandas as pd
@@ -325,3 +325,245 @@ def filter_lab_df(
     out[area_col] = out[area_col].astype(str).str.strip()
     out[horizon_col] = out[horizon_col].astype(str).str.strip()
     return out[out[area_col].isin(areas) & out[horizon_col].isin(horizons)]
+
+
+def _norm_header_token(x: object) -> str:
+    return _norm(str(x))
+
+
+# Подстроки для **первой** строки объединённого заголовка (уровень 0 MultiIndex).
+DEFAULT_MATRIX_WATER_KEYWORDS: tuple[str, ...] = (
+    "водонасыщ",
+    "насыщенность вод",
+    "насыщенность, д",
+    "sw,",
+    "кво,",
+    "кво ",
+)
+DEFAULT_MATRIX_J_KEYWORDS: tuple[str, ...] = (
+    "j функц",
+    "леверет",
+    "leverett",
+    "функция j",
+    "j-функ",
+)
+
+
+def parse_matrix_block_keywords(user_text: str | None, fallback: tuple[str, ...]) -> list[str]:
+    """
+    Разбор подстрок из поля ввода: запятая, точка с запятой, перевод строки.
+    Пустой ввод → fallback.
+    """
+    raw = (user_text or "").strip()
+    if not raw:
+        return list(fallback)
+    parts = re.split(r"[,;\n\r]+", raw)
+    out: list[str] = []
+    for p in parts:
+        t = _norm_header_token(p)
+        if t:
+            out.append(t)
+    if not out:
+        return list(fallback)
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for x in out:
+        if x not in seen:
+            seen.add(x)
+            uniq.append(x)
+    return uniq
+
+
+def _is_matrix_meta_second_level(l1: object) -> bool:
+    """
+    Вторая строка заголовка: площадь месторождения, скважина, фация, № образца, код горизонта —
+    не ступени Sw/J (чтобы «Площадь» не перепутать с блоком воды; «Код горизонта» под блоком J
+    остаётся метаданными, а не ступенью).
+    """
+    s = _norm(str(l1))
+    sc = s.replace(" ", "").replace(".", "")
+    if "горизонт" in sc or "stratum" in s or "пласткод" in sc:
+        return True
+    if "площадь" in sc and "водонасыщ" not in s and "площадност" not in s:
+        return True
+    if "скв" in sc and "№" in str(l1):
+        return True
+    if sc == "фация" or s.startswith("фация"):
+        return True
+    if "обр" in sc and "№" in str(l1):
+        return True
+    if sc.startswith("куст"):
+        return True
+    return False
+
+
+def _looks_like_stage_subcolumn(l1: object) -> bool:
+    """Подпись ступени: «1 ст.», «2 ст.» или «1 st» и т.п."""
+    s = _norm(str(l1))
+    if re.search(r"\d+\s*ст", s):
+        return True
+    if re.search(r"\d+\s*st\b", s):
+        return True
+    return False
+
+
+def _level0_matches_any(level0_norm: str, keywords: Sequence[str]) -> bool:
+    for k in keywords:
+        kk = _norm_header_token(k)
+        if kk and kk in level0_norm:
+            return True
+    return False
+
+
+def classify_j_matrix_stairs_columns(
+    df: pd.DataFrame,
+    water_keywords: Sequence[str] | None = None,
+    j_keywords: Sequence[str] | None = None,
+) -> tuple[list[tuple[Any, ...]], list[tuple[Any, ...]], list[tuple[Any, ...]]]:
+    """
+    Делит столбцы MultiIndex на: водонасыщенность по ступеням, J по ступеням, метаданные.
+
+    В блок Sw/J попадают только колонки, у которых вторая строка похожа на ступень («N ст.»).
+    «Площадь», «№ скв.», «Фация», «№ обр.» всегда остаются в метаданных.
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("Ожидается MultiIndex столбцов (header=[0, 1]).")
+
+    wk = list(water_keywords) if water_keywords is not None else list(DEFAULT_MATRIX_WATER_KEYWORDS)
+    jk = list(j_keywords) if j_keywords is not None else list(DEFAULT_MATRIX_J_KEYWORDS)
+
+    sw_cols: list[tuple[Any, ...]] = []
+    j_cols: list[tuple[Any, ...]] = []
+    meta_cols: list[tuple[Any, ...]] = []
+
+    for c in df.columns:
+        if not isinstance(c, tuple) or len(c) != 2:
+            meta_cols.append(c)  # type: ignore[arg-type]
+            continue
+        l0, l1 = c[0], c[1]
+        if _is_matrix_meta_second_level(l1):
+            meta_cols.append(c)
+            continue
+        t0 = _norm_header_token(l0)
+        if _level0_matches_any(t0, wk) and _looks_like_stage_subcolumn(l1):
+            sw_cols.append(c)
+        elif _level0_matches_any(t0, jk) and _looks_like_stage_subcolumn(l1):
+            j_cols.append(c)
+        else:
+            meta_cols.append(c)
+
+    return sw_cols, j_cols, meta_cols
+
+
+def is_likely_j_matrix_stairs_format(
+    df: pd.DataFrame,
+    water_keywords: Sequence[str] | None = None,
+    j_keywords: Sequence[str] | None = None,
+) -> bool:
+    if not isinstance(df.columns, pd.MultiIndex):
+        return False
+    try:
+        sw, j, _meta = classify_j_matrix_stairs_columns(df, water_keywords, j_keywords)
+    except ValueError:
+        return False
+    return bool(sw and j)
+
+
+def _stage_key_from_subcol(sub: object) -> tuple[int, str]:
+    """Для сортировки пар ступеней: ('7 ст.',) -> (7, '7 ст.')."""
+    s = str(sub).strip()
+    m = re.search(r"(\d+)", s)
+    n = int(m.group(1)) if m else 0
+    return n, s
+
+
+def transform_j_stairs_wide_to_long(
+    df: pd.DataFrame,
+    water_keywords: Sequence[str] | None = None,
+    j_keywords: Sequence[str] | None = None,
+) -> pd.DataFrame:
+    """
+    Разворачивает «матрицу ступеней» в длинный вид, как для облака J(Swn).
+
+    ``water_keywords`` / ``j_keywords`` — подстроки для **первой** строки объединённого заголовка:
+    колонка относится к блоку, если любая подстрока входит в нормализованный текст уровня 0
+    и вторая строка похожа на ступень. Метастолбцы («Площадь», …) не попадают в блоки.
+    """
+    if not isinstance(df.columns, pd.MultiIndex):
+        raise ValueError("Ожидается двухуровневый заголовок (header=[0, 1] при чтении Excel).")
+
+    sw_cols, j_cols, meta_cols = classify_j_matrix_stairs_columns(df, water_keywords, j_keywords)
+
+    if not sw_cols or not j_cols:
+        raise ValueError(
+            "Не найдены столбцы ступеней для водонасыщенности и/или J. "
+            "Проверьте подписи блоков (первая строка) или расширьте списки ключевых слов."
+        )
+
+    # Пары ступеней по подписи второго уровня (1 ст., 2 ст., …)
+    sw_by_sub: dict[str, tuple[Any, ...]] = {}
+    for c in sw_cols:
+        sub = str(c[1]).strip()
+        sw_by_sub[sub] = c
+    pairs: list[tuple[str, tuple[Any, ...], tuple[Any, ...]]] = []
+    for jc in j_cols:
+        sub = str(jc[1]).strip()
+        if sub in sw_by_sub:
+            pairs.append((sub, sw_by_sub[sub], jc))
+    pairs.sort(key=lambda p: _stage_key_from_subcol(p[0]))
+    if not pairs:
+        raise ValueError("Не удалось сопоставить ступени между водонасыщенностью и J.")
+
+    meta_names = [str(c[1]).strip() if isinstance(c, tuple) and len(c) == 2 else str(c) for c in meta_cols]
+
+    rows_out: list[dict[str, Any]] = []
+    eps = 1e-12
+
+    for _, row in df.iterrows():
+        sw_vals: list[float] = []
+        j_vals: list[float] = []
+        for _st, sw_c, j_c in pairs:
+            sw_vals.append(float(pd.to_numeric(row[sw_c], errors="coerce")))
+            j_vals.append(float(pd.to_numeric(row[j_c], errors="coerce")))
+
+        finite_sw = [v for v in sw_vals if np.isfinite(v)]
+        if not finite_sw:
+            continue
+        sw_min = float(min(finite_sw))
+        sw_max = float(max(finite_sw))
+        den = sw_max - sw_min
+
+        meta_vals: dict[str, Any] = {}
+        for c, name in zip(meta_cols, meta_names, strict=False):
+            meta_vals[name] = row[c]
+
+        for (_st, sw_c, j_c), sw, jv in zip(pairs, sw_vals, j_vals):
+            if not np.isfinite(sw) or not np.isfinite(jv):
+                continue
+            if den <= eps or not np.isfinite(den):
+                swn = float("nan")
+            else:
+                swn = (sw - sw_min) / den
+                if swn <= eps or swn >= 1.0 - eps or abs(swn) < eps or abs(swn - 1.0) < eps:
+                    swn = float("nan")
+            rec = {
+                **meta_vals,
+                "ступень": _st,
+                "Водонасыщенность": sw,
+                "Sw_min": sw_min,
+                "Sw_max": sw_max,
+                "Swn": swn,
+                "J (функция Леверетта)": jv,
+            }
+            rows_out.append(rec)
+
+    out = pd.DataFrame(rows_out)
+    if out.empty:
+        return out
+
+    # Код горизонта: если в файле уже есть столбец (часто под объединённым «J функция»), сохраняем его.
+    if "Код горизонта" in out.columns:
+        out["Код горизонта"] = out["Код горизонта"].astype(str).str.strip()
+    elif "Фация" in out.columns:
+        out["Код горизонта"] = out["Фация"].astype(str).str.strip()
+    return out

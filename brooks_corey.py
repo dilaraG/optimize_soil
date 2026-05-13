@@ -43,21 +43,77 @@ def swl_a_exp_b_poro(poro: np.ndarray, a: float, b: float) -> np.ndarray:
     return np.clip(y, 1e-12, 1.0)
 
 
+def _sanitize_swl_exp_envelope_ab(a: float, b: float) -> tuple[float, float]:
+    """
+    Экспоненциальная swl(Кп) = a·exp(b·Кп): **a > 0**, **b < 0** (как физ. ветка для коридора/оптимизации).
+    """
+    aa = float(a)
+    if not np.isfinite(aa) or aa <= 0:
+        aa = 0.15
+    else:
+        aa = float(np.clip(aa, 1e-4, 25.0))
+    bb = float(b)
+    if not np.isfinite(bb) or bb >= -1e-12:
+        bb = -0.5
+    bb = float(np.clip(bb, -80.0, -1e-4))
+    return aa, bb
+
+
+def _ensure_swl_exp_upper_a_above_lower(
+    lower: tuple[float, float],
+    upper: tuple[float, float],
+) -> tuple[float, float]:
+    """Верхняя огибающая по a выше нижней; обе пары с a>0, b<0."""
+    lo_a, _lo_b = lower
+    up_a, up_b = upper
+    if up_a <= lo_a:
+        up_a = lo_a * (1.0 + 1e-6) if lo_a > 0 else 1.05e-4
+    up_a, up_b = _sanitize_swl_exp_envelope_ab(up_a, up_b)
+    return (up_a, up_b)
+
+
+def _ensure_swl_exp_upper_b_not_flatter_than_lower(
+    lower: tuple[float, float],
+    upper: tuple[float, float],
+    poro_ref: float,
+    min_abs_b_ratio: float = 0.72,
+) -> tuple[float, float]:
+    """
+    У верхней эксп. огибающей модуль наклона по Кп (|b| в y=a·exp(b·Кп)) не сильно меньше, чем у нижней:
+    |b_up| >= min_abs_b_ratio * |b_lo|. При увеличении крутизны b подбирается a так, чтобы значение при Кп=poro_ref
+    сохранилось (коридор не «схлопывается» в почти горизонтальную верхнюю дугу).
+    """
+    _lo_a, lo_b = lower
+    up_a, up_b = upper
+    mlo = abs(float(lo_b))
+    mup = abs(float(up_b))
+    if mlo < 1e-10 or mup >= mlo * float(min_abs_b_ratio):
+        return _sanitize_swl_exp_envelope_ab(up_a, up_b)
+    b_new = float(-mlo * float(min_abs_b_ratio))
+    b_new = float(np.clip(b_new, -80.0, -1e-4))
+    phi = float(poro_ref) if np.isfinite(poro_ref) and poro_ref > 0 else 0.15
+    phi = float(np.clip(phi, 1e-6, 1.0))
+    z_old = float(np.clip(phi * float(up_b), -60.0, 60.0))
+    z_new = float(np.clip(phi * b_new, -60.0, 60.0))
+    with np.errstate(over="ignore"):
+        y_ref = float(max(float(up_a) * np.exp(z_old), 1e-18))
+        a_new = float(y_ref / max(np.exp(z_new), 1e-300))
+    return _sanitize_swl_exp_envelope_ab(a_new, b_new)
+
+
 def _fit_swl_exp_ab_center(xx: np.ndarray, yy: np.ndarray) -> tuple[float, float]:
     """Оценка (a, b) по ln(swl) ≈ ln(a) + b*poro."""
     m = np.isfinite(xx) & np.isfinite(yy) & (xx > 0) & (yy > 1e-12)
     if m.sum() < 3:
-        return 0.15, -0.5
+        return _sanitize_swl_exp_envelope_ab(0.15, -0.5)
     xs = xx[m].astype(float)
     ys = np.clip(yy[m].astype(float), 1e-12, 1.0)
     try:
         b0, ln_a = np.polyfit(xs, np.log(ys), 1)
         a0 = float(np.exp(ln_a))
-        a0 = float(np.clip(a0, 1e-4, 25.0))
-        b0 = float(np.clip(b0, -80.0, 80.0))
-        return a0, b0
+        return _sanitize_swl_exp_envelope_ab(a0, float(b0))
     except Exception:
-        return 0.15, -0.5
+        return _sanitize_swl_exp_envelope_ab(0.15, -0.5)
 
 
 def auto_exp_bounds_swl_poro(
@@ -65,46 +121,102 @@ def auto_exp_bounds_swl_poro(
     y: np.ndarray,
     pad_a: float = 0.2,
     pad_b: float = 3.0,
+    upper_b_min_ratio: float = 0.72,
 ) -> dict[str, Any]:
     """
     Границы и огибающие для swl(poro) = a*exp(b*poro).
-    lower/upper — пары (a, b) для огибающих кривых.
+    lower/upper — пары (a, b): **a > 0**, **b < 0**; у верхней **a** не ниже, чем у нижней.
+    У верхней огибающей **|b|** не сильно меньше, чем у нижней (не «положе» по наклону): не ниже
+    ``upper_b_min_ratio * |b_lo|``; при подгонке **b** масштабируется **a** по медиане Кп.
     """
     a0, b0 = _fit_swl_exp_ab_center(np.asarray(x, dtype=float), np.asarray(y, dtype=float))
     alo = max(1e-4, a0 * (1.0 - pad_a))
     ahi = min(25.0, a0 * (1.0 + pad_a))
     if ahi <= alo:
         ahi = min(25.0, alo * 1.1)
-    blo = float(np.clip(b0 - pad_b, -80.0, 80.0))
-    bhi = float(np.clip(b0 + pad_b, -80.0, 80.0))
+    # сырые b вокруг центра — затем принудительно b<0 у огибающих
+    blo = float(np.clip(b0 - pad_b, -80.0, -1e-4))
+    bhi = float(np.clip(b0 + pad_b, -80.0, -1e-4))
     if blo >= bhi:
-        blo, bhi = b0 - 1.0, b0 + 1.0
-    lower = (alo, blo)
-    upper = (ahi, bhi)
-    center = (a0, b0)
-    b_de_lo = float(min(blo, bhi, b0) - 2.0)
-    b_de_hi = float(max(blo, bhi, b0) + 2.0)
+        blo, bhi = float(np.clip(b0 - 1.0, -80.0, -1e-4)), float(np.clip(b0 + 1.0, -80.0, -1e-4))
+    if blo >= bhi:
+        blo, bhi = -5.0, -0.01
+    lower = _sanitize_swl_exp_envelope_ab(alo, blo)
+    upper = _sanitize_swl_exp_envelope_ab(ahi, bhi)
+    center = _sanitize_swl_exp_envelope_ab(a0, b0)
+    upper = _ensure_swl_exp_upper_a_above_lower(lower, upper)
+    xv = np.asarray(x, dtype=float)
+    poro_ref = float(np.nanmedian(xv[np.isfinite(xv) & (xv > 0)])) if np.any(np.isfinite(xv) & (xv > 0)) else 0.15
+    upper = _ensure_swl_exp_upper_b_not_flatter_than_lower(
+        lower, upper, poro_ref, min_abs_b_ratio=float(upper_b_min_ratio)
+    )
+    upper = _ensure_swl_exp_upper_a_above_lower(lower, upper)
+    lo_a, lo_b = lower
+    up_a, up_b = upper
+    ce_a, ce_b = center
+    b_de_lo = float(min(lo_b, up_b, ce_b) - 2.0)
+    b_de_hi = float(max(lo_b, up_b, ce_b) + 2.0)
     b_de_lo = max(b_de_lo, -80.0)
-    b_de_hi = min(b_de_hi, 80.0)
+    b_de_hi = min(b_de_hi, -1e-4)
     if b_de_lo >= b_de_hi:
-        b_de_lo, b_de_hi = -80.0, 80.0
+        b_de_lo, b_de_hi = -5.0, -0.01
+
+    a_de_lo = max(1e-4, min(lo_a, up_a, ce_a) * 0.45)
+    a_de_hi = min(25.0, max(lo_a, up_a, ce_a) * 1.25)
+    if a_de_lo >= a_de_hi:
+        a_de_lo, a_de_hi = 1e-4, min(25.0, max(lo_a, up_a) * 1.2)
 
     return {
-        "bounds": PowerBounds((max(1e-4, alo * 0.5), min(25.0, ahi * 1.2)), (b_de_lo, b_de_hi)),
+        "bounds": PowerBounds((a_de_lo, a_de_hi), (b_de_lo, b_de_hi)),
         "center": center,
         "lower": lower,
         "upper": upper,
     }
 
 
+def _sanitize_power_envelope_ab(a: float, b: float) -> tuple[float, float]:
+    """
+    Степенная огибающая y = a·x^b в цепочке БК (perm, pvit, n): **a > 0**, **b < 0**.
+    """
+    aa = float(a)
+    if not np.isfinite(aa) or aa <= 0:
+        aa = 1e-4
+    else:
+        aa = max(aa, 1e-12)
+    bb = float(b)
+    if not np.isfinite(bb) or bb >= -1e-12:
+        bb = -0.35
+    bb = float(np.clip(bb, -12.0, -0.02))
+    return aa, bb
+
+
+def _ensure_upper_a_above_lower(
+    lower: tuple[float, float],
+    upper: tuple[float, float],
+) -> tuple[float, float]:
+    """Верхняя граница по a не ниже нижней (после санитизации), b уже < 0."""
+    lo_a, lo_b = lower
+    up_a, up_b = upper
+    if up_a <= lo_a:
+        up_a = lo_a * (1.0 + 1e-6) if lo_a > 0 else 1.05e-4
+    up_a, up_b = _sanitize_power_envelope_ab(up_a, up_b)
+    return (up_a, up_b)
+
+
 def _envelopes(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
     """
-    Возвращает (lower_ab, upper_ab, center_ab) для степенной зависимости y=a*x^b
-    с ограничением a>0 и b<0.
+    Возвращает (lower_ab, upper_ab, center_ab) для степенной зависимости y=a*x^b.
+
+    Нижняя и **верхняя** огибающие всегда с **a > 0** и **b < 0** (как для ветвей perm / pvit / n в БК).
+    Для верхней дополнительно гарантируется up_a > lo_a, чтобы коридор был ненулевым по амплитуде.
     """
     m = np.isfinite(x) & np.isfinite(y) & (x > 0) & (y > 0)
     if m.sum() < 5:
-        return (1e-4, -1.0), (1.0, -0.1), (1e-2, -0.5)
+        lo = _sanitize_power_envelope_ab(1e-4, -1.0)
+        up = _sanitize_power_envelope_ab(1.0, -0.1)
+        ce = _sanitize_power_envelope_ab(1e-2, -0.5)
+        up = _ensure_upper_a_above_lower(lo, up)
+        return lo, up, ce
     xx, yy = x[m].astype(float), y[m].astype(float)
     a0, b0 = _fit_power(xx, yy)
     if not np.isfinite(a0):
@@ -122,9 +234,10 @@ def _envelopes(x: np.ndarray, y: np.ndarray) -> tuple[tuple[float, float], tuple
         alo = max(1e-8, float(np.min(r[r > 0])) if np.any(r > 0) else 1e-6)
     if ahi <= alo:
         ahi = alo * 1.05
-    lower = (alo, b0)
-    upper = (ahi, b0)
-    center = (float(a0), b0)
+    lower = _sanitize_power_envelope_ab(alo, b0)
+    upper = _sanitize_power_envelope_ab(ahi, b0)
+    center = _sanitize_power_envelope_ab(float(a0), b0)
+    upper = _ensure_upper_a_above_lower(lower, upper)
     return lower, upper, center
 
 
@@ -415,7 +528,7 @@ def optimize_brooks_corey_for_region(
         # Жесткие физические ограничения
         if not (1e-9 < p["a_swl"] <= 100.0):
             return 1e12
-        if not np.isfinite(p["b_swl"]) or abs(p["b_swl"]) > 120.0:
+        if not np.isfinite(p["b_swl"]) or p["b_swl"] >= 0 or p["b_swl"] < -120.0:
             return 1e12
         if any(p[k] <= 0 for k in ["a_perm", "a_pvit", "a_n"]):
             return 1e12

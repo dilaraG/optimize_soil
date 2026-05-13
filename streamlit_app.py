@@ -24,12 +24,18 @@ from brooks_corey import (
 from kkd_database import build_kkd_sqlite, excel_path, load_kkd_dataframe, sqlite_path
 from lab_analysis import (
     auto_ab_bounds_from_cloud,
+    classify_j_matrix_stairs_columns,
+    DEFAULT_MATRIX_J_KEYWORDS,
+    DEFAULT_MATRIX_WATER_KEYWORDS,
     filter_lab_df,
     fit_power_j_swn,
     guess_area_column,
     guess_horizon_column,
     guess_j_column,
+    is_likely_j_matrix_stairs_format,
+    parse_matrix_block_keywords,
     pick_second_swn_column,
+    transform_j_stairs_wide_to_long,
 )
 from optimize import run_pipeline
 
@@ -1548,37 +1554,126 @@ def _fig_j_swn_lab(
 
 def laboratory_tab() -> None:
     st.title("Лаборатория")
-    st.caption("База данных строится из файла `data/ККД_БД.xlsx` (SQLite: `data/kkd_lab.sqlite`).")
+    st.caption(
+        "Источник облака J–Swn: либо база ККД (`data/ККД_БД.xlsx` → SQLite), либо Excel с матрицей ступеней "
+        "(первая строка — группы «водонасыщенность» и «J функция», вторая — подстолбцы «1 ст.» … «N ст.»)."
+    )
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
-    if excel_path().is_file() and not sqlite_path().is_file():
-        try:
-            build_kkd_sqlite()
-        except Exception:
-            pass
-    up = st.file_uploader("Загрузить Excel ККД (сохранится как data/ККД_БД.xlsx)", type=["xlsx", "xls"], key="kkd_upload")
-    if up is not None:
-        target = DATA_DIR / "ККД_БД.xlsx"
-        target.write_bytes(up.getbuffer())
-        st.success(f"Файл сохранён: {target}")
 
-    c1, c2 = st.columns(2)
-    with c1:
-        if st.button("Пересобрать SQLite из Excel", type="primary"):
+    lab_src = st.radio(
+        "Источник лабораторных точек для J(Swn)",
+        options=("kkd", "matrix"),
+        format_func=lambda x: "База ККД (Excel → SQLite)" if x == "kkd" else "Excel: матрица ступеней (Sw + J)",
+        horizontal=True,
+        key="lab_cloud_source_mode",
+    )
+
+    df: pd.DataFrame | None = None
+
+    if lab_src == "kkd":
+        if excel_path().is_file() and not sqlite_path().is_file():
             try:
-                dbp = build_kkd_sqlite()
-                st.success(f"База обновлена: {dbp}")
-            except FileNotFoundError as e:
-                st.error(str(e))
-    with c2:
-        st.caption(f"Excel: `{excel_path()}`  |  SQLite: `{sqlite_path()}`")
+                build_kkd_sqlite()
+            except Exception:
+                pass
+        up = st.file_uploader("Загрузить Excel ККД (сохранится как data/ККД_БД.xlsx)", type=["xlsx", "xls"], key="kkd_upload")
+        if up is not None:
+            target = DATA_DIR / "ККД_БД.xlsx"
+            target.write_bytes(up.getbuffer())
+            st.success(f"Файл сохранён: {target}")
 
-    try:
-        db_file = sqlite_path()
-        df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
-    except FileNotFoundError:
-        st.info("База ещё не создана. Положите `ККД_БД.xlsx` в папку `data` или загрузите файл выше, затем нажмите «Пересобрать SQLite из Excel».")
-        return
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Пересобрать SQLite из Excel", type="primary"):
+                try:
+                    dbp = build_kkd_sqlite()
+                    st.success(f"База обновлена: {dbp}")
+                except FileNotFoundError as e:
+                    st.error(str(e))
+        with c2:
+            st.caption(f"Excel: `{excel_path()}`  |  SQLite: `{sqlite_path()}`")
+
+        try:
+            db_file = sqlite_path()
+            df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
+        except FileNotFoundError:
+            st.info(
+                "База ещё не создана. Положите `ККД_БД.xlsx` в папку `data` или загрузите файл выше, "
+                "затем нажмите «Пересобрать SQLite из Excel». Либо выберите источник «матрица ступеней»."
+            )
+            return
+    else:
+        st.markdown(
+            "Загрузите `.xlsx` / `.xls`, где **первая строка** задаёт объединённые заголовки "
+            "(блок водонасыщенности и блок J), **вторая** — подписи ступеней («1 ст.», …). "
+            "Таблица разворачивается: для каждой строки считаются `Sw_min`/`Sw_max` по всем ступеням, "
+            "`Swn = (Sw − Sw_min)/(Sw_max − Sw_min)`; если Swn получается 0 или 1 — в ячейку записывается пропуск."
+        )
+        mat_up = st.file_uploader("Файл матрицы ступеней", type=["xlsx", "xls"], key="lab_matrix_stairs_upload")
+        if mat_up is None:
+            st.info("Выберите файл Excel с матрицей ступеней.")
+            return
+        _def_kw_w = ", ".join(DEFAULT_MATRIX_WATER_KEYWORDS)
+        _def_kw_j = ", ".join(DEFAULT_MATRIX_J_KEYWORDS)
+        if "lab_matrix_kw_water_text" not in st.session_state:
+            st.session_state["lab_matrix_kw_water_text"] = _def_kw_w
+        if "lab_matrix_kw_j_text" not in st.session_state:
+            st.session_state["lab_matrix_kw_j_text"] = _def_kw_j
+        with st.expander("Подписи блоков (первая строка Excel)", expanded=False):
+            st.caption(
+                "Укажите подстроки, которые встречаются в **объединённой первой строке** заголовка для блока "
+                "водонасыщенности и для блока J. Разделитель — запятая, точка с запятой или новая строка. "
+                "Колонка попадает в блок только если совпала первая строка **и** вторая похожа на ступень "
+                "(«1 ст.», …). **Площадь**, **№ скв.**, **Фация**, **№ обр.**, **Код горизонта** (в т.ч. под объединённым заголовком J) "
+                "всегда считаются метаданными."
+            )
+            st.text_area(
+                "Ключевые слова блока водонасыщенности",
+                height=70,
+                key="lab_matrix_kw_water_text",
+                help=f"По умолчанию: {_def_kw_w}",
+            )
+            st.text_area(
+                "Ключевые слова блока J",
+                height=70,
+                key="lab_matrix_kw_j_text",
+                help=f"По умолчанию: {_def_kw_j}",
+            )
+        water_kw = parse_matrix_block_keywords(
+            st.session_state.get("lab_matrix_kw_water_text"), DEFAULT_MATRIX_WATER_KEYWORDS
+        )
+        j_kw = parse_matrix_block_keywords(st.session_state.get("lab_matrix_kw_j_text"), DEFAULT_MATRIX_J_KEYWORDS)
+        try:
+            raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1], engine="openpyxl")
+        except Exception:
+            try:
+                raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1])
+            except Exception as e2:
+                st.error(f"Не удалось прочитать Excel: {e2}")
+                return
+        if not is_likely_j_matrix_stairs_format(raw, water_keywords=water_kw, j_keywords=j_kw):
+            st.error(
+                "Файл не распознан как матрица ступеней: нет двухуровневого заголовка или не найдены столбцы "
+                "ступеней по заданным ключам. Проверьте первые две строки листа или расширьте ключевые слова выше."
+            )
+            return
+        try:
+            sw_c, j_c, meta_c = classify_j_matrix_stairs_columns(raw, water_keywords=water_kw, j_keywords=j_kw)
+            st.caption(
+                f"Распознано: водонасыщенность — {len(sw_c)} столбцов, J — {len(j_c)} столбцов, "
+                f"метаданные — {len(meta_c)} столбцов."
+            )
+            df = transform_j_stairs_wide_to_long(raw, water_keywords=water_kw, j_keywords=j_kw)
+        except Exception as e:
+            st.error(f"Ошибка преобразования в длинный формат: {e}")
+            return
+        if df.empty:
+            st.error("После разворота не осталось строк.")
+            return
+        st.success(f"Разворот матрицы: {len(df)} строк (ступени × исходные образцы).")
+        with st.expander("Предпросмотр (первые 20 строк)", expanded=False):
+            st.dataframe(df.head(20), use_container_width=True)
 
     cols = list(df.columns)
 
