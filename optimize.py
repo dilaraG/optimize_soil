@@ -1,3 +1,5 @@
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import differential_evolution, dual_annealing
@@ -93,7 +95,52 @@ def huber_loss(r: np.ndarray, delta: float = 0.1) -> np.ndarray:
     return np.where(mask, 0.5 * r**2, delta * (abs_r - 0.5 * delta))
 
 
-def loss_function(params: tuple[float, float, float], df: pd.DataFrame) -> float:
+def _j_power_envelope_penalty(
+    a: float,
+    b: float,
+    env: dict[str, Any] | None,
+    *,
+    n_grid: int = 48,
+    scale: float = 2e5,
+) -> float:
+    """
+    Штраф, если степенная J_lab(Swn) = a·Swn^b выходит за лабораторные нижнюю/верхнюю огибающие
+    на отрезке [s_min, s_max] облака (коридор по вертикали в каждой точке сетки).
+    """
+    if not env:
+        return 0.0
+    lo = env.get("lower") or {}
+    up = env.get("upper") or {}
+    try:
+        alo, blo = float(lo["a"]), float(lo["b"])
+        ahi, bhi = float(up["a"]), float(up["b"])
+    except (KeyError, TypeError, ValueError):
+        return 0.0
+    if not all(np.isfinite([a, b, alo, blo, ahi, bhi])):
+        return 0.0
+    s0 = float(env.get("s_min", 1e-4))
+    s1 = float(env.get("s_max", 1.0))
+    if not (np.isfinite(s0) and np.isfinite(s1)) or s1 <= 0:
+        return 0.0
+    s0 = max(s0, 1e-9)
+    s1 = max(s1, s0 * 1.01)
+    grid = np.logspace(np.log10(s0), np.log10(s1), int(max(8, min(n_grid, 120))))
+    with np.errstate(over="ignore", invalid="ignore"):
+        y_lo_b = alo * (grid**blo)
+        y_hi_b = ahi * (grid**bhi)
+        j_lo = np.minimum(y_lo_b, y_hi_b)
+        j_hi = np.maximum(y_lo_b, y_hi_b)
+        j_opt = a * (grid**b)
+    viol_lo = np.clip(j_lo - j_opt, 0.0, np.inf)
+    viol_hi = np.clip(j_opt - j_hi, 0.0, np.inf)
+    return float(scale * np.mean(viol_lo**2 + viol_hi**2))
+
+
+def loss_function(
+    params: tuple[float, float, float],
+    df: pd.DataFrame,
+    j_envelope: dict[str, Any] | None = None,
+) -> float:
     a, b, sigma = params
     kng_model = calc_kng_vector(df, a, b, sigma)
     kng_true = _safe_series(df, "Кнг_W")
@@ -102,7 +149,8 @@ def loss_function(params: tuple[float, float, float], df: pd.DataFrame) -> float
     if not np.any(valid):
         return 1e9
     r = kng_model[valid] - kng_true[valid]
-    return float(np.sum(weights[valid] * huber_loss(r)))
+    base = float(np.sum(weights[valid] * huber_loss(r)))
+    return base + _j_power_envelope_penalty(a, b, j_envelope)
 
 
 def _pso_optimize(
@@ -110,6 +158,7 @@ def _pso_optimize(
     bounds: list[tuple[float, float]],
     maxiter: int = 120,
     particles: int = 28,
+    j_envelope: dict[str, Any] | None = None,
 ) -> tuple[float, float, float]:
     dim = 3
     lb = np.array([b[0] for b in bounds], dtype=float)
@@ -118,7 +167,7 @@ def _pso_optimize(
     x = rng.uniform(lb, ub, size=(particles, dim))
     v = np.zeros_like(x)
     pbest = x.copy()
-    pbest_val = np.array([loss_function(tuple(xx), g) for xx in x], dtype=float)
+    pbest_val = np.array([loss_function(tuple(xx), g, j_envelope) for xx in x], dtype=float)
     gidx = int(np.argmin(pbest_val))
     gbest = pbest[gidx].copy()
     gbest_val = float(pbest_val[gidx])
@@ -129,7 +178,7 @@ def _pso_optimize(
         r2 = rng.random((particles, dim))
         v = w * v + c1 * r1 * (pbest - x) + c2 * r2 * (gbest - x)
         x = np.clip(x + v, lb, ub)
-        vals = np.array([loss_function(tuple(xx), g) for xx in x], dtype=float)
+        vals = np.array([loss_function(tuple(xx), g, j_envelope) for xx in x], dtype=float)
         better = vals < pbest_val
         pbest[better] = x[better]
         pbest_val[better] = vals[better]
@@ -148,6 +197,7 @@ def optimize_pvt(
     popsize: int = 20,
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
     optimizer_method: str = "differential_evolution",
+    j_envelope_by_pvt: dict[int, dict[str, Any]] | None = None,
 ) -> dict[int, tuple[float, float, float]]:
     params: dict[int, tuple[float, float, float]] = {}
     fixed = fixed_params or {}
@@ -163,14 +213,23 @@ def optimize_pvt(
             bounds_by_pvt[pvt]["b"],
             bounds_by_pvt[pvt]["sigma"],
         ]
+        env = j_envelope_by_pvt.get(pvt) if j_envelope_by_pvt else None
         method = (optimizer_method or "differential_evolution").lower()
         if method == "pso":
-            params[pvt] = _pso_optimize(g, bounds=bounds, maxiter=maxiter, particles=max(12, popsize))
+            params[pvt] = _pso_optimize(
+                g,
+                bounds=bounds,
+                maxiter=maxiter,
+                particles=max(12, popsize),
+                j_envelope=env,
+            )
         elif method == "dual_annealing":
-            result = dual_annealing(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, seed=42)
+            result = dual_annealing(loss_function, bounds=bounds, args=(g, env), maxiter=maxiter, seed=42)
             params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
         else:
-            result = differential_evolution(loss_function, bounds=bounds, args=(g,), maxiter=maxiter, popsize=popsize)
+            result = differential_evolution(
+                loss_function, bounds=bounds, args=(g, env), maxiter=maxiter, popsize=popsize
+            )
             params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
     return params
 
@@ -197,12 +256,32 @@ def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
         y_true = _safe_series(g, "Кнг_W")
         y_pred = _safe_series(g, "Kng_model")
         w = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
-        err = y_pred - y_true
-        mae = float(np.average(np.abs(err), weights=w))
-        rmse = float(np.sqrt(np.average(err**2, weights=w)))
-        bias = float(np.average(err, weights=w))
-        r2 = float(r2_score(y_true, y_pred))
-        score = float(1 - (np.sum(w * np.abs(err)) / np.sum(w)))
+        m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
+        if not np.any(m):
+            rows.append(
+                {
+                    "PVTNUM_GDM": int(float(pvt_raw)),
+                    "MAE": np.nan,
+                    "RMSE": np.nan,
+                    "BIAS": np.nan,
+                    "R2": np.nan,
+                    "SCORE": np.nan,
+                }
+            )
+            continue
+        yt = y_true[m]
+        yp = y_pred[m]
+        ww = w[m]
+        err = yp - yt
+        sw = float(np.sum(ww))
+        mae = float(np.average(np.abs(err), weights=ww)) if sw > 0 else np.nan
+        rmse = float(np.sqrt(np.average(err**2, weights=ww))) if sw > 0 else np.nan
+        bias = float(np.average(err, weights=ww)) if sw > 0 else np.nan
+        score = float(1.0 - (float(np.sum(ww * np.abs(err))) / sw)) if sw > 0 else np.nan
+        if len(yt) > 1:
+            r2 = float(r2_score(yt, yp))
+        else:
+            r2 = float("nan")
         rows.append(
             {
                 "PVTNUM_GDM": int(float(pvt_raw)),
@@ -291,6 +370,7 @@ def run_pipeline(
     popsize: int = 20,
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
     optimizer_method: str = "differential_evolution",
+    j_envelope_by_pvt: dict[int, dict[str, Any]] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     missing = [c for c in REQUIRED_WELL_COLUMNS if c not in df_wells.columns]
     if missing:
@@ -306,6 +386,7 @@ def run_pipeline(
         popsize=popsize,
         fixed_params=fixed_params,
         optimizer_method=optimizer_method,
+        j_envelope_by_pvt=j_envelope_by_pvt,
     )
     result = apply_model(data, params)
     qa = compute_qa(result)

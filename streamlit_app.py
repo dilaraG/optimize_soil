@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 from pathlib import Path
 import time
@@ -1204,13 +1205,50 @@ def _fmt_float3(x: object) -> str:
         return "—"
 
 
+# Общее сопоставление колонок скважин/добычи между вкладками J и БК
+SHARED_WELLS_COL_SIG = "shared_wells_cols_sig"
+SHARED_WELLS_MAP_SAVED = "shared_wells_map_saved"
+SHARED_PROD_COL_SIG = "shared_prod_cols_sig"
+SHARED_PROD_MAP_SAVED = "shared_prod_map_saved"
+
+
+def _wells_file_uploader_key() -> str:
+    n = int(st.session_state.get("shared_wells_uploader_nonce", 0))
+    return f"shared_wells_file_{n}"
+
+
+def _prod_file_uploader_key() -> str:
+    n = int(st.session_state.get("shared_prod_uploader_nonce", 0))
+    return f"shared_prod_file_{n}"
+
+
+def _clear_shared_wells_files() -> None:
+    for k in ("wells_file_path", "shared_wells_file_path", "bc_wells_path"):
+        st.session_state.pop(k, None)
+    st.session_state["shared_wells_uploader_nonce"] = int(st.session_state.get("shared_wells_uploader_nonce", 0)) + 1
+    st.session_state.pop(SHARED_WELLS_COL_SIG, None)
+
+
+def _clear_shared_prod_files() -> None:
+    for k in ("prod_file_path", "shared_prod_file_path", "bc_prod_path"):
+        st.session_state.pop(k, None)
+    st.session_state["shared_prod_uploader_nonce"] = int(st.session_state.get("shared_prod_uploader_nonce", 0)) + 1
+    st.session_state.pop(SHARED_PROD_COL_SIG, None)
+
+
 def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: str) -> pd.DataFrame:
     df = _normalize_columns(raw_wells.copy())
     cols = list(df.columns)
     st.subheader(title)
-    st.caption("Выберите соответствия колонок сверху, затем проверьте предпросмотр.")
+    st.caption("Сопоставления подставляются автоматически по именам колонок; при необходимости скорректируйте вручную.")
     if not cols:
         return df
+    sig = tuple(sorted(cols))
+    prev_sig = st.session_state.get(SHARED_WELLS_COL_SIG)
+    if prev_sig != sig:
+        st.session_state[SHARED_WELLS_COL_SIG] = sig
+        st.session_state[SHARED_WELLS_MAP_SAVED] = {}
+    saved_map = st.session_state.get(SHARED_WELLS_MAP_SAVED) or st.session_state.get(f"{key_prefix}_wells_map_saved", {})
     mapping_rules: list[tuple[str, str, list[str]]] = [
         ("WELL_NAME", "Скважина", ["WELL_NAME", "СКВАЖ", "WELL", "STVOL"]),
         ("PVTNUM_GDM", "Регион", ["PVTNUM", "PVT", "ЭКСПЛ", "OBJECT", "OBJ"]),
@@ -1218,13 +1256,18 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
         ("PERM_GDM", "Проницаемость", ["PERM", "ПРОНИ", "KPR", "K_PR"]),
         ("PC", "Капиллярное давление", ["PC", "КАПИЛ", "P_CAP"]),
         ("SWL_GDM", "Кво", ["SWL", "SWI", "SW_MIN", "КВО"]),
-        ("Кнг_W", "Нефтенасыщенность", ["КНГ", "KNG", "НЕФТЕНАС", "RIGIS"]),
+        ("Кнг_W", "Нефтенасыщенность", ["КНГ", "KNG", "KN", "SOIL", "НЕФТЕНАС", "RIGIS"]),
     ]
-    saved_map = st.session_state.get(f"{key_prefix}_wells_map_saved", {})
     defaults = {}
     for target, _, hints in mapping_rules:
         cand = saved_map.get(target)
-        defaults[target] = cand if isinstance(cand, str) and cand in cols else _safe_guess_col(cols, hints)
+        if isinstance(cand, str) and cand in cols:
+            defaults[target] = cand
+        elif target == "Кнг_W":
+            gk = _guess_kng_w_column(cols)
+            defaults[target] = gk if gk else _safe_guess_col(cols, hints)
+        else:
+            defaults[target] = _safe_guess_col(cols, hints)
     pick: dict[str, str] = {}
     row1_rules = mapping_rules[:4]
     row2_rules = mapping_rules[4:]
@@ -1237,7 +1280,7 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
             ui_label,
             options=cols,
             index=idx,
-            key=f"{key_prefix}_map_wells_{target}",
+            key=f"shared_map_wells_{target}",
         )
 
     row2 = st.columns(4)
@@ -1248,20 +1291,20 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
             ui_label,
             options=cols,
             index=idx,
-            key=f"{key_prefix}_map_wells_{target}",
+            key=f"shared_map_wells_{target}",
         )
 
     perf_saved = saved_map.get("Perf_GDM")
     perf_default = perf_saved if isinstance(perf_saved, str) and perf_saved in cols else _safe_guess_col(cols, ["PERF_GDM", "PERF", "ПЕРФ", "ПЕРФОРА"])
     perf_options = ["<не использовать>"] + cols
     perf_idx = perf_options.index(perf_default) if perf_default in perf_options else 0
-    perf_pick = row2[3].selectbox("Перфорация", options=perf_options, index=perf_idx, key=f"{key_prefix}_map_wells_Perf_GDM")
+    perf_pick = row2[3].selectbox("Перфорация", options=perf_options, index=perf_idx, key="shared_map_wells_Perf_GDM")
     if perf_pick != "<не использовать>":
         pick["Perf_GDM"] = perf_pick
     if len(set(pick.values())) != len(pick):
         st.error("Для обязательных полей скважин выбраны повторяющиеся колонки. Выберите уникальные соответствия.")
         return pd.DataFrame()
-    st.session_state[f"{key_prefix}_wells_map_saved"] = pick.copy()
+    st.session_state[SHARED_WELLS_MAP_SAVED] = pick.copy()
     rename_map = {src: dst for dst, src in pick.items()}
     mapped = df.rename(columns=rename_map)
     return mapped
@@ -1276,11 +1319,16 @@ def _map_uploaded_prod_df(raw_prod: pd.DataFrame | None, *, key_prefix: str, tit
     st.caption("Опционально: сопоставьте колонки файла добычи в таблице ниже, затем проверьте предпросмотр.")
     if not cols:
         return df
+    sig = tuple(sorted(cols))
+    prev_sig = st.session_state.get(SHARED_PROD_COL_SIG)
+    if prev_sig != sig:
+        st.session_state[SHARED_PROD_COL_SIG] = sig
+        st.session_state[SHARED_PROD_MAP_SAVED] = {}
+    saved_map = st.session_state.get(SHARED_PROD_MAP_SAVED) or st.session_state.get(f"{key_prefix}_prod_map_saved", {})
     rules: list[tuple[str, str, list[str]]] = [
         ("WELL_NAME", "Скважина", ["WELL_NAME", "СТВОЛ", "СКВАЖ", "WELL"]),
         ("PVTNUM_GDM", "Регион", ["PVTNUM", "ЭКСПЛ", "ОБЪЕКТ", "OBJECT"]),
     ]
-    saved_map = st.session_state.get(f"{key_prefix}_prod_map_saved", {})
     defaults = {}
     for target, _, hints in rules:
         cand = saved_map.get(target)
@@ -1291,15 +1339,106 @@ def _map_uploaded_prod_df(raw_prod: pd.DataFrame | None, *, key_prefix: str, tit
         host = cols_ui[i % 2]
         default = defaults[target]
         idx = cols.index(default) if default in cols else 0
-        picks[target] = host.selectbox(ui_label, options=cols, index=idx, key=f"{key_prefix}_map_prod_{target}")
+        picks[target] = host.selectbox(ui_label, options=cols, index=idx, key=f"shared_map_prod_{target}")
     st.caption("Предпросмотр загруженного файла добычи:")
     st.dataframe(_round_df(df.head(12)), use_container_width=True)
     if len(set(picks.values())) != len(picks):
         st.error("Для файла добычи выбраны повторяющиеся колонки сопоставления.")
         return pd.DataFrame()
-    st.session_state[f"{key_prefix}_prod_map_saved"] = picks.copy()
+    st.session_state[SHARED_PROD_MAP_SAVED] = picks.copy()
     rename_map = {src: dst for dst, src in picks.items()}
     return df.rename(columns=rename_map)
+
+
+def _prod_obj_key(v: object) -> str:
+    """Стабильный ключ для кода эксплуатационного объекта в файле добычи."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "__NA__"
+    if isinstance(v, (bool, np.bool_)):
+        return str(bool(v))
+    if isinstance(v, (int, np.integer)):
+        return str(int(v))
+    if isinstance(v, (float, np.floating)):
+        fv = float(v)
+        if np.isfinite(fv) and abs(fv - round(fv)) < 1e-9:
+            return str(int(round(fv)))
+        return format(fv, "g")
+    s = str(v).strip()
+    return s if s else "__EMPTY__"
+
+
+def _prod_code_resolves_to_model_pvt(v: object, model_pvt_set: set[int]) -> int | None:
+    """Если код в добыче уже совпадает с целочисленным PVTNUM модели — вернуть его."""
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return None
+    try:
+        iv = int(float(str(v).strip()))
+        if iv in model_pvt_set:
+            return iv
+    except (ValueError, TypeError, OverflowError):
+        pass
+    return None
+
+
+def _pvtmap_widget_key(prefix: str, prod_path_tag: str, rk: str) -> str:
+    h = hashlib.md5(f"{prefix}|{prod_path_tag}|{rk}".encode("utf-8", errors="replace")).hexdigest()[:18]
+    return f"pvtmap_{prefix}_{h}"
+
+
+def _apply_prod_pvt_mapping_ui(
+    df_prod: pd.DataFrame | None,
+    model_pvts: list[int],
+    *,
+    key_prefix: str,
+    prod_path: str | None,
+    title: str = "Соответствие кода объекта в добыче → PVTNUM модели",
+) -> pd.DataFrame | None:
+    """
+    В файле добычи колонка «регион» может содержать коды эксплуатационных объектов,
+    не совпадающие с PVTNUM_GDM скважин. Здесь для каждого уникального кода задаётся PVTNUM,
+    к которому относить строку при расчёте весов (слияние по WELL_NAME + PVTNUM_GDM).
+    """
+    if df_prod is None or df_prod.empty or not model_pvts:
+        return df_prod
+    if "PVTNUM_GDM" not in df_prod.columns:
+        return df_prod
+    tag = str(prod_path or "")
+    wset = set(int(p) for p in model_pvts)
+    uniq = df_prod["PVTNUM_GDM"].dropna().unique().tolist()
+    uniq_sorted = sorted(uniq, key=lambda x: (_prod_obj_key(x), str(x)))
+    st.subheader(title)
+    st.caption(
+        "Если в добыче указаны другие обозначения объектов, чем **PVTNUM_GDM** в файле скважин, "
+        "выберите для каждого кода соответствующий **PVTNUM** модели. Иначе веса по добыче не сольются со скважинами."
+    )
+    for u in uniq_sorted:
+        rk = _prod_obj_key(u)
+        auto = _prod_code_resolves_to_model_pvt(u, wset)
+        default_pvt = auto if auto is not None else int(model_pvts[0])
+        idx = model_pvts.index(default_pvt) if default_pvt in model_pvts else 0
+        wkey = _pvtmap_widget_key(key_prefix, tag, rk)
+        st.selectbox(
+            f"Код в файле добычи: `{u}` → PVTNUM",
+            options=model_pvts,
+            index=idx,
+            format_func=lambda x: f"{int(x)}",
+            key=wkey,
+            help="Этот PVTNUM должен совпадать с регионом скважины в геомодели для корректного merge весов.",
+        )
+    out = df_prod.copy()
+
+    def _cell(v: object) -> object:
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return v
+        rk = _prod_obj_key(v)
+        wkey = _pvtmap_widget_key(key_prefix, tag, rk)
+        if wkey in st.session_state:
+            return int(st.session_state[wkey])
+        r = _prod_code_resolves_to_model_pvt(v, wset)
+        return int(r) if r is not None else v
+
+    out["PVTNUM_GDM"] = out["PVTNUM_GDM"].map(_cell)
+    return out
 
 
 @st.cache_data(show_spinner=False)
@@ -1315,6 +1454,88 @@ def _guess_col(cols: list[str], candidates: list[str]) -> str:
             if cand in uc:
                 return orig
     return cols[0]
+
+
+def _guess_kng_w_column(cols: list[str]) -> str:
+    """
+    Автовыбор столбца нефтенасыщенности (Кнг): Kn, Кн, soil, КНГ, нефтенасыщенность и т.п.
+    """
+    if not cols:
+        return ""
+    scored: list[tuple[int, str]] = []
+    for c in cols:
+        raw = str(c).strip()
+        u = raw.upper().replace(" ", "").replace("_", "")
+        score = 0
+        if "КНГ" in u or "KNG" in u:
+            score += 8
+        if "НЕФТЕНАС" in raw.upper():
+            score += 8
+        if "SOIL" in u:
+            score += 6
+        if "OILSAT" in u or "SOIL" in raw.upper():
+            score += 4
+        if u in ("KN", "КН") or u.endswith("KN") or u.endswith("КН"):
+            score += 5
+        if "КН" in raw.upper() and "КНГ" not in raw.upper() and len(raw) <= 12:
+            score += 3
+        if "НЕФТ" in raw.upper() and "КВО" not in raw.upper() and "ВОД" not in raw.upper():
+            score += 2
+        if "RIGIS" in u:
+            score += 2
+        if score > 0:
+            scored.append((score, c))
+    if scored:
+        scored.sort(key=lambda t: (-t[0], len(str(t[1]))))
+        return str(scored[0][1])
+    return _guess_col(cols, ["КНГ", "KNG", "KN", "SOIL", "НЕФТЕНАС", "RIGIS", "КНН"])
+
+
+def _build_j_envelopes_by_pvt(
+    pvts: list[int],
+    cloud: pd.DataFrame | None,
+    pvt_horizon_map: dict[int, list[str]],
+) -> dict[int, dict]:
+    """
+    Коридор J(Swn)=a·Swn^b по лаборатории для штрафа в optimize (нижняя/верхняя + диапазон Swn).
+    """
+    out: dict[int, dict] = {}
+    if cloud is None or cloud.empty:
+        return out
+    need = {"lab_horizon", "Swn", "J_lab"}
+    if not need.issubset(cloud.columns):
+        return out
+    for pvt in pvts:
+        hs = pvt_horizon_map.get(pvt) or []
+        if not hs:
+            continue
+        hs_set = {str(h).strip() for h in hs}
+        sub = cloud.loc[cloud["lab_horizon"].astype(str).str.strip().isin(hs_set)]
+        if len(sub) < 5:
+            continue
+        swn = pd.to_numeric(sub["Swn"], errors="coerce").to_numpy(dtype=float)
+        jj = pd.to_numeric(sub["J_lab"], errors="coerce").to_numpy(dtype=float)
+        m = np.isfinite(swn) & np.isfinite(jj) & (swn > 0) & (jj > 0)
+        if int(m.sum()) < 5:
+            continue
+        info = auto_ab_bounds_from_cloud(swn[m], jj[m])
+        lo = info.get("lower") or {}
+        up = info.get("upper") or {}
+        try:
+            alo, blo = float(lo["a"]), float(lo["b"])
+            ahi, bhi = float(up["a"]), float(up["b"])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not all(np.isfinite([alo, blo, ahi, bhi])):
+            continue
+        s_pos = swn[m]
+        out[int(pvt)] = {
+            "lower": {"a": alo, "b": blo},
+            "upper": {"a": ahi, "b": bhi},
+            "s_min": float(np.min(s_pos)),
+            "s_max": float(np.max(s_pos)),
+        }
+    return out
 
 
 def _add_pvit_n_if_missing(df: pd.DataFrame) -> pd.DataFrame:
@@ -1561,9 +1782,29 @@ def laboratory_tab() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
+    st.subheader("Лаборатория: данные для метода Брукса–Кори")
+    st.caption("Можно загрузить сразу, без настройки облака J(Swn).")
+    bc_file = st.file_uploader(
+        "Загрузить таблицу лабораторных точек (файл зависимости_облако_точек)",
+        type=["csv", "xlsx", "xls"],
+        key="bc_lab_upload",
+    )
+    if bc_file is not None:
+        try:
+            bc_df = _read_table(bc_file)
+            bc_df = _add_pvit_n_if_missing(_normalize_columns(bc_df))
+            st.session_state["bc_user_upload_df"] = bc_df
+            st.session_state["bc_user_upload_rev"] = int(time.time() * 1000) % 1_000_000_000
+            st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк (используются только они, без ККД из БД).")
+        except Exception as e:
+            st.error(f"Ошибка загрузки данных Брукса-Кори: {e}")
+
+    st.divider()
+
     lab_src = st.radio(
         "Источник лабораторных точек для J(Swn)",
-        options=("kkd", "matrix"),
+        options=("matrix", "kkd"),
+        index=0,
         format_func=lambda x: "База ККД (Excel → SQLite)" if x == "kkd" else "Excel: матрица ступеней (Sw + J)",
         horizontal=True,
         key="lab_cloud_source_mode",
@@ -1602,7 +1843,7 @@ def laboratory_tab() -> None:
                 "База ещё не создана. Положите `ККД_БД.xlsx` в папку `data` или загрузите файл выше, "
                 "затем нажмите «Пересобрать SQLite из Excel». Либо выберите источник «матрица ступеней»."
             )
-            return
+            df = None
     else:
         st.markdown(
             "Загрузите `.xlsx` / `.xls`, где **первая строка** задаёт объединённые заголовки "
@@ -1612,68 +1853,78 @@ def laboratory_tab() -> None:
         )
         mat_up = st.file_uploader("Файл матрицы ступеней", type=["xlsx", "xls"], key="lab_matrix_stairs_upload")
         if mat_up is None:
-            st.info("Выберите файл Excel с матрицей ступеней.")
-            return
-        _def_kw_w = ", ".join(DEFAULT_MATRIX_WATER_KEYWORDS)
-        _def_kw_j = ", ".join(DEFAULT_MATRIX_J_KEYWORDS)
-        if "lab_matrix_kw_water_text" not in st.session_state:
-            st.session_state["lab_matrix_kw_water_text"] = _def_kw_w
-        if "lab_matrix_kw_j_text" not in st.session_state:
-            st.session_state["lab_matrix_kw_j_text"] = _def_kw_j
-        with st.expander("Подписи блоков (первая строка Excel)", expanded=False):
-            st.caption(
-                "Укажите подстроки, которые встречаются в **объединённой первой строке** заголовка для блока "
-                "водонасыщенности и для блока J. Разделитель — запятая, точка с запятой или новая строка. "
-                "Колонка попадает в блок только если совпала первая строка **и** вторая похожа на ступень "
-                "(«1 ст.», …). **Площадь**, **№ скв.**, **Фация**, **№ обр.**, **Код горизонта** (в т.ч. под объединённым заголовком J) "
-                "всегда считаются метаданными."
+            st.info("Выберите файл Excel с матрицей ступеней — или переключитесь на источник «База ККД».")
+            df = None
+        else:
+            _def_kw_w = ", ".join(DEFAULT_MATRIX_WATER_KEYWORDS)
+            _def_kw_j = ", ".join(DEFAULT_MATRIX_J_KEYWORDS)
+            if "lab_matrix_kw_water_text" not in st.session_state:
+                st.session_state["lab_matrix_kw_water_text"] = _def_kw_w
+            if "lab_matrix_kw_j_text" not in st.session_state:
+                st.session_state["lab_matrix_kw_j_text"] = _def_kw_j
+            with st.expander("Подписи блоков (первая строка Excel)", expanded=False):
+                st.caption(
+                    "Укажите подстроки, которые встречаются в **объединённой первой строке** заголовка для блока "
+                    "водонасыщенности и для блока J. Разделитель — запятая, точка с запятой или новая строка. "
+                    "Колонка попадает в блок только если совпала первая строка **и** вторая похожа на ступень "
+                    "(«1 ст.», …). **Площадь**, **№ скв.**, **Фация**, **№ обр.**, **Код горизонта** (в т.ч. под объединённым заголовком J) "
+                    "всегда считаются метаданными."
+                )
+                st.text_area(
+                    "Ключевые слова блока водонасыщенности",
+                    height=70,
+                    key="lab_matrix_kw_water_text",
+                    help=f"По умолчанию: {_def_kw_w}",
+                )
+                st.text_area(
+                    "Ключевые слова блока J",
+                    height=70,
+                    key="lab_matrix_kw_j_text",
+                    help=f"По умолчанию: {_def_kw_j}",
+                )
+            water_kw = parse_matrix_block_keywords(
+                st.session_state.get("lab_matrix_kw_water_text"), DEFAULT_MATRIX_WATER_KEYWORDS
             )
-            st.text_area(
-                "Ключевые слова блока водонасыщенности",
-                height=70,
-                key="lab_matrix_kw_water_text",
-                help=f"По умолчанию: {_def_kw_w}",
-            )
-            st.text_area(
-                "Ключевые слова блока J",
-                height=70,
-                key="lab_matrix_kw_j_text",
-                help=f"По умолчанию: {_def_kw_j}",
-            )
-        water_kw = parse_matrix_block_keywords(
-            st.session_state.get("lab_matrix_kw_water_text"), DEFAULT_MATRIX_WATER_KEYWORDS
-        )
-        j_kw = parse_matrix_block_keywords(st.session_state.get("lab_matrix_kw_j_text"), DEFAULT_MATRIX_J_KEYWORDS)
-        try:
-            raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1], engine="openpyxl")
-        except Exception:
+            j_kw = parse_matrix_block_keywords(st.session_state.get("lab_matrix_kw_j_text"), DEFAULT_MATRIX_J_KEYWORDS)
             try:
-                raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1])
-            except Exception as e2:
-                st.error(f"Не удалось прочитать Excel: {e2}")
+                raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1], engine="openpyxl")
+            except Exception:
+                try:
+                    raw = pd.read_excel(io.BytesIO(mat_up.getbuffer()), header=[0, 1])
+                except Exception as e2:
+                    st.error(f"Не удалось прочитать Excel: {e2}")
+                    return
+            if not is_likely_j_matrix_stairs_format(raw, water_keywords=water_kw, j_keywords=j_kw):
+                st.error(
+                    "Файл не распознан как матрица ступеней: нет двухуровневого заголовка или не найдены столбцы "
+                    "ступеней по заданным ключам. Проверьте первые две строки листа или расширьте ключевые слова выше."
+                )
                 return
-        if not is_likely_j_matrix_stairs_format(raw, water_keywords=water_kw, j_keywords=j_kw):
-            st.error(
-                "Файл не распознан как матрица ступеней: нет двухуровневого заголовка или не найдены столбцы "
-                "ступеней по заданным ключам. Проверьте первые две строки листа или расширьте ключевые слова выше."
-            )
-            return
-        try:
-            sw_c, j_c, meta_c = classify_j_matrix_stairs_columns(raw, water_keywords=water_kw, j_keywords=j_kw)
-            st.caption(
-                f"Распознано: водонасыщенность — {len(sw_c)} столбцов, J — {len(j_c)} столбцов, "
-                f"метаданные — {len(meta_c)} столбцов."
-            )
-            df = transform_j_stairs_wide_to_long(raw, water_keywords=water_kw, j_keywords=j_kw)
-        except Exception as e:
-            st.error(f"Ошибка преобразования в длинный формат: {e}")
-            return
-        if df.empty:
-            st.error("После разворота не осталось строк.")
-            return
-        st.success(f"Разворот матрицы: {len(df)} строк (ступени × исходные образцы).")
-        with st.expander("Предпросмотр (первые 20 строк)", expanded=False):
-            st.dataframe(df.head(20), use_container_width=True)
+            try:
+                sw_c, j_c, meta_c = classify_j_matrix_stairs_columns(raw, water_keywords=water_kw, j_keywords=j_kw)
+                st.caption(
+                    f"Распознано: водонасыщенность — {len(sw_c)} столбцов, J — {len(j_c)} столбцов, "
+                    f"метаданные — {len(meta_c)} столбцов."
+                )
+                df = transform_j_stairs_wide_to_long(raw, water_keywords=water_kw, j_keywords=j_kw)
+            except Exception as e:
+                st.error(f"Ошибка преобразования в длинный формат: {e}")
+                return
+            if df.empty:
+                st.error("После разворота не осталось строк.")
+                return
+            st.success(f"Разворот матрицы: {len(df)} строк (ступени × исходные образцы).")
+            with st.expander("Предпросмотр (первые 20 строк)", expanded=False):
+                st.dataframe(df.head(20), use_container_width=True)
+
+    if df is None:
+        cloud_only = st.session_state.get("lab_cloud")
+        if cloud_only is not None and not cloud_only.empty:
+            st.subheader("График J(Swn) (сохранённые данные)")
+            fit = st.session_state.get("lab_trend_fit") or {}
+            fig = _fig_j_swn_lab(cloud_only, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
+            st.plotly_chart(fig, use_container_width=True)
+        return
 
     cols = list(df.columns)
 
@@ -1709,9 +1960,11 @@ def laboratory_tab() -> None:
     else:
         st.session_state["lab_sel_areas"] = [a for a in st.session_state["lab_sel_areas"] if a in areas]
     if "lab_sel_hors" not in st.session_state:
-        st.session_state["lab_sel_hors"] = []
+        st.session_state["lab_sel_hors"] = horizons.copy()
     else:
         st.session_state["lab_sel_hors"] = [h for h in st.session_state["lab_sel_hors"] if h in horizons]
+        if not st.session_state["lab_sel_hors"] and horizons:
+            st.session_state["lab_sel_hors"] = horizons.copy()
     cfa1, cfa2 = st.columns([1, 3])
     all_selected = set(st.session_state.get("lab_sel_areas", [])) == set(areas) and len(areas) > 0
     if cfa1.button("Выбрать все (площади)" if not all_selected else "Снять все (площади)", key="lab_toggle_all_areas"):
@@ -1751,6 +2004,7 @@ def laboratory_tab() -> None:
         }
         fit = fit_power_j_swn(filt["Swn"].to_numpy(), filt["J_lab"].to_numpy())
         st.session_state["lab_trend_fit"] = fit
+        st.session_state["_pending_pvt_hor_fill"] = sorted(filt["lab_horizon"].astype(str).str.strip().unique())
         st.success(
             f"Сохранено точек: {_fmt_float3(len(filt))}. Лаб. тренд: "
             f"a={_fmt_float3(fit.get('a'))}, b={_fmt_float3(fit.get('b'))}, R²={_fmt_float3(fit.get('r2'))}"
@@ -1763,24 +2017,6 @@ def laboratory_tab() -> None:
         fig = _fig_j_swn_lab(cloud, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
         st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-    st.subheader("Лаборатория: загрузка данных для метода Брукса-Кори")
-    bc_file = st.file_uploader(
-        "Загрузить таблицу лабораторных точек (файл зависимости_облако_точек)",
-        type=["csv", "xlsx", "xls"],
-        key="bc_lab_upload",
-    )
-    if bc_file is not None:
-        try:
-            bc_df = _read_table(bc_file)
-            bc_df = _add_pvit_n_if_missing(_normalize_columns(bc_df))
-            st.session_state["bc_user_upload_df"] = bc_df
-            # Сброс виджетов фильтра БК (площади/горизонты), чтобы списки брались из нового файла
-            st.session_state["bc_user_upload_rev"] = int(time.time() * 1000) % 1_000_000_000
-            st.success(f"Данные Брукса-Кори загружены: {len(bc_df)} строк (используются только они, без ККД из БД).")
-        except Exception as e:
-            st.error(f"Ошибка загрузки данных Брукса-Кори: {e}")
-
 
 def leverett_tab() -> None:
     st.title("Подбор J функции Леверетта")
@@ -1791,8 +2027,19 @@ def leverett_tab() -> None:
 
     with st.sidebar:
         st.header("Загрузка данных")
-        wells_file = st.file_uploader("Файл скважин", type=["csv", "xlsx", "xls", "txt"], key="wells_file")
-        prod_file = st.file_uploader("Файл добычи (опционально для весов)", type=["csv", "xlsx", "xls"], key="prod_file")
+        wells_file = st.file_uploader(
+            "Файл скважин", type=["csv", "xlsx", "xls", "txt"], key=_wells_file_uploader_key()
+        )
+        prod_file = st.file_uploader(
+            "Файл добычи (опционально для весов)", type=["csv", "xlsx", "xls"], key=_prod_file_uploader_key()
+        )
+        c_clr1, c_clr2 = st.columns(2)
+        if c_clr1.button("Сбросить скважины", help="Убрать сохранённый файл скважин из расчёта", key="j_clr_wells"):
+            _clear_shared_wells_files()
+            st.rerun()
+        if c_clr2.button("Сбросить добычу", help="Убрать сохранённый файл добычи из расчёта", key="j_clr_prod"):
+            _clear_shared_prod_files()
+            st.rerun()
         optimizer_method = st.selectbox(
             "Метод оптимизации",
             options=["differential_evolution", "pso", "dual_annealing"],
@@ -1862,6 +2109,20 @@ def leverett_tab() -> None:
         st.error("Не удалось определить регионы PVTNUM_GDM.")
         return
 
+    _ph_fill = st.session_state.pop("_pending_pvt_hor_fill", None)
+    if _ph_fill is not None:
+        for _pvt in pvts:
+            st.session_state[f"pvt_hor_map_{_pvt}"] = list(_ph_fill)
+
+    df_prod_weights = df_prod
+    if df_prod is not None and not df_prod.empty and "PVTNUM_GDM" in df_prod.columns:
+        df_prod_weights = _apply_prod_pvt_mapping_ui(
+            df_prod,
+            pvts,
+            key_prefix="shared",
+            prod_path=str(prod_path) if prod_path else "",
+        )
+
     st.subheader("Предпросмотр данных")
     st.dataframe(_round_df(df_wells.head(30)), use_container_width=True)
     st.caption(f"Строк после очистки: {len(df_wells)}")
@@ -1884,7 +2145,8 @@ def leverett_tab() -> None:
     if lab_ready and cloud is not None and not cloud.empty:
         bounds_mode = st.radio(
             "Как задавать amin/amax/bmin/bmax",
-            options=("Ручной ввод", "Автоподбор по лабораторному облаку"),
+            options=("Автоподбор по лабораторному облаку", "Ручной ввод"),
+            index=0,
             horizontal=True,
         )
     else:
@@ -2005,6 +2267,18 @@ def leverett_tab() -> None:
         merged.update(partial)
         return merged
 
+    j_envelope_arg: dict[int, dict] | None = None
+    if (
+        lab_ready
+        and cloud is not None
+        and not cloud.empty
+        and pvt_horizon_map
+        and not any(not (pvt_horizon_map.get(p) or []) for p in pvts)
+    ):
+        _je = _build_j_envelopes_by_pvt(pvts, cloud, pvt_horizon_map)
+        if _je:
+            j_envelope_arg = _je
+
     if run_fix:
         if not use_fixed:
             st.error("Включите «Рассчитать с заданными коэффициентами» и задайте a, b, sigma.")
@@ -2015,14 +2289,16 @@ def leverett_tab() -> None:
             _ui_lock(True, "ui_lock_j")
             with st.spinner("Применяются заданные коэффициенты..."):
                 try:
+                    t0_j = time.perf_counter()
                     result_df, params_df, qa_df = run_pipeline(
                         df_wells=df_wells,
-                        df_prod=df_prod,
+                        df_prod=df_prod_weights,
                         bounds_by_pvt=_merge_bounds(bounds_by_pvt),
                         maxiter=maxiter,
                         popsize=popsize,
                         fixed_params=fixed_params,
                         optimizer_method=optimizer_method,
+                        j_envelope_by_pvt=j_envelope_arg,
                     )
                 except Exception as e:
                     st.error(f"Ошибка расчета: {e}")
@@ -2030,6 +2306,7 @@ def leverett_tab() -> None:
                     st.session_state["leverett_result_df"] = result_df
                     st.session_state["leverett_params_df"] = params_df
                     st.session_state["leverett_qa_df"] = qa_df
+                    st.session_state["j_total_elapsed_sec"] = float(time.perf_counter() - t0_j)
                     st.success("Расчет с заданными коэффициентами завершен.")
                 finally:
                     st.session_state["j_busy"] = False
@@ -2043,14 +2320,16 @@ def leverett_tab() -> None:
             _ui_lock(True, "ui_lock_j")
             with st.spinner("Выполняется подбор коэффициентов..."):
                 try:
+                    t0_j = time.perf_counter()
                     result_df, params_df, qa_df = run_pipeline(
                         df_wells=df_wells,
-                        df_prod=df_prod,
+                        df_prod=df_prod_weights,
                         bounds_by_pvt=_merge_bounds(bounds_by_pvt),
                         maxiter=maxiter,
                         popsize=popsize,
                         fixed_params=None,
                         optimizer_method=optimizer_method,
+                        j_envelope_by_pvt=j_envelope_arg,
                     )
                 except Exception as e:
                     st.error(f"Ошибка расчета: {e}")
@@ -2058,6 +2337,7 @@ def leverett_tab() -> None:
                     st.session_state["leverett_result_df"] = result_df
                     st.session_state["leverett_params_df"] = params_df
                     st.session_state["leverett_qa_df"] = qa_df
+                    st.session_state["j_total_elapsed_sec"] = float(time.perf_counter() - t0_j)
                     st.success("Расчет завершен.")
                 finally:
                     st.session_state["j_busy"] = False
@@ -2069,6 +2349,10 @@ def leverett_tab() -> None:
     if result_df is None or params_df is None or qa_df is None:
         st.info("Запустите расчет, чтобы увидеть результаты и графики.")
         return
+
+    j_total_elapsed = st.session_state.get("j_total_elapsed_sec")
+    if j_total_elapsed is not None:
+        st.metric("Общее время расчета J-функции, сек", f"{float(j_total_elapsed):.2f}")
 
     c1, c2 = st.columns(2)
     with c1:
@@ -2301,8 +2585,8 @@ def brooks_corey_tab() -> None:
     bc_lab_df, bc_source = _get_bc_source_df()
     if bc_lab_df is None or bc_lab_df.empty:
         st.info(
-            "Нет данных для Брукса-Кори: загрузите свой файл во вкладке «Лаборатория» "
-            "(блок Брукса-Кори) или убедитесь, что доступна БД ККД."
+            "Нет данных для Брукса-Кори: во вкладке «Лаборатория» вверху страницы загрузите таблицу для БК "
+            "или настройте облако J(Swn) и примените фильтр, либо убедитесь, что доступна БД ККД."
         )
         return
     st.caption(f"Источник лабораторных данных БК: {bc_source}")
@@ -2354,10 +2638,21 @@ def brooks_corey_tab() -> None:
             key="bc_perm_cap",
             help="Значения проницаемости обрезаются сверху при подготовке лабораторных данных и при расчёте Кпр.",
         )
-        wells_file = st.file_uploader("Файл скважин (для БК)", type=["csv", "xlsx", "xls", "txt"], key="bc_wells_file")
-        prod_file = st.file_uploader("Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key="bc_prod_file")
-        maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=180, step=10, key="bc_maxiter")
-        popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=18, step=1, key="bc_popsize")
+        wells_file = st.file_uploader(
+            "Файл скважин (для БК)", type=["csv", "xlsx", "xls", "txt"], key=_wells_file_uploader_key()
+        )
+        prod_file = st.file_uploader(
+            "Файл добычи (для весов БК, опционально)", type=["csv", "xlsx", "xls"], key=_prod_file_uploader_key()
+        )
+        bcw1, bcw2 = st.columns(2)
+        if bcw1.button("Сбросить скважины", key="bc_clr_wells"):
+            _clear_shared_wells_files()
+            st.rerun()
+        if bcw2.button("Сбросить добычу", key="bc_clr_prod"):
+            _clear_shared_prod_files()
+            st.rerun()
+        maxiter = st.slider("Итерации БК", min_value=50, max_value=350, value=200, step=10, key="bc_maxiter")
+        popsize = st.slider("Популяция БК", min_value=10, max_value=40, value=20, step=1, key="bc_popsize")
         bc_optimizer_method = st.selectbox(
             "Метод оптимизации БК",
             options=["differential_evolution", "pso", "dual_annealing"],
@@ -2403,7 +2698,23 @@ def brooks_corey_tab() -> None:
         if (not use_perf_weights) and ("Perf_GDM" in df_geo_raw.columns):
             df_geo_raw = df_geo_raw.drop(columns=["Perf_GDM"])
         df_prod = _clean_prod_cached(mapped_prod)
-        df_geo = prepare_brooks_training_data(df_geo_raw, df_prod)
+        df_geo_raw["PVTNUM_GDM"] = pd.to_numeric(df_geo_raw["PVTNUM_GDM"], errors="coerce")
+        pvts_bc = sorted(df_geo_raw["PVTNUM_GDM"].dropna().astype(int).unique().tolist())
+        df_prod_m = df_prod
+        if (
+            df_prod is not None
+            and not df_prod.empty
+            and "PVTNUM_GDM" in df_prod.columns
+            and pvts_bc
+        ):
+            df_prod_m = _apply_prod_pvt_mapping_ui(
+                df_prod,
+                pvts_bc,
+                key_prefix="shared",
+                prod_path=str(prod_path) if prod_path else "",
+                title="Соответствие кода объекта в добыче → PVTNUM (БК, веса)",
+            )
+        df_geo = prepare_brooks_training_data(df_geo_raw, df_prod_m)
     except Exception as e:
         st.error(f"Ошибка чтения геологической модели: {e}")
         return
@@ -2466,6 +2777,16 @@ def brooks_corey_tab() -> None:
     )
     swl_dbg = pd.to_numeric(bc_lab_df[swl_col], errors="coerce")
     swl_zero_share = float((swl_dbg == 0).mean()) if swl_dbg.notna().sum() > 0 else np.nan
+    n_sw = int(swl_dbg.notna().sum())
+    if n_sw:
+        bad_gt1 = int((swl_dbg > 1.0).sum())
+        bad_nonpos = int((swl_dbg <= 0).sum())
+        if bad_gt1 or bad_nonpos:
+            st.warning(
+                "Столбец **Swi/Swl (лаборатория)** должен содержать доли связной воды в интервале **(0; 1]**. "
+                f"Сейчас: значений **> 1**: {bad_gt1}, **≤ 0** (включая нули): {bad_nonpos} из {n_sw} числовых ячеек. "
+                "Проверьте сопоставление столбца и единицы (не проценты), при необходимости пересчитайте в доли."
+            )
     d1, d2, d3 = st.columns(3)
     d1.metric("swl min", f"{swl_dbg.min():.4g}" if swl_dbg.notna().sum() else "nan")
     d2.metric("swl max", f"{swl_dbg.max():.4g}" if swl_dbg.notna().sum() else "nan")
@@ -2956,14 +3277,20 @@ def compare_methods_tab() -> None:
 def main() -> None:
     page = st.sidebar.radio("Раздел", options=["Лаборатория", "Подбор J функции Леверетта", "Брукса-Кори", "Сравнение методов"])
     prev_page = st.session_state.get("_active_page")
-    if prev_page != page:
-        # Не запоминаем связь код горизонта -> PVTNUM при переключении разделов
+    _keep_maps = {
+        "Лаборатория",
+        "Подбор J функции Леверетта",
+        "Брукса-Кори",
+    }
+    if prev_page != page and not (prev_page in _keep_maps and page in _keep_maps):
         st.session_state.pop("pvt_horizon_map", None)
         st.session_state.pop("bc_pvt_h_map", None)
         for k in list(st.session_state.keys()):
             ks = str(k)
             if ks.startswith("pvt_hor_map_") or ks.startswith("bc_map_"):
                 st.session_state.pop(k, None)
+        _scroll_page_top()
+    elif prev_page != page:
         _scroll_page_top()
     st.session_state["_active_page"] = page
     if page == "Лаборатория":

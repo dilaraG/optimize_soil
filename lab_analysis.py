@@ -100,12 +100,19 @@ def pick_second_swn_column(columns: list[str]) -> tuple[str | None, list[str]]:
 
 
 def fit_power_j_swn(swn: np.ndarray, j: np.ndarray) -> dict[str, Any]:
-    """J ≈ a * Swn^b в лог-лог масштабе."""
+    """J ≈ a * Swn^b в лог-лог: OLS по тем же точкам, что и для огибающих (без сильных выбросов)."""
     mask = np.isfinite(swn) & np.isfinite(j) & (swn > 0) & (j > 0)
     if mask.sum() < 3:
         return {"a": np.nan, "b": np.nan, "r2": np.nan, "n": int(mask.sum())}
-    u = np.log(swn[mask])
-    v = np.log(j[mask])
+    s = swn[mask].astype(float)
+    jj = j[mask].astype(float)
+    env_m = _j_cloud_inlier_mask_for_envelopes(s, jj)
+    s_fit = s[env_m]
+    jj_fit = jj[env_m]
+    if len(s_fit) < 3:
+        s_fit, jj_fit = s, jj
+    u = np.log(s_fit)
+    v = np.log(jj_fit)
     coef = np.polyfit(u, v, 1)
     b = float(coef[0])
     ln_a = float(coef[1])
@@ -114,7 +121,7 @@ def fit_power_j_swn(swn: np.ndarray, j: np.ndarray) -> dict[str, Any]:
     ss_res = float(np.sum((v - v_pred) ** 2))
     ss_tot = float(np.sum((v - np.mean(v)) ** 2))
     r2 = float(1 - ss_res / ss_tot) if ss_tot > 0 else np.nan
-    return {"a": a, "b": b, "r2": r2, "n": int(mask.sum())}
+    return {"a": a, "b": b, "r2": r2, "n": int(len(u))}
 
 
 def _median_pairwise_slope(u: np.ndarray, v: np.ndarray) -> float:
@@ -179,6 +186,58 @@ def _tight_a_from_b(s: np.ndarray, j: np.ndarray, b: float, side: str) -> float:
     return float(np.min(r))
 
 
+def _refine_lower_j_power_for_low_swn(
+    s: np.ndarray,
+    j: np.ndarray,
+    b_lo: float,
+    b_up: float,
+    low_swn_quantile: float = 0.18,
+    n_grid: int = 44,
+) -> tuple[float, float]:
+    """
+    Нижняя степенная J = a·Swn^b не должна сильно провисать у малых Swn относительно точек:
+    перебираем b_lo в [b_lo, min(b_up−ε, −0.055)] и для каждого b берём a = min_i(J_i/Swn_i^b);
+    выбираем пару, у которой минимальный зазор J_i − a·Swn_i^b по точкам с Swn в нижнем квантиле
+    минимален (стремимся к касанию хотя бы одной точки в этой зоне), не нарушая a·Swn^b ≤ J везде.
+    """
+    b_lo = float(b_lo)
+    b_up = float(b_up)
+    b_cap = float(min(-0.055, b_up - 0.02))
+    if not (np.isfinite(b_lo) and np.isfinite(b_cap)) or b_lo >= b_cap:
+        a0 = _tight_a_from_b(s, j, b_lo, "lower")
+        return b_lo, a0
+
+    q = float(np.clip(low_swn_quantile, 0.05, 0.45))
+    s_thr = float(np.quantile(s, q))
+    m_low = s <= s_thr
+    if not np.any(m_low):
+        a0 = _tight_a_from_b(s, j, b_lo, "lower")
+        return b_lo, a0
+
+    bs = np.linspace(b_lo, b_cap, int(max(8, min(n_grid, 80))))
+    best_b = b_lo
+    best_gap = float("inf")
+    for b in bs:
+        bb = float(b)
+        a_try = _tight_a_from_b(s, j, bb, "lower")
+        if not np.isfinite(a_try):
+            continue
+        with np.errstate(over="ignore", invalid="ignore"):
+            pred = a_try * (s**bb)
+        gap = j - pred
+        if np.min(gap) < -1e-7:
+            continue
+        g_low = float(np.min(gap[m_low]))
+        if g_low < best_gap:
+            best_gap = g_low
+            best_b = bb
+
+    a_best = _tight_a_from_b(s, j, best_b, "lower")
+    if not np.isfinite(a_best):
+        return b_lo, _tight_a_from_b(s, j, b_lo, "lower")
+    return float(best_b), float(a_best)
+
+
 def _tight_a_from_b_robust_upper(s: np.ndarray, j: np.ndarray, b: float) -> float:
     """
     Робастная оценка a для верхней огибающей.
@@ -217,6 +276,90 @@ def _clip_power_curve(s: np.ndarray, j_min: float, j_max: float, a: float, b: fl
     return grid, y
 
 
+def _j_cloud_inlier_mask_for_envelopes(
+    s: np.ndarray,
+    j: np.ndarray,
+    *,
+    iqr_k: float = 2.8,
+    min_keep_frac: float = 0.55,
+) -> np.ndarray:
+    """
+    Сильные выбросы в облаке (Swn, J) не участвуют в построении нижней/верхней огибающих.
+
+    1) По IQR в log(Swn) и log(J) — грубый отсев по осям.
+    2) По робастным остаткам в log-log: наклон — медиана попарных наклонов, сдвиг — медиана(v − b·u);
+       точки с |z| > порога (жёстче при малом n) отбрасываются — сильные выбросы относительно
+       основного тренда в (ln Swn, ln J), в том числе при малой выборке по горизонту.
+    """
+    n = int(len(s))
+    if n < 4:
+        return np.ones(n, dtype=bool)
+    s = np.asarray(s, dtype=float)
+    j = np.asarray(j, dtype=float)
+    u = np.log(s)
+    v = np.log(j)
+    base = np.isfinite(u) & np.isfinite(v) & (s > 0) & (j > 0)
+    if int(base.sum()) < 4:
+        return np.ones(n, dtype=bool)
+
+    min_keep = max(5, int((0.35 if n <= 14 else min_keep_frac) * n))
+
+    # --- IQR по осям log ---
+    m_iqr = np.ones(n, dtype=bool)
+    if n >= 10:
+        uu, vv = u[base], v[base]
+        q1, q3 = np.quantile(vv, [0.25, 0.75])
+        iqr = float(q3 - q1)
+        q1s, q3s = np.quantile(uu, [0.25, 0.75])
+        iqrs = float(q3s - q1s)
+        if iqr >= 1e-12 and iqrs >= 1e-12:
+            lo_v, hi_v = q1 - iqr_k * iqr, q3 + iqr_k * iqr
+            lo_u, hi_u = q1s - iqr_k * iqrs, q3s + iqr_k * iqrs
+            m_iqr = np.zeros(n, dtype=bool)
+            m_iqr[base] = (vv >= lo_v) & (vv <= hi_v) & (uu >= lo_u) & (uu <= hi_u)
+            if int(m_iqr.sum()) < min_keep:
+                m_iqr = np.ones(n, dtype=bool)
+
+    # --- Остатки от робастной прямой в (ln Swn, ln J) ---
+    def _residual_z_thresh(n_pts: int) -> float:
+        if n_pts <= 10:
+            return 1.9
+        if n_pts <= 14:
+            return 2.05
+        if n_pts <= 20:
+            return 2.25
+        if n_pts <= 28:
+            return 2.55
+        return 3.15
+
+    m_res = np.ones(n, dtype=bool)
+    ub, vb = u[base], v[base]
+    if len(ub) >= 4:
+        b_med = float(_median_pairwise_slope(ub, vb))
+        if not np.isfinite(b_med):
+            b_med = -0.35
+        ln_a = float(np.median(vb - b_med * ub))
+        pred = ln_a + b_med * u
+        res = v - pred
+        med_r = float(np.median(res[base]))
+        mad = float(np.median(np.abs(res[base] - med_r))) + 1e-12
+        if mad < 1e-8:
+            mad = float(np.std(res[base])) + 1e-12
+        z = np.abs(res - med_r) / (1.4826 * mad + 1e-15)
+        th = _residual_z_thresh(int(base.sum()))
+        m_res = np.zeros(n, dtype=bool)
+        m_res[base] = z[base] <= th
+        if int(m_res.sum()) < min_keep:
+            m_res = np.ones(n, dtype=bool)
+
+    combined = m_iqr & m_res
+    if int(combined.sum()) < min_keep:
+        combined = m_res if int(m_res.sum()) >= min_keep else m_iqr
+    if int(combined.sum()) < min_keep:
+        return np.ones(n, dtype=bool)
+    return combined
+
+
 def auto_ab_bounds_from_cloud(
     swn: np.ndarray,
     j: np.ndarray,
@@ -229,7 +372,12 @@ def auto_ab_bounds_from_cloud(
     Верхняя: выбирается b_up < 0 по «верхней» границе облака в (ln Swn, ln J), затем
     a_up = max_i(J_i / Swn_i^b_up) — тогда a_up·Swn_i^b_up >= J_i для всех i.
 
-    Нижняя: b_lo < 0 по «нижней» границе, a_lo = min_i(J_i / Swn_i^b_lo) — кривая не выше точек в узлах.
+    Нижняя: b_lo < 0, затем пара (a_lo, b_lo) уточняется так, чтобы у малых Swn (нижний квантиль)
+    кривая не «провисала» сильно ниже точек — стремление к касанию хотя бы одной точки в этой зоне.
+
+    Сильные выбросы по **log(Swn)** и **log(J)** (IQR) и по **остаткам** от робастной прямой в log-log
+    при расчёте **центральной степенной (OLS в log-log), нижней и верхней** огибающих не используются;
+    при малом n порог по z жёстче.
 
     Для отрисовки: кривые строятся только на [Swn_min, Swn_max], значения J обрезаются в [J_min, J_max],
     чтобы линии не уходили за пределы данных по вертикали.
@@ -252,28 +400,36 @@ def auto_ab_bounds_from_cloud(
     v = np.log(jj)
     n = len(u)
 
-    # Центр: OLS в log-log; при b >= 0 принудительно убывающий J(Swn) (b < 0) и пересчёт ln a
-    b_ols, ln_a_ols = np.polyfit(u, v, 1)
+    env_m = _j_cloud_inlier_mask_for_envelopes(s, jj)
+    s_e = s[env_m]
+    jj_e = jj[env_m]
+    if len(s_e) < 5:
+        s_e, jj_e = s, jj
+    u_e = np.log(s_e)
+    v_e = np.log(jj_e)
+
+    # Центр: OLS в log-log по тем же inlier, что и огибающие; при b >= 0 — робастный наклон (b < 0)
+    b_ols, ln_a_ols = np.polyfit(u_e, v_e, 1)
     b_ols = float(b_ols)
     ln_a_ols = float(ln_a_ols)
     if b_ols >= -1e-4:
-        b_ols = float(np.clip(_median_pairwise_slope(u, v), -8.0, -0.06))
+        b_ols = float(np.clip(_median_pairwise_slope(u_e, v_e), -8.0, -0.06))
         if b_ols >= -1e-4:
             b_ols = -0.35
-        ln_a_ols = float(np.mean(v - b_ols * u))
+        ln_a_ols = float(np.mean(v_e - b_ols * u_e))
     a_mid = float(np.exp(ln_a_ols))
 
-    # Наклоны огибающих (оба < 0): верхняя — менее крутая max(...), нижняя — более крутая min(...)
-    b_up_raw = _binned_extreme_slope(u, v, mode="upper")
-    b_lo_raw = _binned_extreme_slope(u, v, mode="lower")
+    # Наклоны огибающих по подмножеству без сильных выбросов (оба b < 0)
+    b_up_raw = _binned_extreme_slope(u_e, v_e, mode="upper")
+    b_lo_raw = _binned_extreme_slope(u_e, v_e, mode="lower")
     b_up = float(np.clip(max(b_up_raw, b_ols), -8.0, -0.055))
     b_lo = float(np.clip(min(b_lo_raw, b_ols), -12.0, -0.06))
     if b_lo >= b_up:
         b_lo = float(min(b_lo_raw, b_ols) - 0.12)
         b_lo = float(np.clip(b_lo, -12.0, b_up - 0.02))
 
-    a_up = _tight_a_from_b_robust_upper(s, jj, b_up)
-    a_lo = _tight_a_from_b(s, jj, b_lo, "lower")
+    a_up = _tight_a_from_b_robust_upper(s_e, jj_e, b_up)
+    b_lo, a_lo = _refine_lower_j_power_for_low_swn(s_e, jj_e, b_lo, b_up)
     if not (np.isfinite(a_up) and np.isfinite(a_lo)):
         return {
             "a_bounds": (0.05, 0.35),
