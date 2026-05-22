@@ -1,9 +1,17 @@
 # Large data files (это ваши большие файлы)
 *.txt
+!requirements.txt
 *.csv
 *.xlsx
 *.xls
-data/
+data/**
+!data/README.md
+!data/uploads/
+data/uploads/**
+!data/uploads/.gitkeep
+!data/snapshots/
+data/snapshots/**
+!data/snapshots/.gitkeep
 docs/
 scripts/
 
@@ -34,9 +42,8 @@ env/
 *~
 .DS_Store
 
-# Docker
+# Logs
 *.log
-docker-compose.override.yml
 
 # Git
 *.orig

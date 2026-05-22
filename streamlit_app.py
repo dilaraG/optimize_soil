@@ -48,20 +48,118 @@ from optimize import (
 )
 
 st.set_page_config(page_title="J-функция Леверетта", layout="wide")
-st.markdown(
-    """
-    <style>
-    /* Стабилизирует прокрутку при первом rerun после изменения виджетов */
-    html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
-        overflow-anchor: none;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+
+
+def _inject_streamlit_ru_ui_styles() -> None:
+    """Русские подписи встроенных кнопок Streamlit (Browse files, Drag and drop, …)."""
+    st.markdown(
+        """
+        <style>
+        html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
+            overflow-anchor: none;
+        }
+        /* Загрузка файла: Browse files → Выбрать файл */
+        div[data-testid="stFileUploader"] button {
+            font-size: 0 !important;
+            line-height: 0;
+        }
+        div[data-testid="stFileUploader"] button::after {
+            content: "Выбрать файл";
+            font-size: 0.875rem;
+            line-height: normal;
+        }
+        div[data-testid="stFileUploader"] button span,
+        div[data-testid="stFileUploader"] button div {
+            display: none;
+        }
+        /* Drag and drop file here */
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small {
+            font-size: 0 !important;
+            line-height: 0;
+        }
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small::before {
+            font-size: 0.8rem;
+            line-height: 1.4;
+            color: rgba(49, 51, 63, 0.6);
+        }
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small:nth-of-type(1)::before {
+            content: "Перетащите файл сюда";
+        }
+        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small:nth-of-type(2)::before {
+            content: "или нажмите «Выбрать файл»";
+        }
+        /* Скачивание: подпись на кнопке уже задаётся в коде; скрываем служебный англ. хвост, если есть */
+        [data-testid="stDownloadButton"] button {
+            font-size: inherit;
+        }
+        /* Multiselect: Clear all → Очистить */
+        div[data-baseweb="select"] button[aria-label="Clear all"],
+        div[data-baseweb="select"] button[title="Clear all"] {
+            font-size: 0 !important;
+            line-height: 0;
+        }
+        div[data-baseweb="select"] button[aria-label="Clear all"] span,
+        div[data-baseweb="select"] button[title="Clear all"] span,
+        div[data-baseweb="select"] button[aria-label="Clear all"] svg,
+        div[data-baseweb="select"] button[title="Clear all"] svg {
+            display: none !important;
+        }
+        div[data-baseweb="select"] button[aria-label="Clear all"]::after,
+        div[data-baseweb="select"] button[title="Clear all"]::after {
+            content: "Очистить";
+            font-size: 0.75rem;
+            line-height: normal;
+        }
+        /* Таблицы: иконки панели dataframe */
+        [data-testid="stDataFrame"] button[title] svg,
+        [data-testid="stDataFrame"] button[aria-label] svg {
+            display: none !important;
+        }
+        [data-testid="stDataFrame"] button[title],
+        [data-testid="stDataFrame"] button[aria-label] {
+            font-size: 0 !important;
+            min-width: 2rem;
+        }
+        [data-testid="stDataFrame"] button[title="Download as CSV"]::after,
+        [data-testid="stDataFrame"] button[aria-label="Download as CSV"]::after {
+            content: "CSV";
+            font-size: 0.7rem;
+            line-height: normal;
+        }
+        [data-testid="stDataFrame"] button[title="Search"]::after,
+        [data-testid="stDataFrame"] button[aria-label="Search"]::after {
+            content: "Поиск";
+            font-size: 0.7rem;
+            line-height: normal;
+        }
+        [data-testid="stDataFrame"] button[title="Fullscreen"]::after,
+        [data-testid="stDataFrame"] button[aria-label="Fullscreen"]::after {
+            content: "Экран";
+            font-size: 0.7rem;
+            line-height: normal;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+_inject_streamlit_ru_ui_styles()
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
+SNAPSHOTS_DIR = DATA_DIR / "snapshots"
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+SNAPSHOT_REQUIRED_COLUMNS = (
+    "WELL_NAME",
+    "_AXIS",
+    "Кнг_hist",
+    "Кнг_model",
+    "METHOD",
+    "SNAPSHOT_ID",
+    "SNAPSHOT_LABEL",
+)
 
 
 def _decode_upload_text(file_bytes: bytes) -> str:
@@ -775,6 +873,256 @@ def _snapshot_catalog(method_tag: str) -> pd.DataFrame:
         .reset_index(drop=True)
     )
     return cat
+
+
+def _get_well_method_snapshots() -> pd.DataFrame:
+    snaps = st.session_state.get("well_method_snapshots")
+    if not isinstance(snaps, pd.DataFrame):
+        return pd.DataFrame()
+    return snaps.copy()
+
+
+def _snapshot_counts_text() -> str:
+    snaps = _get_well_method_snapshots()
+    if snaps.empty:
+        return "В памяти сессии снимков нет."
+    n_j = int((snaps["METHOD"] == "J").sum()) if "METHOD" in snaps.columns else 0
+    n_bc = int((snaps["METHOD"] == "BC").sum()) if "METHOD" in snaps.columns else 0
+    cat_j = len(_snapshot_catalog("J"))
+    cat_bc = len(_snapshot_catalog("BC"))
+    return (
+        f"В памяти: **{cat_j}** снимок(ов) J ({n_j} точек), **{cat_bc}** снимок(ов) БК ({n_bc} точек)."
+    )
+
+
+def _default_snapshot_filename() -> str:
+    return f"snapshots_{pd.Timestamp.now().strftime('%Y%m%d_%H%M%S')}.csv"
+
+
+def _default_snapshot_save_path() -> str:
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    return str((SNAPSHOTS_DIR / _default_snapshot_filename()).relative_to(PROJECT_ROOT))
+
+
+def _resolve_snapshot_path(user_path: str, *, default_filename: str) -> Path:
+    raw = (user_path or "").strip()
+    if not raw:
+        raise ValueError("Укажите путь к файлу (полный или относительно папки проекта).")
+    p = Path(raw).expanduser()
+    if not p.is_absolute():
+        p = PROJECT_ROOT / p
+    if p.exists() and p.is_dir():
+        p = p / default_filename
+    elif raw.endswith(("/", "\\")) or (not p.suffix and not p.exists()):
+        p = p / default_filename
+    return p.resolve()
+
+
+def _normalize_loaded_snapshots(df: pd.DataFrame) -> pd.DataFrame:
+    work = df.copy()
+    missing = [c for c in SNAPSHOT_REQUIRED_COLUMNS if c not in work.columns]
+    if missing:
+        raise ValueError(f"В файле нет обязательных столбцов: {', '.join(missing)}")
+    work["METHOD"] = work["METHOD"].astype(str).str.upper()
+    bad = set(work["METHOD"].unique()) - {"J", "BC"}
+    if bad:
+        raise ValueError(f"Недопустимые значения METHOD: {', '.join(sorted(bad))}")
+    if "SAVED_AT" not in work.columns:
+        work["SAVED_AT"] = pd.Timestamp.now().isoformat()
+    if "AXIS_KIND" not in work.columns:
+        work["AXIS_KIND"] = "depth"
+    for col in ("Кнг_hist", "Кнг_model", "_AXIS"):
+        work[col] = pd.to_numeric(work[col], errors="coerce")
+    work["WELL_NAME"] = work["WELL_NAME"].astype(str)
+    work = work.dropna(subset=["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"])
+    if work.empty:
+        raise ValueError("После проверки не осталось валидных строк снимка.")
+    return work.reset_index(drop=True)
+
+
+def _read_snapshots_file(path: Path) -> pd.DataFrame:
+    if not path.is_file():
+        raise FileNotFoundError(f"Файл не найден: {path}")
+    if path.suffix.lower() not in {".csv", ".txt"}:
+        raise ValueError("Поддерживается файл .csv (UTF-8).")
+    text = _decode_upload_text(path.read_bytes())
+    df = _read_csv_text(text)
+    return _normalize_loaded_snapshots(df)
+
+
+def _write_snapshots_file(path: Path, df: pd.DataFrame) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(path, index=False, encoding="utf-8-sig")
+
+
+def _pin_snapshot_load_expander(expanded_key: str, touched_key: str) -> None:
+    """Не сворачивать блок загрузки при вводе пути (каждый символ — rerun Streamlit)."""
+    st.session_state[expanded_key] = True
+    st.session_state[touched_key] = True
+
+
+def _pick_csv_save_path(default_name: str) -> str | None:
+    """Диалог «Сохранить как…» (локальный запуск Streamlit)."""
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+
+        SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        path = filedialog.asksaveasfilename(
+            title="Сохранить снимки",
+            defaultextension=".csv",
+            initialfile=default_name,
+            initialdir=str(SNAPSHOTS_DIR.resolve()),
+            filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
+        )
+        root.destroy()
+        return str(path) if path else None
+    except Exception:
+        return None
+
+
+def _merge_snapshots(existing: pd.DataFrame, loaded: pd.DataFrame) -> pd.DataFrame:
+    """Добавить снимки из файла к запомненным в сессии; при том же SNAPSHOT_ID — из файла."""
+    if existing.empty:
+        return loaded.copy()
+    if loaded.empty:
+        return existing.copy()
+    loaded_ids = set(loaded["SNAPSHOT_ID"].astype(str).unique())
+    kept = existing[~existing["SNAPSHOT_ID"].astype(str).isin(loaded_ids)].copy()
+    return pd.concat([kept, loaded], ignore_index=True)
+
+
+def _commit_snapshots_to_session(
+    loaded: pd.DataFrame,
+    *,
+    src: str,
+    notice_key: str,
+    rerun: bool = True,
+) -> None:
+    current = _get_well_method_snapshots()
+    if current.empty:
+        combined = loaded.copy()
+        st.session_state[notice_key] = (
+            f"Загружено {len(loaded)} строк из «{src}». "
+            f"В памяти: {len(_snapshot_catalog('J'))} снимок(ов) J, {len(_snapshot_catalog('BC'))} снимок(ов) БК."
+        )
+    else:
+        before_ids = set(current["SNAPSHOT_ID"].astype(str).unique())
+        combined = _merge_snapshots(current, loaded)
+        after_ids = set(combined["SNAPSHOT_ID"].astype(str).unique())
+        added_ids = len(after_ids - before_ids)
+        st.session_state[notice_key] = (
+            f"Из «{src}» добавлено снимков: {added_ids} (строк: {len(loaded)}). "
+            f"Снимки текущей сессии сохранены. "
+            f"Всего: {len(_snapshot_catalog('J'))} J, {len(_snapshot_catalog('BC'))} БК."
+        )
+    st.session_state["well_method_snapshots"] = combined
+    if rerun:
+        st.rerun()
+
+
+def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
+    """Сохранение / загрузка каталога well_method_snapshots в CSV по пути пользователя."""
+    st.markdown("### Снимки на диск")
+    st.caption(
+        "Снимки для раздела «Сравнение» (кнопки «Запомнить» на вкладках J и БК). "
+        "Файл CSV можно открыть в Excel; при загрузке восстанавливается каталог снимков в текущей сессии."
+    )
+    notice_key = f"{key_prefix}_load_notice"
+    if st.session_state.get(notice_key):
+        st.success(st.session_state.pop(notice_key))
+
+    st.markdown(_snapshot_counts_text())
+
+    default_name = _default_snapshot_filename()
+    save_path_key = f"{key_prefix}_save_path"
+    if not st.session_state.get(save_path_key):
+        st.session_state[save_path_key] = _default_snapshot_save_path()
+    if not st.session_state.get(f"{key_prefix}_load_path"):
+        st.session_state[f"{key_prefix}_load_path"] = str(
+            (SNAPSHOTS_DIR / "snapshots.csv").relative_to(PROJECT_ROOT)
+        )
+
+    with st.expander("Сохранить снимки в файл", expanded=False):
+        if st.button("Выбрать путь для сохранения…", key=f"{key_prefix}_pick_save"):
+            picked = _pick_csv_save_path(default_name)
+            if picked:
+                st.session_state[save_path_key] = picked
+                st.rerun()
+            else:
+                st.caption("Выбор файла отменён.")
+        st.caption(f"**Файл:** `{st.session_state.get(save_path_key, '')}`")
+        if st.button("Сохранить в файл", type="primary", key=f"{key_prefix}_save_btn"):
+            snaps = _get_well_method_snapshots()
+            if snaps.empty:
+                st.warning("Нет снимков в памяти. Сначала нажмите «Запомнить» на вкладках J и/или БК.")
+            else:
+                try:
+                    save_path_str = str(st.session_state.get(save_path_key, ""))
+                    out_path = _resolve_snapshot_path(save_path_str, default_filename=default_name)
+                    _write_snapshots_file(out_path, snaps)
+                    st.session_state[save_path_key] = str(out_path)
+                    st.success(f"Сохранено {len(snaps)} строк → `{out_path}`")
+                except (OSError, ValueError) as e:
+                    st.error(str(e))
+
+    load_expanded_key = f"{key_prefix}_load_expanded"
+    load_path_key = f"{key_prefix}_load_path"
+    load_path_touched_key = f"{key_prefix}_load_path_touched"
+    if (
+        st.session_state.get(f"{key_prefix}_upload_sig")
+        or st.session_state.get(load_path_touched_key)
+        or str(st.session_state.get(load_path_key, "")).strip()
+    ):
+        st.session_state[load_expanded_key] = True
+
+    with st.expander(
+        "Загрузить снимки из файла",
+        expanded=bool(st.session_state.get(load_expanded_key, False)),
+    ):
+        st.caption(
+            "CSV **добавляется** к уже запомненным в сессии снимкам (J и БК после «Запомнить»). "
+            "В списке сравнения будут и свои расчёты, и загруженный файл. "
+            "При совпадении ID снимка версия из файла заменяет старую."
+        )
+        up = st.file_uploader(
+            "Файл CSV со снимками",
+            type=["csv"],
+            key=f"{key_prefix}_upload",
+            help="После выбора файла загрузка выполняется автоматически.",
+        )
+        if up is not None:
+            upload_sig = f"{up.name}:{up.size}"
+            if st.session_state.get(f"{key_prefix}_upload_sig") != upload_sig:
+                try:
+                    loaded = _normalize_loaded_snapshots(
+                        _read_csv_text(_decode_upload_text(up.getvalue()))
+                    )
+                    st.session_state[f"{key_prefix}_upload_sig"] = upload_sig
+                    st.session_state[load_expanded_key] = True
+                    _commit_snapshots_to_session(loaded, src=up.name, notice_key=notice_key)
+                except (ValueError, pd.errors.ParserError) as e:
+                    st.error(str(e))
+
+        load_path_str = st.text_input(
+            "Путь к файлу на диске (альтернатива выбору файла выше)",
+            key=load_path_key,
+            help="Полный или относительный путь к CSV. По умолчанию дополняет снимки в памяти.",
+            on_change=_pin_snapshot_load_expander,
+            args=(load_expanded_key, load_path_touched_key),
+        )
+        if st.button("Загрузить по пути", key=f"{key_prefix}_load_path_btn"):
+            try:
+                in_path = _resolve_snapshot_path(load_path_str, default_filename="snapshots.csv")
+                loaded = _read_snapshots_file(in_path)
+                st.session_state[f"{key_prefix}_upload_sig"] = None
+                st.session_state[load_expanded_key] = True
+                _commit_snapshots_to_session(loaded, src=str(in_path), notice_key=notice_key)
+            except (OSError, ValueError, pd.errors.ParserError) as e:
+                st.error(str(e))
 
 
 def _render_methods_comparison_block(block_key: str = "compare_methods") -> None:
@@ -1833,7 +2181,6 @@ def _clear_methods_tabs_results() -> None:
     ):
         st.session_state.pop(k, None)
     st.session_state.pop("j_busy", None)
-    _clear_pvt_horizon_multiselects()
 
 
 def _shared_well_selectbox(wells: list[str], label: str = "Скважина") -> str:
@@ -1863,9 +2210,47 @@ def _pvt_horizon_map_from_session(pvts: list[int]) -> dict[int, list[str]]:
         pi = int(p)
         sel = stored.get(pi, stored.get(p))
         if not sel:
-            sel = st.session_state.get(f"pvt_hor_map_{pi}", [])
+            sel = st.session_state.get(f"pvt_hor_map_{pi}_bc") or st.session_state.get(f"pvt_hor_map_{pi}", [])
         out[pi] = [str(h) for h in (sel or [])]
     return out
+
+
+def _lab_j_horizon_universe() -> list[str]:
+    """Коды горизонта из сохранённого лабораторного облака J (после «Применить фильтр»)."""
+    meta = st.session_state.get("lab_meta") or {}
+    if meta.get("horizons"):
+        return sorted(str(h) for h in meta["horizons"])
+    cloud = st.session_state.get("lab_cloud")
+    if isinstance(cloud, pd.DataFrame) and not cloud.empty and "lab_horizon" in cloud.columns:
+        return sorted(cloud["lab_horizon"].astype(str).unique().tolist())
+    return []
+
+
+def _render_pvt_horizon_mapping(
+    pvts: list[int],
+    hors_universe: list[str],
+    *,
+    title: str,
+    key_suffix: str = "",
+) -> dict[int, list[str]]:
+    """Мультивыбор горизонтов по PVTNUM; сохраняет pvt_horizon_map в session_state."""
+    if not pvts or not hors_universe:
+        return {}
+    stored = st.session_state.get("pvt_horizon_map") or {}
+    st.subheader(title)
+    pvt_horizon_map: dict[int, list[str]] = {}
+    for pvt in pvts:
+        pi = int(pvt)
+        prev = stored.get(pi, stored.get(pvt, []))
+        default = [str(h) for h in (prev or []) if str(h) in hors_universe]
+        pvt_horizon_map[pi] = st.multiselect(
+            f"Горизонты для PVTNUM {pi}",
+            options=hors_universe,
+            default=default,
+            key=f"pvt_hor_map_{pi}{key_suffix}",
+        )
+    st.session_state["pvt_horizon_map"] = pvt_horizon_map
+    return pvt_horizon_map
 
 
 def _bc_pvt_horizon_mapping_fragment() -> None:
@@ -1874,16 +2259,12 @@ def _bc_pvt_horizon_mapping_fragment() -> None:
     hors_universe = [str(h) for h in (ctx.get("hors_universe") or [])]
     if not pvts or not hors_universe:
         return
-    pvt_horizon_map: dict[int, list[str]] = {}
-    st.subheader("Связь горизонт -> PVTNUM (Брукса-Кори)")
-    for pvt in pvts:
-        pvt_horizon_map[pvt] = st.multiselect(
-            f"Горизонты для PVTNUM {pvt}",
-            options=hors_universe,
-            default=[],
-            key=f"pvt_hor_map_{pvt}",
-        )
-    st.session_state["pvt_horizon_map"] = pvt_horizon_map
+    _render_pvt_horizon_mapping(
+        pvts,
+        hors_universe,
+        title="Связь горизонт -> PVTNUM (Брукса-Кори)",
+        key_suffix="_bc",
+    )
 
 
 _bc_pvt_horizon_mapping_run = (
@@ -2152,15 +2533,35 @@ def _clear_lab_j_session() -> None:
         "lab_cloud_ready",
         "lab_meta",
         "lab_trend_fit",
+        "lab_source_df",
         "_pending_pvt_hor_fill",
         "_lab_matrix_upload_id",
         "_lab_kkd_upload_id",
         "_bc_lab_upload_id",
     ):
         st.session_state.pop(k, None)
-    st.session_state["lab_sel_areas"] = []
-    st.session_state["lab_sel_hors"] = []
+    for k in ("lab_sel_areas", "lab_sel_hors", "_lab_areas_sig"):
+        st.session_state.pop(k, None)
     _clear_methods_tabs_results()
+
+
+def _lab_selectbox_index(cols: list[str], saved: str | None, guess: str | None) -> int:
+    if saved and saved in cols:
+        return cols.index(saved)
+    if guess and guess in cols:
+        return cols.index(guess)
+    return 0
+
+
+def _restore_lab_filter_widgets(areas: list[str], horizons: list[str]) -> None:
+    """Восстановить мультивыбор площадей/горизонтов после «Применить фильтр»."""
+    meta = st.session_state.get("lab_meta") or {}
+    if not st.session_state.get("lab_cloud_ready"):
+        return
+    saved_a = meta.get("areas") or []
+    saved_h = meta.get("horizons") or []
+    st.session_state["lab_sel_areas"] = [a for a in saved_a if a in areas]
+    st.session_state["lab_sel_hors"] = [h for h in saved_h if h in horizons]
 
 
 def _clear_shared_wells_files() -> None:
@@ -2194,6 +2595,7 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
         st.session_state[SHARED_WELLS_COL_SIG] = sig
         st.session_state[SHARED_WELLS_MAP_SAVED] = {}
         st.session_state.pop("_wells_pvt_sig", None)
+        st.session_state.pop("shared_map_wells_Perf_GDM", None)
     saved_map = st.session_state.get(SHARED_WELLS_MAP_SAVED) or st.session_state.get(f"{key_prefix}_wells_map_saved", {})
     mapping_rules: list[tuple[str, str, list[str]]] = [
         ("WELL_NAME", "Скважина", ["WELL_NAME", "СКВАЖ", "WELL", "STVOL"]),
@@ -2240,12 +2642,17 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
             key=f"shared_map_wells_{target}",
         )
 
+    perf_not_used = "не использовать"
+    if st.session_state.get("shared_map_wells_Perf_GDM") == "<не использовать>":
+        st.session_state.pop("shared_map_wells_Perf_GDM", None)
     perf_saved = saved_map.get("Perf_GDM")
-    perf_default = perf_saved if isinstance(perf_saved, str) and perf_saved in cols else _safe_guess_col(cols, ["PERF_GDM", "PERF", "ПЕРФ", "ПЕРФОРА"])
-    perf_options = ["<не использовать>"] + cols
-    perf_idx = perf_options.index(perf_default) if perf_default in perf_options else 0
+    perf_options = [perf_not_used] + cols
+    if isinstance(perf_saved, str) and perf_saved in cols:
+        perf_idx = perf_options.index(perf_saved)
+    else:
+        perf_idx = 0
     perf_pick = row2[3].selectbox("Перфорация", options=perf_options, index=perf_idx, key="shared_map_wells_Perf_GDM")
-    if perf_pick != "<не использовать>":
+    if perf_pick != perf_not_used:
         pick["Perf_GDM"] = perf_pick
     if len(set(pick.values())) != len(pick):
         st.error("Для обязательных полей скважин выбраны повторяющиеся колонки. Выберите уникальные соответствия.")
@@ -2790,6 +3197,7 @@ def laboratory_tab() -> None:
 
     st.divider()
 
+    st.subheader("Лаборатория: данные для метода J функции")
     lab_src = st.radio(
         "Источник лабораторных точек для J(Swn)",
         options=("matrix", "kkd"),
@@ -2836,6 +3244,7 @@ def laboratory_tab() -> None:
         try:
             db_file = sqlite_path()
             df = _load_kkd_cached(str(db_file), db_file.stat().st_mtime)
+            st.session_state["lab_source_df"] = df
         except FileNotFoundError:
             st.info(
                 "База ещё не создана. Положите `ККД_БД.xlsx` в папку `data` или загрузите файл выше, "
@@ -2850,11 +3259,15 @@ def laboratory_tab() -> None:
             "`Swn = (Sw − Sw_min)/(Sw_max − Sw_min)`; если Swn получается 0 или 1 — в ячейку записывается пропуск."
         )
         mat_up = st.file_uploader("Файл матрицы ступеней", type=["xlsx", "xls"], key="lab_matrix_stairs_upload")
+        cached_df = st.session_state.get("lab_source_df")
         if mat_up is None:
-            if st.session_state.get("_lab_matrix_upload_id"):
-                _clear_lab_j_session()
-            st.info("Выберите файл Excel с матрицей ступеней — или переключитесь на источник «База ККД».")
-            df = None
+            if st.session_state.get("lab_cloud_ready") and isinstance(cached_df, pd.DataFrame) and not cached_df.empty:
+                df = cached_df
+            else:
+                if st.session_state.get("_lab_matrix_upload_id") and not st.session_state.get("lab_cloud_ready"):
+                    _clear_lab_j_session()
+                st.info("Выберите файл Excel с матрицей ступеней — или переключитесь на источник «База ККД».")
+                df = None
         else:
             _mat_uid = f"{mat_up.name}_{mat_up.size}"
             if st.session_state.get("_lab_matrix_upload_id") != _mat_uid:
@@ -2918,16 +3331,26 @@ def laboratory_tab() -> None:
                 st.error("После разворота не осталось строк.")
                 return
             st.success(f"Разворот матрицы: {len(df)} строк (ступени × исходные образцы).")
+            st.session_state["lab_source_df"] = df
             with st.expander("Предпросмотр (первые 20 строк)", expanded=False):
                 st.dataframe(df.head(20), use_container_width=True)
 
     if df is None:
+        if st.session_state.get("lab_cloud_ready"):
+            cloud = st.session_state.get("lab_cloud")
+            if isinstance(cloud, pd.DataFrame) and not cloud.empty:
+                st.success(
+                    f"Для вкладки «Подбор J» сохранено **{len(cloud)}** точек лаборатории. "
+                    "Чтобы изменить фильтр — снова выберите источник и файл ниже."
+                )
+                st.subheader("График J(Swn) (лаборатория)")
+                fit = st.session_state.get("lab_trend_fit") or {}
+                fig = _fig_j_swn_lab(cloud, title="Лабораторные данные", trend_fit=fit, extra_lines=None, optimal=None)
+                st.plotly_chart(fig, use_container_width=True)
         return
 
     cols = list(df.columns)
-
-    def _idx_or_zero(name: str | None) -> int:
-        return cols.index(name) if name and name in cols else 0
+    lab_meta_saved = st.session_state.get("lab_meta") or {}
 
     area_guess = guess_area_column(cols)
     hor_guess = guess_horizon_column(cols)
@@ -2936,15 +3359,30 @@ def laboratory_tab() -> None:
 
     st.subheader("Сопоставление колонок")
     c1, c2, c3, c4 = st.columns(4)
-    area_col = c1.selectbox("Колонка площади", options=cols, index=_idx_or_zero(area_guess))
-    hor_col = c2.selectbox("Колонка кода горизонта", options=cols, index=_idx_or_zero(hor_guess))
-    j_col = c3.selectbox("J (функция Леверетта)", options=cols, index=_idx_or_zero(j_guess))
+    area_col = c1.selectbox(
+        "Колонка площади",
+        options=cols,
+        index=_lab_selectbox_index(cols, lab_meta_saved.get("area_col"), area_guess),
+        key="lab_map_area_col",
+    )
+    hor_col = c2.selectbox(
+        "Колонка кода горизонта",
+        options=cols,
+        index=_lab_selectbox_index(cols, lab_meta_saved.get("horizon_col"), hor_guess),
+        key="lab_map_hor_col",
+    )
+    j_col = c3.selectbox(
+        "J (функция Леверетта)",
+        options=cols,
+        index=_lab_selectbox_index(cols, lab_meta_saved.get("j_col"), j_guess),
+        key="lab_map_j_col",
+    )
     default_swn = "Swn" if "Swn" in cols else cols[0]
-    swn_idx = cols.index(default_swn) if default_swn in cols else 0
     swn_col = c4.selectbox(
         "Swn",
         options=cols,
-        index=swn_idx,
+        index=_lab_selectbox_index(cols, lab_meta_saved.get("swn_col"), default_swn),
+        key="lab_map_swn_col",
         help=(f"Найденные кандидаты SWn: {swn_list}" if swn_list else None),
     )
 
@@ -2952,17 +3390,26 @@ def laboratory_tab() -> None:
     horizons = sorted(pd.Series(df[hor_col]).dropna().astype(str).str.strip().unique().tolist())
 
     st.subheader("Фильтр данных")
-    st.caption("Площади и горизонты сохраняются в рамках сессии.")
-    if "lab_sel_areas" not in st.session_state:
-        st.session_state["lab_sel_areas"] = areas.copy()
+    st.caption("Площади и горизонты сохраняются в рамках сессии (в том числе после перехода на другие вкладки).")
+    if st.session_state.get("lab_cloud_ready"):
+        _restore_lab_filter_widgets(areas, horizons)
     else:
-        st.session_state["lab_sel_areas"] = [a for a in st.session_state["lab_sel_areas"] if a in areas]
-    if "lab_sel_hors" not in st.session_state:
-        st.session_state["lab_sel_hors"] = horizons.copy()
-    else:
-        st.session_state["lab_sel_hors"] = [h for h in st.session_state["lab_sel_hors"] if h in horizons]
-        if not st.session_state["lab_sel_hors"] and horizons:
+        areas_sig = (area_col, tuple(areas))
+        if st.session_state.get("_lab_areas_sig") != areas_sig:
+            st.session_state["lab_sel_areas"] = areas.copy()
+            st.session_state["_lab_areas_sig"] = areas_sig
+        elif not st.session_state.get("lab_sel_areas"):
+            st.session_state["lab_sel_areas"] = areas.copy()
+        else:
+            kept = [a for a in st.session_state["lab_sel_areas"] if a in areas]
+            st.session_state["lab_sel_areas"] = kept if kept else areas.copy()
+    if not st.session_state.get("lab_cloud_ready"):
+        if "lab_sel_hors" not in st.session_state:
             st.session_state["lab_sel_hors"] = horizons.copy()
+        else:
+            st.session_state["lab_sel_hors"] = [h for h in st.session_state["lab_sel_hors"] if h in horizons]
+            if not st.session_state["lab_sel_hors"] and horizons:
+                st.session_state["lab_sel_hors"] = horizons.copy()
     cfa1, cfa2 = st.columns([1, 3])
     all_selected = set(st.session_state.get("lab_sel_areas", [])) == set(areas) and len(areas) > 0
     if cfa1.button("Выбрать все (площади)" if not all_selected else "Снять все (площади)", key="lab_toggle_all_areas"):
@@ -2999,8 +3446,11 @@ def laboratory_tab() -> None:
             "j_col": j_col,
             "areas": sel_areas,
             "horizons": sel_hors,
+            "source_mode": lab_src,
         }
+        st.session_state["lab_source_df"] = df
         _clear_methods_tabs_results()
+        _clear_pvt_horizon_multiselects()
         fit = fit_power_j_swn(filt["Swn"].to_numpy(), filt["J_lab"].to_numpy())
         st.session_state["lab_trend_fit"] = fit
         st.success(
@@ -3023,6 +3473,7 @@ def leverett_tab() -> None:
 
     lab_ready = bool(st.session_state.get("lab_cloud_ready"))
     cloud: pd.DataFrame | None = st.session_state.get("lab_cloud")
+    lab_hors = _lab_j_horizon_universe()
 
     with st.sidebar:
         st.header("Загрузка данных")
@@ -3092,6 +3543,25 @@ def leverett_tab() -> None:
         st.session_state["shared_prod_file_path"] = p
 
     wells_path = _coalesce_path("shared_wells_file_path", "wells_file_path", "bc_wells_path")
+
+    if lab_ready and lab_hors:
+        if not wells_path:
+            st.subheader("Связь код горизонта -> PVTNUM")
+            st.warning(
+                "Лабораторное облако J сохранено. Загрузите **файл скважин** в боковой панели — "
+                "затем появятся поля привязки горизонтов к PVTNUM из выгрузки."
+            )
+        else:
+            st.caption(
+                f"Лаборатория: сохранено {len(cloud) if isinstance(cloud, pd.DataFrame) else 0} точек, "
+                f"кодов горизонта: {len(lab_hors)}."
+            )
+    elif not lab_ready:
+        st.info(
+            "Для привязки горизонтов к PVTNUM сначала во вкладке **«Лаборатория»** выберите данные "
+            "и нажмите **«Применить фильтр и сохранить выбор для вкладки «Подбор»»**."
+        )
+
     if not wells_path:
         st.info("Загрузите файл скважин, чтобы продолжить.")
         return
@@ -3153,17 +3623,12 @@ def leverett_tab() -> None:
     st.caption(f"Строк после очистки: {len(df_wells)}")
 
     pvt_horizon_map: dict[int, list[str]] = {}
-    if lab_ready and cloud is not None and not cloud.empty:
-        st.subheader("Связь код горизонта -> PVTNUM")
-        hors_universe = sorted(cloud["lab_horizon"].astype(str).unique().tolist())
-        for pvt in pvts:
-            pvt_horizon_map[pvt] = st.multiselect(
-                f"Горизонты для PVTNUM {pvt}",
-                options=hors_universe,
-                default=[],
-                key=f"pvt_hor_map_{pvt}",
-            )
-        st.session_state["pvt_horizon_map"] = pvt_horizon_map
+    if lab_ready and lab_hors:
+        pvt_horizon_map = _render_pvt_horizon_mapping(
+            pvts,
+            lab_hors,
+            title="Связь код горизонта -> PVTNUM",
+        )
 
     st.subheader("Режим границ a, b")
     if lab_ready and cloud is not None and not cloud.empty:
@@ -4218,26 +4683,24 @@ def brooks_corey_tab() -> None:
 def compare_methods_tab() -> None:
     st.title("Сравнение методов")
     _scroll_to_top_if_pending()
-    st.caption("Сначала сохраните результаты по скважинам в вкладках J-функции и Брукса-Кори.")
+    st.caption(
+        "Сначала сохраните результаты по скважинам в вкладках J-функции и Брукса-Кори "
+        "(кнопка «Запомнить»). Снимки можно записать в CSV и загрузить после перезапуска приложения."
+    )
+    _render_snapshot_disk_panel(key_prefix="compare_tab_snap")
+    st.divider()
     _render_methods_comparison_block(block_key="compare_tab")
 
 
 def main() -> None:
     page = st.sidebar.radio("Раздел", options=["Лаборатория", "Подбор J функции Леверетта", "Брукса-Кори", "Сравнение методов"])
     prev_page = st.session_state.get("_active_page")
-    _keep_maps = {
-        "Лаборатория",
-        "Подбор J функции Леверетта",
-        "Брукса-Кори",
-    }
     if prev_page != page:
         _mark_scroll_to_top_pending()
         _clear_preserved_scroll(SCROLL_STORAGE_BC)
         st.session_state["_bc_scroll_restore"] = False
         _scroll_page_top()
-        if not (prev_page in _keep_maps and page in _keep_maps):
-            st.session_state.pop("pvt_horizon_map", None)
-            _clear_pvt_horizon_multiselects()
+        # Привязки горизонт→PVTNUM не сбрасываем при смене вкладки (в т.ч. «Сравнение методов»).
     st.session_state["_active_page"] = page
     if page == "Лаборатория":
         laboratory_tab()

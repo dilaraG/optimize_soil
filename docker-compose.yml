@@ -1,9 +1,0 @@
-name: leverett-jfunc
-
-services:
-  leverett-app:
-    build: .
-    container_name: leverett-streamlit
-    ports:
-      - "8501:8501"
-    restart: unless-stopped
