@@ -24,9 +24,7 @@ df[columns_to_convert] = df[columns_to_convert].astype(float)
 df = df[~(df[columns_to_convert] <= -1).any(axis=1)].dropna()
 
 df = df.loc[df['ACTNUM_GDM'] != 0]
-df = df.loc[df['FWL_GDM'] != 0]
 df = df.loc[df['PC'] >= 0.01]
-df = df.loc[df['FWL_GDM'] >= 3] 
 df = df.loc[df['Кнг_W'] != 0 ]
 
 df.loc[df["Кнг_W"] > 1, "Кнг_W"] = df["Кнг_W"] / 100

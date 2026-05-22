@@ -1,4 +1,7 @@
+from functools import partial
 from typing import Any
+
+import time
 
 import numpy as np
 import pandas as pd
@@ -14,6 +17,9 @@ REQUIRED_WELL_COLUMNS = [
     "SWL_GDM",
     "Кнг_W",
 ]
+
+DEFAULT_LOW_SWN_THRESHOLD = 0.01
+DEFAULT_J_CAP_AT_LOW_SWN = 20.0
 
 
 def prepare_weights(df: pd.DataFrame, df_j: pd.DataFrame | None) -> pd.DataFrame:
@@ -95,6 +101,60 @@ def huber_loss(r: np.ndarray, delta: float = 0.1) -> np.ndarray:
     return np.where(mask, 0.5 * r**2, delta * (abs_r - 0.5 * delta))
 
 
+def j_power_from_swn(swn: np.ndarray, a: float, b: float) -> np.ndarray:
+    """Степенная J(Swn) = a·Swn^b."""
+    with np.errstate(over="ignore", invalid="ignore"):
+        return a * (np.asarray(swn, dtype=float) ** b)
+
+
+def apply_low_swn_j_cap(
+    swn: np.ndarray,
+    j: np.ndarray,
+    *,
+    swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
+) -> np.ndarray:
+    """При Swn ≤ порога ограничивает J сверху (по умолчанию J ≤ 20 при Swn ≤ 0.01)."""
+    s = np.asarray(swn, dtype=float)
+    y = np.asarray(j, dtype=float).copy()
+    thr = float(swn_threshold)
+    cap = float(j_cap)
+    if not (np.isfinite(thr) and thr > 0 and np.isfinite(cap) and cap > 0):
+        return y
+    low = s <= thr
+    if np.any(low):
+        y[low] = np.minimum(y[low], cap)
+    return y
+
+
+def _low_swn_j_cap_penalty(
+    a: float,
+    b: float,
+    *,
+    swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
+    n_grid: int = 24,
+    scale: float = 2e5,
+) -> float:
+    """Штраф, если некапированная J = a·Swn^b превышает j_cap при Swn ≤ порога."""
+    thr = float(swn_threshold)
+    cap = float(j_cap)
+    if not (np.isfinite(a) and np.isfinite(b) and np.isfinite(thr) and thr > 0 and np.isfinite(cap) and cap > 0):
+        return 0.0
+    s0 = max(1e-9, 1e-4)
+    if s0 >= thr:
+        return 0.0
+    grid = np.logspace(np.log10(s0), np.log10(thr), int(max(6, min(n_grid, 80))))
+    raw = j_power_from_swn(grid, a, b)
+    if not np.any(np.isfinite(raw)):
+        return 0.0
+    viol = np.clip(raw - cap, 0.0, np.inf)
+    viol = viol[np.isfinite(viol)]
+    if viol.size == 0:
+        return 0.0
+    return float(scale * np.mean(viol**2))
+
+
 def _j_power_envelope_penalty(
     a: float,
     b: float,
@@ -102,6 +162,8 @@ def _j_power_envelope_penalty(
     *,
     n_grid: int = 48,
     scale: float = 2e5,
+    swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
 ) -> float:
     """
     Штраф, если степенная J_lab(Swn) = a·Swn^b выходит за лабораторные нижнюю/верхнюю огибающие
@@ -125,12 +187,16 @@ def _j_power_envelope_penalty(
     s0 = max(s0, 1e-9)
     s1 = max(s1, s0 * 1.01)
     grid = np.logspace(np.log10(s0), np.log10(s1), int(max(8, min(n_grid, 120))))
+    thr = float(swn_threshold)
+    cap = float(j_cap)
+    if np.isfinite(thr) and thr > 0 and s0 <= thr <= s1:
+        grid = np.unique(np.sort(np.concatenate([grid, [thr]])))
     with np.errstate(over="ignore", invalid="ignore"):
         y_lo_b = alo * (grid**blo)
         y_hi_b = ahi * (grid**bhi)
         j_lo = np.minimum(y_lo_b, y_hi_b)
         j_hi = np.maximum(y_lo_b, y_hi_b)
-        j_opt = a * (grid**b)
+        j_opt = apply_low_swn_j_cap(grid, j_power_from_swn(grid, a, b), swn_threshold=thr, j_cap=cap)
     viol_lo = np.clip(j_lo - j_opt, 0.0, np.inf)
     viol_hi = np.clip(j_opt - j_hi, 0.0, np.inf)
     return float(scale * np.mean(viol_lo**2 + viol_hi**2))
@@ -140,6 +206,9 @@ def loss_function(
     params: tuple[float, float, float],
     df: pd.DataFrame,
     j_envelope: dict[str, Any] | None = None,
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
 ) -> float:
     a, b, sigma = params
     kng_model = calc_kng_vector(df, a, b, sigma)
@@ -150,7 +219,27 @@ def loss_function(
         return 1e9
     r = kng_model[valid] - kng_true[valid]
     base = float(np.sum(weights[valid] * huber_loss(r)))
-    return base + _j_power_envelope_penalty(a, b, j_envelope)
+    env_pen = _j_power_envelope_penalty(
+        a, b, j_envelope, swn_threshold=low_swn_threshold, j_cap=j_cap_at_low_swn
+    )
+    cap_pen = _low_swn_j_cap_penalty(a, b, swn_threshold=low_swn_threshold, j_cap=j_cap_at_low_swn)
+    return base + env_pen + cap_pen
+
+
+def _make_loss_fn(
+    g: pd.DataFrame,
+    j_envelope: dict[str, Any] | None,
+    *,
+    low_swn_threshold: float,
+    j_cap_at_low_swn: float,
+):
+    return partial(
+        loss_function,
+        df=g,
+        j_envelope=j_envelope,
+        low_swn_threshold=low_swn_threshold,
+        j_cap_at_low_swn=j_cap_at_low_swn,
+    )
 
 
 def _pso_optimize(
@@ -159,6 +248,9 @@ def _pso_optimize(
     maxiter: int = 120,
     particles: int = 28,
     j_envelope: dict[str, Any] | None = None,
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
 ) -> tuple[float, float, float]:
     dim = 3
     lb = np.array([b[0] for b in bounds], dtype=float)
@@ -167,7 +259,10 @@ def _pso_optimize(
     x = rng.uniform(lb, ub, size=(particles, dim))
     v = np.zeros_like(x)
     pbest = x.copy()
-    pbest_val = np.array([loss_function(tuple(xx), g, j_envelope) for xx in x], dtype=float)
+    loss_fn = _make_loss_fn(
+        g, j_envelope, low_swn_threshold=low_swn_threshold, j_cap_at_low_swn=j_cap_at_low_swn
+    )
+    pbest_val = np.array([loss_fn(tuple(xx)) for xx in x], dtype=float)
     gidx = int(np.argmin(pbest_val))
     gbest = pbest[gidx].copy()
     gbest_val = float(pbest_val[gidx])
@@ -178,7 +273,7 @@ def _pso_optimize(
         r2 = rng.random((particles, dim))
         v = w * v + c1 * r1 * (pbest - x) + c2 * r2 * (gbest - x)
         x = np.clip(x + v, lb, ub)
-        vals = np.array([loss_function(tuple(xx), g, j_envelope) for xx in x], dtype=float)
+        vals = np.array([loss_fn(tuple(xx)) for xx in x], dtype=float)
         better = vals < pbest_val
         pbest[better] = x[better]
         pbest_val[better] = vals[better]
@@ -198,39 +293,73 @@ def optimize_pvt(
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
     optimizer_method: str = "differential_evolution",
     j_envelope_by_pvt: dict[int, dict[str, Any]] | None = None,
+    timing_rows: list[dict[str, Any]] | None = None,
+    lab_counts_by_pvt: dict[int, int] | None = None,
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
 ) -> dict[int, tuple[float, float, float]]:
     params: dict[int, tuple[float, float, float]] = {}
     fixed = fixed_params or {}
+    lab_n = lab_counts_by_pvt or {}
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
         pvt = int(float(pvt_raw))
+        n_lab = int(lab_n.get(pvt, 0))
+        t0 = time.perf_counter()
         if pvt in fixed:
             params[pvt] = fixed[pvt]
+        elif pvt not in bounds_by_pvt:
+            if timing_rows is not None:
+                timing_rows.append(
+                    {
+                        "PVTNUM_GDM": pvt,
+                        "rows_geo": int(len(g)),
+                        "rows_lab": n_lab,
+                        "elapsed_sec": float(time.perf_counter() - t0),
+                    }
+                )
             continue
-        if pvt not in bounds_by_pvt:
-            continue
-        bounds = [
-            bounds_by_pvt[pvt]["a"],
-            bounds_by_pvt[pvt]["b"],
-            bounds_by_pvt[pvt]["sigma"],
-        ]
-        env = j_envelope_by_pvt.get(pvt) if j_envelope_by_pvt else None
-        method = (optimizer_method or "differential_evolution").lower()
-        if method == "pso":
-            params[pvt] = _pso_optimize(
-                g,
-                bounds=bounds,
-                maxiter=maxiter,
-                particles=max(12, popsize),
-                j_envelope=env,
-            )
-        elif method == "dual_annealing":
-            result = dual_annealing(loss_function, bounds=bounds, args=(g, env), maxiter=maxiter, seed=42)
-            params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
         else:
-            result = differential_evolution(
-                loss_function, bounds=bounds, args=(g, env), maxiter=maxiter, popsize=popsize
+            bounds = [
+                bounds_by_pvt[pvt]["a"],
+                bounds_by_pvt[pvt]["b"],
+                bounds_by_pvt[pvt]["sigma"],
+            ]
+            env = j_envelope_by_pvt.get(pvt) if j_envelope_by_pvt else None
+            loss_fn = _make_loss_fn(
+                g,
+                env,
+                low_swn_threshold=low_swn_threshold,
+                j_cap_at_low_swn=j_cap_at_low_swn,
             )
-            params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
+            method = (optimizer_method or "differential_evolution").lower()
+            if method == "pso":
+                params[pvt] = _pso_optimize(
+                    g,
+                    bounds=bounds,
+                    maxiter=maxiter,
+                    particles=max(12, popsize),
+                    j_envelope=env,
+                    low_swn_threshold=low_swn_threshold,
+                    j_cap_at_low_swn=j_cap_at_low_swn,
+                )
+            elif method == "dual_annealing":
+                result = dual_annealing(loss_fn, bounds=bounds, maxiter=maxiter, seed=42)
+                params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
+            else:
+                result = differential_evolution(
+                    loss_fn, bounds=bounds, maxiter=maxiter, popsize=popsize
+                )
+                params[pvt] = (float(result.x[0]), float(result.x[1]), float(result.x[2]))
+        if timing_rows is not None:
+            timing_rows.append(
+                {
+                    "PVTNUM_GDM": pvt,
+                    "rows_geo": int(len(g)),
+                    "rows_lab": n_lab,
+                    "elapsed_sec": float(time.perf_counter() - t0),
+                }
+            )
     return params
 
 
@@ -250,51 +379,73 @@ def apply_model(df: pd.DataFrame, params: dict[int, tuple[float, float, float]])
     return df
 
 
+def _as_weight_array(weights: Any) -> np.ndarray:
+    """Приводит веса к float-массиву (1.0 вместо NaN)."""
+    w = pd.to_numeric(pd.Series(np.asarray(weights).ravel()), errors="coerce").fillna(1.0).to_numpy(dtype=float)
+    return w
+
+
+def _qa_metrics_row(
+    y_true: np.ndarray,
+    y_pred: np.ndarray,
+    weights: Any,
+    pvt_label: int | str,
+) -> dict[str, Any]:
+    w = _as_weight_array(weights)
+    m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
+    if not np.any(m):
+        return {
+            "PVTNUM_GDM": pvt_label,
+            "MAE": np.nan,
+            "RMSE": np.nan,
+            "BIAS": np.nan,
+            "R2": np.nan,
+            "SCORE": np.nan,
+        }
+    yt = y_true[m]
+    yp = y_pred[m]
+    ww = w[m]
+    err = yp - yt
+    sw = float(np.sum(ww))
+    mae = float(np.average(np.abs(err), weights=ww)) if sw > 0 else np.nan
+    rmse = float(np.sqrt(np.average(err**2, weights=ww))) if sw > 0 else np.nan
+    bias = float(np.average(err, weights=ww)) if sw > 0 else np.nan
+    score = float(1.0 - (float(np.sum(ww * np.abs(err))) / sw)) if sw > 0 else np.nan
+    r2 = float(r2_score(yt, yp)) if len(yt) > 1 else float("nan")
+    return {
+        "PVTNUM_GDM": pvt_label,
+        "MAE": mae,
+        "RMSE": rmse,
+        "BIAS": bias,
+        "R2": r2,
+        "SCORE": score,
+    }
+
+
 def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
     rows = []
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
-        y_true = _safe_series(g, "Кнг_W")
-        y_pred = _safe_series(g, "Kng_model")
-        w = pd.to_numeric(g.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
-        m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
-        if not np.any(m):
-            rows.append(
-                {
-                    "PVTNUM_GDM": int(float(pvt_raw)),
-                    "MAE": np.nan,
-                    "RMSE": np.nan,
-                    "BIAS": np.nan,
-                    "R2": np.nan,
-                    "SCORE": np.nan,
-                }
-            )
-            continue
-        yt = y_true[m]
-        yp = y_pred[m]
-        ww = w[m]
-        err = yp - yt
-        sw = float(np.sum(ww))
-        mae = float(np.average(np.abs(err), weights=ww)) if sw > 0 else np.nan
-        rmse = float(np.sqrt(np.average(err**2, weights=ww))) if sw > 0 else np.nan
-        bias = float(np.average(err, weights=ww)) if sw > 0 else np.nan
-        score = float(1.0 - (float(np.sum(ww * np.abs(err))) / sw)) if sw > 0 else np.nan
-        if len(yt) > 1:
-            r2 = float(r2_score(yt, yp))
-        else:
-            r2 = float("nan")
         rows.append(
-            {
-                "PVTNUM_GDM": int(float(pvt_raw)),
-                "MAE": mae,
-                "RMSE": rmse,
-                "BIAS": bias,
-                "R2": r2,
-                "SCORE": score,
-            }
+            _qa_metrics_row(
+                _safe_series(g, "Кнг_W"),
+                _safe_series(g, "Kng_model"),
+                g.get("weight", 1.0),
+                int(float(pvt_raw)),
+            )
         )
-    qa = pd.DataFrame(rows)
-    if not qa.empty:
-        qa = qa.sort_values("PVTNUM_GDM").reset_index(drop=True)
+    regional = pd.DataFrame(rows)
+    if not regional.empty:
+        regional = regional.sort_values(
+            by="PVTNUM_GDM",
+            key=lambda s: pd.to_numeric(s, errors="coerce"),
+        ).reset_index(drop=True)
+    global_row = _qa_metrics_row(
+        _safe_series(df, "Кнг_W"),
+        _safe_series(df, "Kng_model"),
+        df.get("weight", 1.0),
+        "Все регионы",
+    )
+    qa = pd.concat([pd.DataFrame([global_row]), regional], ignore_index=True)
     return qa
 
 
@@ -371,7 +522,11 @@ def run_pipeline(
     fixed_params: dict[int, tuple[float, float, float]] | None = None,
     optimizer_method: str = "differential_evolution",
     j_envelope_by_pvt: dict[int, dict[str, Any]] | None = None,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    lab_counts_by_pvt: dict[int, int] | None = None,
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     missing = [c for c in REQUIRED_WELL_COLUMNS if c not in df_wells.columns]
     if missing:
         raise ValueError(f"В файле скважин отсутствуют колонки: {missing}")
@@ -379,6 +534,7 @@ def run_pipeline(
     data = prepare_input_df(df_wells)
     data = prepare_weights(data, df_prod)
     train_data = _filter_training_kng(data)
+    timing_rows: list[dict[str, Any]] = []
     params = optimize_pvt(
         train_data,
         bounds_by_pvt,
@@ -387,9 +543,14 @@ def run_pipeline(
         fixed_params=fixed_params,
         optimizer_method=optimizer_method,
         j_envelope_by_pvt=j_envelope_by_pvt,
+        timing_rows=timing_rows,
+        lab_counts_by_pvt=lab_counts_by_pvt,
+        low_swn_threshold=low_swn_threshold,
+        j_cap_at_low_swn=j_cap_at_low_swn,
     )
     result = apply_model(data, params)
     qa = compute_qa(result)
+    timing_df = _timing_table_with_total(timing_rows)
 
     params_df = pd.DataFrame(
         [
@@ -397,4 +558,24 @@ def run_pipeline(
             for pvt, vals in sorted(params.items())
         ]
     )
-    return result, params_df, qa
+    return result, params_df, qa, timing_df
+
+
+def _timing_table_with_total(
+    timing_rows: list[dict[str, Any]],
+    total_elapsed: float | None = None,
+) -> pd.DataFrame:
+    if not timing_rows:
+        return pd.DataFrame(columns=["PVTNUM_GDM", "rows_geo", "rows_lab", "elapsed_sec"])
+    regional = pd.DataFrame(timing_rows).sort_values(
+        by="PVTNUM_GDM",
+        key=lambda s: pd.to_numeric(s, errors="coerce"),
+    ).reset_index(drop=True)
+    elapsed = float(total_elapsed) if total_elapsed is not None else float(regional["elapsed_sec"].sum())
+    total_row = {
+        "PVTNUM_GDM": "Все регионы",
+        "rows_geo": int(regional["rows_geo"].sum()),
+        "rows_lab": int(regional["rows_lab"].sum()),
+        "elapsed_sec": elapsed,
+    }
+    return pd.concat([pd.DataFrame([total_row]), regional], ignore_index=True)
