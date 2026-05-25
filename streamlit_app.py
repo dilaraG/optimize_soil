@@ -2,6 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import io
+import os
+import platform
+import subprocess
+import sys
 from pathlib import Path
 import time
 
@@ -955,33 +959,92 @@ def _write_snapshots_file(path: Path, df: pd.DataFrame) -> None:
     df.to_csv(path, index=False, encoding="utf-8-sig")
 
 
-def _pin_snapshot_load_expander(expanded_key: str, touched_key: str) -> None:
-    """Не сворачивать блок загрузки при вводе пути (каждый символ — rerun Streamlit)."""
-    st.session_state[expanded_key] = True
-    st.session_state[touched_key] = True
+def _gui_dialogs_available() -> bool:
+    """Системный диалог выбора файла возможен только при локальном GUI (не CI / headless)."""
+    if sys.platform == "darwin" and os.environ.get("CI"):
+        return False
+    headless = os.environ.get("STREAMLIT_SERVER_HEADLESS", "").lower() in ("1", "true", "yes")
+    return not headless
 
 
-def _pick_csv_save_path(default_name: str) -> str | None:
-    """Диалог «Сохранить как…» (локальный запуск Streamlit)."""
+def _pick_csv_save_path_macos(default_name: str, initial_dir: Path) -> str | None:
+    dir_posix = str(initial_dir.resolve())
+    name = default_name.replace("\\", "\\\\").replace('"', '\\"')
+    folder = dir_posix.replace("\\", "\\\\").replace('"', '\\"')
+    script = (
+        f'set defaultLoc to POSIX file "{folder}"\n'
+        f'set outPath to choose file name with prompt "Сохранить снимки как:" '
+        f'default name "{name}" default location defaultLoc\n'
+        "return POSIX path of outPath"
+    )
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=600,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    path = (proc.stdout or "").strip()
+    return path if path else None
+
+
+def _pick_csv_save_path_windows(default_name: str, initial_dir: Path) -> str | None:
     try:
         import tkinter as tk
         from tkinter import filedialog
 
-        SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
         root = tk.Tk()
         root.withdraw()
-        root.attributes("-topmost", True)
+        root.update_idletasks()
+        try:
+            root.attributes("-topmost", True)
+        except tk.TclError:
+            pass
         path = filedialog.asksaveasfilename(
             title="Сохранить снимки",
             defaultextension=".csv",
             initialfile=default_name,
-            initialdir=str(SNAPSHOTS_DIR.resolve()),
+            initialdir=str(initial_dir.resolve()),
             filetypes=[("CSV", "*.csv"), ("Все файлы", "*.*")],
         )
         root.destroy()
         return str(path) if path else None
     except Exception:
         return None
+
+
+def _pick_csv_save_path(default_name: str) -> tuple[str | None, str | None]:
+    """
+    Диалог «Сохранить как…» для локального Streamlit.
+    Возвращает (путь, сообщение_об_ошибке). На macOS tkinter часто роняет процесс Streamlit — используем osascript.
+    """
+    SNAPSHOTS_DIR.mkdir(parents=True, exist_ok=True)
+    initial_dir = SNAPSHOTS_DIR.resolve()
+    if not _gui_dialogs_available():
+        return None, (
+            "Системный диалог недоступен (режим без GUI или удалённый сервер). "
+            "Введите путь в поле ниже или нажмите «Скачать CSV в браузер»."
+        )
+    system = platform.system()
+    if system == "Darwin":
+        path = _pick_csv_save_path_macos(default_name, initial_dir)
+        if path:
+            return path, None
+        return None, "Диалог отменён или macOS не разрешил выбор файла (нет доступа к экрану для терминала)."
+    if system == "Windows":
+        path = _pick_csv_save_path_windows(default_name, initial_dir)
+        if path:
+            return path, None
+        return None, "Диалог отменён или окно выбора файла не открылось."
+    return None, (
+        "На этой ОС диалог «Сохранить как…» не настроен. "
+        "Укажите путь вручную или скачайте CSV через браузер."
+    )
 
 
 def _merge_snapshots(existing: pd.DataFrame, loaded: pd.DataFrame) -> pd.DataFrame:
@@ -1025,11 +1088,11 @@ def _commit_snapshots_to_session(
 
 
 def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
-    """Сохранение / загрузка каталога well_method_snapshots в CSV по пути пользователя."""
+    """Сохранение / загрузка каталога well_method_snapshots в CSV (без сворачиваемых блоков)."""
     st.markdown("### Снимки на диск")
     st.caption(
-        "Снимки для раздела «Сравнение» (кнопки «Запомнить» на вкладках J и БК). "
-        "Файл CSV можно открыть в Excel; при загрузке восстанавливается каталог снимков в текущей сессии."
+        "Сначала «Запомнить» на вкладках J и БК. Здесь — запись и чтение CSV; загрузка **добавляет** снимки к уже "
+        "запомненным в сессии (при совпадении ID — версия из файла)."
     )
     notice_key = f"{key_prefix}_load_notice"
     if st.session_state.get(notice_key):
@@ -1039,87 +1102,94 @@ def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
 
     default_name = _default_snapshot_filename()
     save_path_key = f"{key_prefix}_save_path"
-    if not st.session_state.get(save_path_key):
-        st.session_state[save_path_key] = _default_snapshot_save_path()
-    if not st.session_state.get(f"{key_prefix}_load_path"):
-        st.session_state[f"{key_prefix}_load_path"] = str(
-            (SNAPSHOTS_DIR / "snapshots.csv").relative_to(PROJECT_ROOT)
-        )
+    save_path_pending_key = f"{key_prefix}_save_path_pending"
+    load_path_key = f"{key_prefix}_load_path"
 
-    with st.expander("Сохранить снимки в файл", expanded=False):
-        if st.button("Выбрать путь для сохранения…", key=f"{key_prefix}_pick_save"):
-            picked = _pick_csv_save_path(default_name)
-            if picked:
-                st.session_state[save_path_key] = picked
-                st.rerun()
-            else:
-                st.caption("Выбор файла отменён.")
-        st.caption(f"**Файл:** `{st.session_state.get(save_path_key, '')}`")
-        if st.button("Сохранить в файл", type="primary", key=f"{key_prefix}_save_btn"):
-            snaps = _get_well_method_snapshots()
+    pending_save_path = st.session_state.pop(save_path_pending_key, None)
+    if pending_save_path is not None:
+        st.session_state[save_path_key] = pending_save_path
+    elif save_path_key not in st.session_state:
+        st.session_state[save_path_key] = _default_snapshot_save_path()
+    if load_path_key not in st.session_state:
+        st.session_state[load_path_key] = str((SNAPSHOTS_DIR / "snapshots.csv").relative_to(PROJECT_ROOT))
+
+    st.subheader("Сохранение")
+    st.text_input(
+        "Куда сохранить CSV",
+        key=save_path_key,
+        help="Полный или относительный путь, например data/snapshots/имя.csv",
+    )
+    snaps = _get_well_method_snapshots()
+    b_save, b_pick, b_dl = st.columns([2, 2, 2])
+    with b_save:
+        if st.button("Сохранить в файл", type="primary", key=f"{key_prefix}_save_btn", use_container_width=True):
             if snaps.empty:
-                st.warning("Нет снимков в памяти. Сначала нажмите «Запомнить» на вкладках J и/или БК.")
+                st.warning("Нет снимков. Сначала «Запомнить» на вкладках J и/или БК.")
             else:
                 try:
                     save_path_str = str(st.session_state.get(save_path_key, ""))
                     out_path = _resolve_snapshot_path(save_path_str, default_filename=default_name)
                     _write_snapshots_file(out_path, snaps)
-                    st.session_state[save_path_key] = str(out_path)
-                    st.success(f"Сохранено {len(snaps)} строк → `{out_path}`")
+                    if str(out_path) != save_path_str.strip():
+                        st.session_state[save_path_pending_key] = str(out_path)
+                        st.rerun()
+                    else:
+                        st.success(f"Сохранено {len(snaps)} строк → `{out_path}`")
                 except (OSError, ValueError) as e:
                     st.error(str(e))
+    with b_pick:
+        if st.button("Выбрать путь…", key=f"{key_prefix}_pick_save", use_container_width=True):
+            picked, err = _pick_csv_save_path(default_name)
+            if picked:
+                st.session_state[save_path_pending_key] = picked
+                st.rerun()
+            elif err:
+                st.warning(err)
+    with b_dl:
+        if not snaps.empty:
+            st.download_button(
+                "Скачать CSV",
+                data=_csv_bytes(snaps),
+                file_name=default_name,
+                mime="text/csv",
+                key=f"{key_prefix}_download",
+                use_container_width=True,
+                help="Файл в папку «Загрузки» браузера.",
+            )
 
-    load_expanded_key = f"{key_prefix}_load_expanded"
-    load_path_key = f"{key_prefix}_load_path"
-    load_path_touched_key = f"{key_prefix}_load_path_touched"
-    if (
-        st.session_state.get(f"{key_prefix}_upload_sig")
-        or st.session_state.get(load_path_touched_key)
-        or str(st.session_state.get(load_path_key, "")).strip()
-    ):
-        st.session_state[load_expanded_key] = True
+    st.divider()
+    st.subheader("Загрузка")
+    up = st.file_uploader(
+        "Выбрать CSV на компьютере",
+        type=["csv"],
+        key=f"{key_prefix}_upload",
+        help="После выбора файла данные подгружаются сразу.",
+    )
+    if up is not None:
+        upload_sig = f"{up.name}:{up.size}"
+        if st.session_state.get(f"{key_prefix}_upload_sig") != upload_sig:
+            try:
+                loaded = _normalize_loaded_snapshots(_read_csv_text(_decode_upload_text(up.getvalue())))
+                st.session_state[f"{key_prefix}_upload_sig"] = upload_sig
+                _commit_snapshots_to_session(loaded, src=up.name, notice_key=notice_key)
+            except (ValueError, pd.errors.ParserError) as e:
+                st.error(str(e))
 
-    with st.expander(
-        "Загрузить снимки из файла",
-        expanded=bool(st.session_state.get(load_expanded_key, False)),
-    ):
-        st.caption(
-            "CSV **добавляется** к уже запомненным в сессии снимкам (J и БК после «Запомнить»). "
-            "В списке сравнения будут и свои расчёты, и загруженный файл. "
-            "При совпадении ID снимка версия из файла заменяет старую."
-        )
-        up = st.file_uploader(
-            "Файл CSV со снимками",
-            type=["csv"],
-            key=f"{key_prefix}_upload",
-            help="После выбора файла загрузка выполняется автоматически.",
-        )
-        if up is not None:
-            upload_sig = f"{up.name}:{up.size}"
-            if st.session_state.get(f"{key_prefix}_upload_sig") != upload_sig:
-                try:
-                    loaded = _normalize_loaded_snapshots(
-                        _read_csv_text(_decode_upload_text(up.getvalue()))
-                    )
-                    st.session_state[f"{key_prefix}_upload_sig"] = upload_sig
-                    st.session_state[load_expanded_key] = True
-                    _commit_snapshots_to_session(loaded, src=up.name, notice_key=notice_key)
-                except (ValueError, pd.errors.ParserError) as e:
-                    st.error(str(e))
-
+    load_col, load_btn_col = st.columns([4, 1])
+    with load_col:
         load_path_str = st.text_input(
-            "Путь к файлу на диске (альтернатива выбору файла выше)",
+            "Или путь к CSV на диске",
             key=load_path_key,
-            help="Полный или относительный путь к CSV. По умолчанию дополняет снимки в памяти.",
-            on_change=_pin_snapshot_load_expander,
-            args=(load_expanded_key, load_path_touched_key),
+            help="Относительно папки проекта или полный путь.",
         )
-        if st.button("Загрузить по пути", key=f"{key_prefix}_load_path_btn"):
+    with load_btn_col:
+        st.write("")
+        st.write("")
+        if st.button("Загрузить", key=f"{key_prefix}_load_path_btn", use_container_width=True):
             try:
                 in_path = _resolve_snapshot_path(load_path_str, default_filename="snapshots.csv")
                 loaded = _read_snapshots_file(in_path)
                 st.session_state[f"{key_prefix}_upload_sig"] = None
-                st.session_state[load_expanded_key] = True
                 _commit_snapshots_to_session(loaded, src=str(in_path), notice_key=notice_key)
             except (OSError, ValueError, pd.errors.ParserError) as e:
                 st.error(str(e))
@@ -2809,6 +2879,17 @@ def _guess_col(cols: list[str], candidates: list[str]) -> str:
     return cols[0]
 
 
+def _guess_bc_lab_n_column(cols: list[str]) -> str:
+    """Столбец показателя n в лабораторной таблице БК: по умолчанию колонка «n»."""
+    for c in cols:
+        if str(c).strip() == "n":
+            return c
+    for c in cols:
+        if str(c).strip().lower() == "n":
+            return c
+    return _safe_guess_col(cols, ["N", "N_LAB", "ПОКАЗАТЕЛЬ"])
+
+
 def _guess_kng_w_column(cols: list[str]) -> str:
     """
     Автовыбор столбца нефтенасыщенности (Кнг): Kn, Кн, soil, КНГ, нефтенасыщенность и т.п.
@@ -4337,7 +4418,11 @@ def brooks_corey_tab() -> None:
         "Swi/Swl (лаборатория)": saved_lab_map.get("Swi/Swl (лаборатория)") if saved_lab_map.get("Swi/Swl (лаборатория)") in cols else _safe_guess_col(cols, ["КВО", "SWL", "SWI"]),
         "Perm (лаборатория)": saved_lab_map.get("Perm (лаборатория)") if saved_lab_map.get("Perm (лаборатория)") in cols else _safe_guess_col(cols, ["КПР", "ПРОНИЦАЕМОСТ", "PERM"]),
         "Pvit (лаборатория)": saved_lab_map.get("Pvit (лаборатория)") if saved_lab_map.get("Pvit (лаборатория)") in cols else _safe_guess_col(cols, ["РВЫТ", "PVIT"]),
-        "n (лаборатория)": saved_lab_map.get("n (лаборатория)") if saved_lab_map.get("n (лаборатория)") in cols else _safe_guess_col(cols, [" N", "N_"]),
+        "n (лаборатория)": (
+            saved_lab_map.get("n (лаборатория)")
+            if saved_lab_map.get("n (лаборатория)") in cols
+            else _guess_bc_lab_n_column(cols)
+        ),
     }
     lab_map_df = pd.DataFrame([defaults_lab])
     lab_cfg = {
