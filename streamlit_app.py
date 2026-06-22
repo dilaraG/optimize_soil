@@ -58,42 +58,58 @@ st.set_page_config(page_title="J-функция Леверетта", layout="wid
 
 
 def _inject_streamlit_ru_ui_styles() -> None:
-    """Русские подписи встроенных кнопок Streamlit (Browse files, Drag and drop, …)."""
+    """Стили UI: скрыть Drag and drop, русская кнопка загрузки. Вставляется на каждом rerun."""
     st.markdown(
         """
         <style>
         html, body, [data-testid="stAppViewContainer"], [data-testid="stMain"] {
             overflow-anchor: none;
         }
-        /* Загрузка файла: Browse files → Выбрать файл */
-        div[data-testid="stFileUploader"] button {
-            font-size: 0 !important;
-            line-height: 0;
+        /* File uploader (Streamlit 1.32+): скрыть «Drag and drop file here» */
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzoneInstructions"],
+        [data-testid="stFileUploader"] [data-testid="stFileDropzoneInstructions"],
+        [data-testid="stFileUploaderDropzoneInstructions"],
+        [data-testid="stFileDropzoneInstructions"] {
+            display: none !important;
+            visibility: hidden !important;
+            width: 0 !important;
+            height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            position: absolute !important;
+            left: -9999px !important;
         }
-        div[data-testid="stFileUploader"] button::after {
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] {
+            min-height: 0;
+            padding-top: 0.35rem;
+            padding-bottom: 0.35rem;
+        }
+        /* Browse files → Выбрать файл (только кнопка внутри dropzone) */
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"],
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="baseButton-secondary"] {
+            font-size: 0 !important;
+            line-height: 0 !important;
+        }
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"]::after,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="baseButton-secondary"]::after {
             content: "Выбрать файл";
             font-size: 0.875rem;
             line-height: normal;
         }
-        div[data-testid="stFileUploader"] button span,
-        div[data-testid="stFileUploader"] button div {
-            display: none;
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"] > span,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="stBaseButton-secondary"] > div,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="baseButton-secondary"] > span,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="baseButton-secondary"] > div {
+            display: none !important;
         }
-        /* Drag and drop file here */
-        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small {
-            font-size: 0 !important;
-            line-height: 0;
-        }
-        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small::before {
-            font-size: 0.8rem;
-            line-height: 1.4;
-            color: rgba(49, 51, 63, 0.6);
-        }
-        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small:nth-of-type(1)::before {
-            content: "Перетащите файл сюда";
-        }
-        div[data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] div small:nth-of-type(2)::before {
-            content: "или нажмите «Выбрать файл»";
+        /* Совместимость со старыми версиями Streamlit */
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] small,
+        [data-testid="stFileUploader"] [data-testid="stFileUploaderDropzone"] [data-testid="stMarkdownContainer"] {
+            display: none !important;
         }
         /* Скачивание: подпись на кнопке уже задаётся в коде; скрываем служебный англ. хвост, если есть */
         [data-testid="stDownloadButton"] button {
@@ -150,8 +166,6 @@ def _inject_streamlit_ru_ui_styles() -> None:
         unsafe_allow_html=True,
     )
 
-
-_inject_streamlit_ru_ui_styles()
 
 DATA_DIR = Path(__file__).resolve().parent / "data"
 UPLOAD_DIR = DATA_DIR / "uploads"
@@ -1486,61 +1500,20 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
 
     st.markdown("### Метрики по каждому методу (по горизонтам, Регион)")
     st.caption(
-        "Те же взвешенные MAE/RMSE/BIAS/R²/SCORE, что на вкладках J и БК после расчёта "
+        "Те же взвешенные MAE/RMSE/SCORE, что на вкладках J и БК после расчёта "
         "(по сохранённому снимку). На кроссплотах ниже по-прежнему не учитываются точки с Кн_hist = 0."
     )
     tab_j = _qa_metrics_from_snapshot(sj)
     tab_b = _qa_metrics_from_snapshot(sb)
     cjm, cbm = st.columns(2)
-    cjm.dataframe(_round_df(tab_j.rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")), use_container_width=True)
-    cbm.dataframe(_round_df(tab_b.rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")), use_container_width=True)
-
-    st.markdown("### Кроссплоты по методам")
-    c3, c4 = st.columns(2)
-    sj_x = _crossplot_df(sj)
-    sb_x = _crossplot_df(sb)
-    if sj_x.empty:
-        c3.info("Нет точек для кроссплота J после исключения Кн_hist = 0.")
-    else:
-        sj_plot = sj_x.copy()
-        if "PVTNUM_GDM" in sj_plot.columns:
-            sj_plot["Регион"] = pd.to_numeric(sj_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
-        fig_j = px.scatter(
-            sj_plot,
-            x="Кн_hist",
-            y="Кн_model",
-            color="Регион" if "Регион" in sj_plot.columns else None,
-            color_discrete_sequence=px.colors.qualitative.Dark24,
-            hover_data=[c for c in ["_AXIS", "Регион"] if c in sj_plot.columns],
-            title="J: расчетное(историческое)",
-            opacity=0.65,
-            **_crossplot_hover_name_kw(sj_plot),
-        )
-        fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-        _apply_crossplot_hover(fig_j, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sj_plot)
-        fig_j.update_layout(legend_title_text="Регион")
-        c3.plotly_chart(fig_j, use_container_width=True)
-    if sb_x.empty:
-        c4.info("Нет точек для кроссплота БК после исключения Кн_hist = 0.")
-    else:
-        sb_plot = sb_x.copy()
-        if "PVTNUM_GDM" in sb_plot.columns:
-            sb_plot["Регион"] = pd.to_numeric(sb_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
-        fig_bc = px.scatter(
-            sb_plot,
-            x="Кн_hist",
-            y="Кн_model",
-            color="Регион" if "Регион" in sb_plot.columns else None,
-            color_discrete_sequence=px.colors.qualitative.Dark24,
-            hover_data=[c for c in ["_AXIS", "Регион"] if c in sb_plot.columns],
-            title="БК: расчетное(историческое)",
-            opacity=0.65,
-            **_crossplot_hover_name_kw(sb_plot),
-        )
-        fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-        _apply_crossplot_hover(fig_bc, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sb_plot)
-        fig_bc.update_layout(legend_title_text="Регион")
-        c4.plotly_chart(fig_bc, use_container_width=True)
+    cjm.dataframe(
+        _round_df(_qa_table_for_display(tab_j).rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")),
+        use_container_width=True,
+    )
+    cbm.dataframe(
+        _round_df(_qa_table_for_display(tab_b).rename(columns={"PVTNUM_GDM": "Регион"}).set_index("Регион")),
+        use_container_width=True,
+    )
 
     st.markdown("### Региональные средневзвешенные значения и распределения")
     meth_tab_j, meth_tab_bc, meth_tab_cmp = st.tabs(["J-функция", "Брукс-Кори", "J vs БК"])
@@ -1796,7 +1769,54 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             show_title=False,
         )
 
-    st.markdown("### Поскважинное сравнение и кластеры согласованности")
+    st.markdown("### Кроссплоты по методам")
+    c3, c4 = st.columns(2)
+    sj_x = _crossplot_df(sj)
+    sb_x = _crossplot_df(sb)
+    if sj_x.empty:
+        c3.info("Нет точек для кроссплота J после исключения Кн_hist = 0.")
+    else:
+        sj_plot = sj_x.copy()
+        if "PVTNUM_GDM" in sj_plot.columns:
+            sj_plot["Регион"] = pd.to_numeric(sj_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
+        fig_j = px.scatter(
+            sj_plot,
+            x="Кн_hist",
+            y="Кн_model",
+            color="Регион" if "Регион" in sj_plot.columns else None,
+            color_discrete_sequence=px.colors.qualitative.Dark24,
+            hover_data=[c for c in ["_AXIS", "Регион"] if c in sj_plot.columns],
+            title="J: расчетное(историческое)",
+            opacity=0.65,
+            **_crossplot_hover_name_kw(sj_plot),
+        )
+        fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        _apply_crossplot_hover(fig_j, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sj_plot)
+        fig_j.update_layout(legend_title_text="Регион")
+        c3.plotly_chart(fig_j, use_container_width=True)
+    if sb_x.empty:
+        c4.info("Нет точек для кроссплота БК после исключения Кн_hist = 0.")
+    else:
+        sb_plot = sb_x.copy()
+        if "PVTNUM_GDM" in sb_plot.columns:
+            sb_plot["Регион"] = pd.to_numeric(sb_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
+        fig_bc = px.scatter(
+            sb_plot,
+            x="Кн_hist",
+            y="Кн_model",
+            color="Регион" if "Регион" in sb_plot.columns else None,
+            color_discrete_sequence=px.colors.qualitative.Dark24,
+            hover_data=[c for c in ["_AXIS", "Регион"] if c in sb_plot.columns],
+            title="БК: расчетное(историческое)",
+            opacity=0.65,
+            **_crossplot_hover_name_kw(sb_plot),
+        )
+        fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        _apply_crossplot_hover(fig_bc, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sb_plot)
+        fig_bc.update_layout(legend_title_text="Регион")
+        c4.plotly_chart(fig_bc, use_container_width=True)
+
+    st.markdown("### Сравнение в разрезе скважины")
     st.caption(
         "Для каждой скважины на общей сетке по глубине сравниваются **тренды** рассчитанных кривых "
         "J-функции и Брукса–Кори (корреляция и совпадение знака приращений). Связь с историей РИГИС "
@@ -1835,7 +1855,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         )
     cmp_df = pd.DataFrame(rows)
     if cmp_df.empty:
-        st.warning("Недостаточно данных для поскважинного сравнения.")
+        st.warning("Недостаточно данных для сравнения в разрезе скважины.")
         return
 
     cmp_df["good_match"] = (cmp_df["corr_j_bc"] >= 0.8) & (cmp_df["trend_j_bc"] >= 65.0)
@@ -1856,41 +1876,11 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         use_container_width=True,
     )
 
-    feat = cmp_df[["corr_j_bc", "trend_j_bc"]].copy()
-    feat = feat.fillna(feat.median(numeric_only=True))
-    try:
-        from sklearn.cluster import KMeans
-
-        k = int(max(2, min(4, len(feat))))
-        km = KMeans(n_clusters=k, random_state=42, n_init=10)
-        cmp_df["cluster"] = km.fit_predict(feat).astype(str)
-    except Exception:
-        cmp_df["cluster"] = np.where(cmp_df["good_match"], "good", "other")
-
-    fig_cluster = px.scatter(
-        cmp_df,
-        x="corr_j_bc",
-        y="trend_j_bc",
-        color="cluster",
-        symbol="good_match",
-        hover_data=["corr_j_hist", "corr_bc_hist", "points_interp"],
-        title="Кластеры: согласованность J-функции и Брукса–Кори (корреляция и тренд)",
-        **_crossplot_hover_name_kw(cmp_df),
+    well = st.selectbox(
+        "Скважина для детального сравнения",
+        options=sorted(cmp_df["WELL_NAME"].unique().tolist()),
+        key=f"{block_key}_well",
     )
-    _apply_crossplot_hover(fig_cluster, "corr_j_bc=%{x:.3f}<br>trend_j_bc=%{y:.3f}", cmp_df)
-    with st.expander("Как интерпретировать график кластеров", expanded=False):
-        st.markdown(
-            "- Каждая точка — одна скважина.\n"
-            "- Ось X (`corr_j_bc`) показывает, насколько форма кривых J и БК похожа.\n"
-            "- Ось Y (`trend_j_bc`) показывает долю совпадения направления изменений по глубине, %.\n"
-            "- Чем правее и выше точка, тем лучше согласованность методов по скважине.\n"
-            "- `cluster` — метка кластера (группа скважин с похожей комбинацией `corr_j_bc` и `trend_j_bc`).\n"
-            "- `good_match=True` — скважина в зоне хорошего согласия: `corr_j_bc >= 0.8` и `trend_j_bc >= 65%`.\n"
-            "- `good_match=False` (или `0`) — хотя бы один из критериев не выполнен, согласованность ниже целевой."
-        )
-    st.plotly_chart(fig_cluster, use_container_width=True)
-
-    well = st.selectbox("Скважина для детального сравнения", options=sorted(cmp_df["WELL_NAME"].unique().tolist()), key=f"{block_key}_well")
     wj = sj[sj["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
     wb = sb[sb["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
     if wj.empty or wb.empty:
@@ -2247,6 +2237,59 @@ def _round_df(df: pd.DataFrame, digits: int = 3) -> pd.DataFrame:
     return out
 
 
+def _qa_table_for_display(df: pd.DataFrame) -> pd.DataFrame:
+    """Таблица метрик для UI: без BIAS и R2 (остаются в расчёте и CSV)."""
+    out = df.copy()
+    return out.drop(columns=[c for c in ("BIAS", "R2") if c in out.columns])
+
+
+ALL_REGIONS_LABEL = "Все регионы"
+
+
+def _pvt_region_select_options(pvt_opts: list[int]) -> list[str | int]:
+    return [ALL_REGIONS_LABEL] + pvt_opts
+
+
+def _is_all_regions(region_pick: object) -> bool:
+    return str(region_pick) == ALL_REGIONS_LABEL
+
+
+def _filter_df_by_pvt_region(
+    df: pd.DataFrame, region_pick: object, pvt_col: str = "PVTNUM_GDM"
+) -> pd.DataFrame:
+    if _is_all_regions(region_pick) or pvt_col not in df.columns:
+        return df.copy()
+    mask = pd.to_numeric(df[pvt_col], errors="coerce") == float(region_pick)
+    return df.loc[mask].copy()
+
+
+def _region_plot_label(region_pick: object) -> str:
+    return ALL_REGIONS_LABEL if _is_all_regions(region_pick) else str(region_pick)
+
+
+def _merge_well_region_into_crossplot(
+    cross_df: pd.DataFrame, source_df: pd.DataFrame, pvt_col: str = "PVTNUM_GDM"
+) -> pd.DataFrame:
+    if cross_df.empty or "WELL_NAME" not in cross_df.columns or pvt_col not in source_df.columns:
+        return cross_df
+    well_region = (
+        source_df.assign(_pvt_num=pd.to_numeric(source_df[pvt_col], errors="coerce"))
+        .dropna(subset=["_pvt_num"])
+        .groupby("WELL_NAME", as_index=False)["_pvt_num"]
+        .median()
+        .rename(columns={"_pvt_num": "Регион"})
+    )
+    well_region["Регион"] = well_region["Регион"].astype(int).astype(str)
+    return cross_df.merge(well_region, on="WELL_NAME", how="left")
+
+
+def _add_pvt_region_column(df: pd.DataFrame, pvt_col: str = "PVTNUM_GDM") -> pd.DataFrame:
+    out = df.copy()
+    if pvt_col in out.columns:
+        out["Регион"] = pd.to_numeric(out[pvt_col], errors="coerce").astype("Int64").astype(str)
+    return out
+
+
 def _fmt_float3(x: object) -> str:
     try:
         xf = float(x)  # type: ignore[arg-type]
@@ -2394,51 +2437,6 @@ _bc_pvt_horizon_mapping_run = (
 )
 
 
-def _bc_well_preview_fragment() -> None:
-    """Профиль скважины — отдельный fragment, без перерисовки всей вкладки БК."""
-    bc_res = st.session_state.get("bc_result_df")
-    if not isinstance(bc_res, pd.DataFrame) or bc_res.empty:
-        return
-    psel = st.session_state.get("bc_plot_pvt")
-    if psel is None:
-        pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
-        if not pvt_opts:
-            return
-        psel = pvt_opts[0]
-    g = bc_res[pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce") == float(psel)].copy()
-    g = g.dropna(subset=["Кн_W", "Kng_BC_model"])
-    g_conv = _filter_convergence_points(g.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
-        columns={"Kng_model": "Kng_BC_model"}
-    )
-    if g_conv.empty or "WELL_NAME" not in g_conv.columns:
-        return
-    st.subheader("Просмотр скважины (Брукса-Кори)")
-    wells = sorted(g_conv["WELL_NAME"].astype(str).unique().tolist())
-    well = _shared_well_selectbox(wells)
-    wd = g_conv[g_conv["WELL_NAME"].astype(str) == well].copy()
-    dcol = _pick_depth_column(wd)
-    if dcol is None:
-        st.warning("Не найдена колонка глубины для скважины.")
-    elif "ACTNUM_GDM" not in wd.columns:
-        st.warning("В данных отсутствует ACTNUM_GDM.")
-    else:
-        wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
-        wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
-        curve = wd[[dcol, "ACTNUM_GDM", "Кн_W", "Kng_BC_model"]].rename(
-            columns={"Кн_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
-        )
-        melt = curve.melt(
-            id_vars=[dcol],
-            value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"],
-            var_name="Кривая",
-            value_name="Значение",
-        )
-        fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
-        fig_prof.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
-        fig_prof.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_prof, use_container_width=True)
-
-
 def _bc_results_dashboard_fragment() -> None:
     """Таблицы и графики результатов БК (без блока просмотра скважины)."""
     bc_res = st.session_state.get("bc_result_df")
@@ -2476,7 +2474,7 @@ def _bc_results_dashboard_fragment() -> None:
         if isinstance(bc_qa, pd.DataFrame) and not bc_qa.empty:
             bc_qa_show = bc_qa.copy()
             bc_qa_show["PVTNUM_GDM"] = bc_qa_show["PVTNUM_GDM"].astype(str)
-            st.dataframe(_round_df(bc_qa_show.set_index("PVTNUM_GDM")), use_container_width=True)
+            st.dataframe(_round_df(_qa_table_for_display(bc_qa_show).set_index("PVTNUM_GDM")), use_container_width=True)
             global_bc = bc_qa[bc_qa["PVTNUM_GDM"].astype(str) == "Все регионы"]
             if not global_bc.empty and np.isfinite(global_bc.iloc[0]["SCORE"]):
                 st.metric("SCORE (все регионы)", f"{float(global_bc.iloc[0]['SCORE']):.3f}")
@@ -2569,63 +2567,54 @@ def _bc_results_dashboard_fragment() -> None:
             c4.plotly_chart(fig4, use_container_width=True)
 
     st.subheader("Кроссплоты Брукса-Кори")
-    g_conv = _filter_convergence_points(g.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
+    bc_cross_pvt = st.selectbox(
+        "Регион для кроссплота по скважинам",
+        options=_pvt_region_select_options(pvt_opts),
+        key="bc_well_cross_pvt",
+    )
+    g_well = _filter_df_by_pvt_region(bc_res, bc_cross_pvt)
+    g_well = g_well.dropna(subset=["Кн_W", "Kng_BC_model"])
+    g_well_conv = _filter_convergence_points(g_well.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
         columns={"Kng_model": "Kng_BC_model"}
     )
-    if g_conv.empty:
-        st.warning("Нет валидных точек сходимости для кроссплотов БК.")
-        return
-    bc_color_mode = st.radio("Палитра БК", options=("По весу", "По толщине"), horizontal=True, key="bc_scatter_color")
-    depth_col = _pick_depth_column(g_conv)
-    if bc_color_mode == "По толщине" and depth_col is not None and "WELL_NAME" in g_conv.columns:
-        g_conv[depth_col] = pd.to_numeric(g_conv[depth_col], errors="coerce")
-        tdf = g_conv.dropna(subset=[depth_col]).groupby("WELL_NAME")[depth_col].agg(["min", "max"]).reset_index()
-        tdf["thickness"] = tdf["max"] - tdf["min"]
-        g_conv = g_conv.merge(tdf[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left")
-        bc_color = "thickness"
-    else:
-        bc_color = "weight" if "weight" in g_conv.columns else None
-
-    fig = px.scatter(
-        g_conv,
-        x="Кн_W",
-        y="Kng_BC_model",
-        color=bc_color,
-        color_continuous_scale="Viridis",
-        hover_data={
-            c: ":.3f"
-            for c in ["PC", "PORO_GDM", "Kng_BC_model", "Кн_W", "thickness", "weight"]
-            if c in g_conv.columns
-        },
-        title=f"PVT {psel}: предсказанное(историческое) (Брукса-Кори)",
-        opacity=0.75,
-        **_crossplot_hover_name_kw(g_conv),
-    )
-    fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-    _apply_crossplot_hover(fig, "Кн_W=%{x:.3f}<br>Kng_BC_model=%{y:.3f}", g_conv)
-    st.plotly_chart(fig, use_container_width=True)
-
-    if "WELL_NAME" in g_conv.columns:
-        cross = _well_weighted_crossplot_df(g_conv.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
+    if g_well_conv.empty:
+        st.warning("Нет валидных точек сходимости для кроссплота по скважинам БК.")
+    elif "WELL_NAME" in g_well_conv.columns:
+        st.markdown("#### Кроссплот по скважинам (средневзвешенные значения)")
+        cross = _well_weighted_crossplot_df(g_well_conv.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
             columns={"Kng_model_wmean": "Kng_BC_wmean"}
         )
-        if not cross.empty:
-            figw = px.scatter(
-                cross,
-                x="Кн_W_wmean",
-                y="Kng_BC_wmean",
-                color="convergence_percent",
-                color_continuous_scale="Turbo",
-                hover_data={
+        if cross.empty:
+            st.info("Недостаточно данных для кроссплота по скважинам.")
+        else:
+            if _is_all_regions(bc_cross_pvt):
+                cross = _merge_well_region_into_crossplot(cross, g_well_conv)
+            cross_color = (
+                "Регион"
+                if _is_all_regions(bc_cross_pvt) and "Регион" in cross.columns
+                else "convergence_percent"
+            )
+            cross_kw: dict[str, object] = {
+                "x": "Кн_W_wmean",
+                "y": "Kng_BC_wmean",
+                "color": cross_color,
+                "hover_data": {
                     "points": ":.3f",
                     "avg_weight": ":.3f",
                     "convergence_percent": ":.3f",
                 },
-                title=f"PVT {psel}: кроссплот по скважинам (БК, средневзвешенно)",
+                "title": f"{_region_plot_label(bc_cross_pvt)}: кроссплот по скважинам (БК, средневзвешенно)",
                 **_crossplot_hover_name_kw(cross),
-            )
+            }
+            if cross_color == "Регион":
+                cross_kw["color_discrete_sequence"] = px.colors.qualitative.Dark24
+                cross_kw["hover_data"]["Регион"] = True
+            else:
+                cross_kw["color_continuous_scale"] = "Turbo"
+            figw = px.scatter(cross, **cross_kw)
             _apply_crossplot_hover(figw, "Кн_W_wmean=%{x:.3f}<br>Kng_BC_wmean=%{y:.3f}", cross)
             figw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+            figw.update_layout(legend_title_text="Регион" if cross_color == "Регион" else None)
             st.plotly_chart(figw, use_container_width=True)
             st.markdown("#### Невязка по кроссплоту (скважины)")
             cross_all_bc = _well_crossplot_table_from_result(bc_res, "Кн_W", "Kng_BC_model")
@@ -2639,8 +2628,89 @@ def _bc_results_dashboard_fragment() -> None:
                 show_metrics_help=True,
             )
 
+    bc_interactive_pvt = st.selectbox(
+        "Регион для интерактивного графика",
+        options=_pvt_region_select_options(pvt_opts),
+        key="bc_interactive_pvt",
+    )
+    g_inter = _filter_df_by_pvt_region(bc_res, bc_interactive_pvt)
+    g_inter = g_inter.dropna(subset=["Кн_W", "Kng_BC_model"])
+    g_conv = _filter_convergence_points(g_inter.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
+        columns={"Kng_model": "Kng_BC_model"}
+    )
+    if g_conv.empty:
+        st.warning("Нет валидных точек сходимости для интерактивного графика БК.")
+        return
 
-_bc_well_preview_run = st.fragment(_bc_well_preview_fragment) if hasattr(st, "fragment") else _bc_well_preview_fragment
+    st.markdown("#### Кроссплоты по скважинам (по всем точкам)")
+    all_regions_bc = _is_all_regions(bc_interactive_pvt)
+    if all_regions_bc:
+        g_conv = _add_pvt_region_column(g_conv)
+        bc_color: str | None = "Регион"
+    else:
+        bc_color_mode = st.radio("Палитра БК", options=("По весу", "По толщине"), horizontal=True, key="bc_scatter_color")
+        depth_col = _pick_depth_column(g_conv)
+        if bc_color_mode == "По толщине" and depth_col is not None and "WELL_NAME" in g_conv.columns:
+            g_conv[depth_col] = pd.to_numeric(g_conv[depth_col], errors="coerce")
+            tdf = g_conv.dropna(subset=[depth_col]).groupby("WELL_NAME")[depth_col].agg(["min", "max"]).reset_index()
+            tdf["thickness"] = tdf["max"] - tdf["min"]
+            g_conv = g_conv.merge(tdf[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left")
+            bc_color = "thickness"
+        else:
+            bc_color = "weight" if "weight" in g_conv.columns else None
+
+    scatter_kw: dict[str, object] = {
+        "x": "Кн_W",
+        "y": "Kng_BC_model",
+        "color": bc_color,
+        "hover_data": {
+            c: ":.3f"
+            for c in ["PC", "PORO_GDM", "Kng_BC_model", "Кн_W", "thickness", "weight", "Регион"]
+            if c in g_conv.columns
+        },
+        "title": f"{_region_plot_label(bc_interactive_pvt)}: предсказанное(историческое) (Брукса-Кори)",
+        "opacity": 0.75,
+        **_crossplot_hover_name_kw(g_conv),
+    }
+    if bc_color == "Регион":
+        scatter_kw["color_discrete_sequence"] = px.colors.qualitative.Dark24
+    else:
+        scatter_kw["color_continuous_scale"] = "Viridis"
+    fig = px.scatter(g_conv, **scatter_kw)
+    fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+    _apply_crossplot_hover(fig, "Кн_W=%{x:.3f}<br>Kng_BC_model=%{y:.3f}", g_conv)
+    fig.update_layout(legend_title_text="Регион" if bc_color == "Регион" else None)
+    st.plotly_chart(fig, use_container_width=True)
+
+    if g_conv.empty or "WELL_NAME" not in g_conv.columns:
+        return
+    st.subheader("Просмотр скважины (Брукса-Кори)")
+    wells = sorted(g_conv["WELL_NAME"].astype(str).unique().tolist())
+    well = _shared_well_selectbox(wells)
+    wd = g_conv[g_conv["WELL_NAME"].astype(str) == well].copy()
+    dcol = _pick_depth_column(wd)
+    if dcol is None:
+        st.warning("Не найдена колонка глубины для скважины.")
+    elif "ACTNUM_GDM" not in wd.columns:
+        st.warning("В данных отсутствует ACTNUM_GDM.")
+    else:
+        wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
+        wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
+        curve = wd[[dcol, "ACTNUM_GDM", "Кн_W", "Kng_BC_model"]].rename(
+            columns={"Кн_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
+        )
+        melt = curve.melt(
+            id_vars=[dcol],
+            value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"],
+            var_name="Кривая",
+            value_name="Значение",
+        )
+        fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
+        fig_prof.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
+        fig_prof.update_yaxes(autorange="reversed")
+        st.plotly_chart(fig_prof, use_container_width=True)
+
+
 _bc_results_dashboard_run = (
     st.fragment(_bc_results_dashboard_fragment) if hasattr(st, "fragment") else _bc_results_dashboard_fragment
 )
@@ -4042,7 +4112,7 @@ def leverett_tab() -> None:
         st.subheader("Метрики")
         qa_show = qa_df.copy()
         qa_show["PVTNUM_GDM"] = qa_show["PVTNUM_GDM"].astype(str)
-        st.dataframe(_round_df(qa_show.set_index("PVTNUM_GDM")), use_container_width=True)
+        st.dataframe(_round_df(_qa_table_for_display(qa_show).set_index("PVTNUM_GDM")), use_container_width=True)
         global_j = qa_df[qa_df["PVTNUM_GDM"].astype(str) == "Все регионы"]
         if not global_j.empty and np.isfinite(global_j.iloc[0]["SCORE"]):
             st.metric("SCORE (все регионы)", f"{float(global_j.iloc[0]['SCORE']):.3f}")
@@ -4095,16 +4165,18 @@ def leverett_tab() -> None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Интерактивные графики (Кн)")
     pvt_series = pd.to_numeric(result_df["PVTNUM_GDM"], errors="coerce")
     region_options = sorted(pvt_series.dropna().astype(int).unique().tolist())
     if not region_options:
         st.warning("В результатах отсутствуют валидные регионы PVTNUM_GDM.")
         return
 
-    region = st.selectbox("Регион (PVTNUM_GDM)", options=region_options)
-    region_mask = pd.to_numeric(result_df["PVTNUM_GDM"], errors="coerce") == float(region)
-    region_df_raw = result_df.loc[region_mask].copy()
+    region = st.selectbox(
+        "Регион (PVTNUM_GDM)",
+        options=_pvt_region_select_options(region_options),
+        key="j_crossplot_region",
+    )
+    region_df_raw = _filter_df_by_pvt_region(result_df, region)
     region_df = _filter_convergence_points(region_df_raw)
 
     if region_df.empty:
@@ -4113,53 +4185,6 @@ def leverett_tab() -> None:
 
     depth_col = _pick_depth_column(region_df)
 
-    color_mode = st.radio(
-        "Палитра точек на графике",
-        options=("По весу", "По толщине"),
-        horizontal=True,
-        key="scatter_color_mode",
-    )
-
-    depth_for_thickness = depth_col
-    if color_mode == "По толщине":
-        if depth_for_thickness is None:
-            st.warning("Колонка глубины не найдена, палитра автоматически переключена на веса.")
-            color_mode = "По весу"
-        elif "WELL_NAME" not in region_df.columns:
-            st.warning("Нет колонки WELL_NAME для расчета толщин, палитра переключена на веса.")
-            color_mode = "По весу"
-        else:
-            region_df[depth_for_thickness] = pd.to_numeric(region_df[depth_for_thickness], errors="coerce")
-            thickness_df = (
-                region_df.dropna(subset=[depth_for_thickness])
-                .groupby("WELL_NAME")[depth_for_thickness]
-                .agg(["min", "max"])
-                .reset_index()
-            )
-            thickness_df["thickness"] = thickness_df["max"] - thickness_df["min"]
-            region_df = region_df.merge(thickness_df[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left")
-
-    color_col = "weight"
-    if color_mode == "По толщине" and "thickness" in region_df.columns:
-        color_col = "thickness"
-
-    hover_cols, hover_metrics = _j_kng_interactive_hover(region_df, depth_col)
-    fig_scatter = px.scatter(
-        region_df,
-        x="Кн_W",
-        y="Kng_model",
-        color=color_col if color_col in region_df.columns else None,
-        color_continuous_scale="Viridis",
-        hover_data=hover_cols if hover_cols else None,
-        title=f"PVT {region}: предсказанное Кн(историческое) ({'вес' if color_col == 'weight' else 'толщина'})",
-        opacity=0.7,
-        **_crossplot_hover_name_kw(region_df),
-    )
-    fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-    _apply_crossplot_hover(fig_scatter, hover_metrics, region_df)
-    fig_scatter.update_layout(xaxis_title="Кн историческое (ГИС)", yaxis_title="Кн предсказанное")
-    st.plotly_chart(fig_scatter, use_container_width=True)
-
     st.subheader("Кроссплот по скважинам (средневзвешенные значения)")
     if "WELL_NAME" in region_df.columns:
         region_cross = _exclude_clipped_kng_zeros(region_df)
@@ -4167,21 +4192,32 @@ def leverett_tab() -> None:
         if cross_df.empty:
             st.info("Недостаточно данных для кроссплота по скважинам.")
         else:
-            fig_well_cross = px.scatter(
-                cross_df,
-                x="Кн_W_wmean",
-                y="Kng_model_wmean",
-                color="convergence_percent",
-                color_continuous_scale="Turbo",
-                hover_data={
+            if _is_all_regions(region):
+                cross_df = _merge_well_region_into_crossplot(cross_df, region_cross)
+            cross_color = (
+                "Регион"
+                if _is_all_regions(region) and "Регион" in cross_df.columns
+                else "convergence_percent"
+            )
+            cross_kw: dict[str, object] = {
+                "x": "Кн_W_wmean",
+                "y": "Kng_model_wmean",
+                "color": cross_color,
+                "hover_data": {
                     "points": ":.3f",
                     "avg_weight": ":.3f",
                     "convergence_percent": ":.3f",
                 },
-                title=f"PVT {region}: кроссплот по скважинам (средневзвешенно)",
-                opacity=0.85,
+                "title": f"{_region_plot_label(region)}: кроссплот по скважинам (средневзвешенно)",
+                "opacity": 0.85,
                 **_crossplot_hover_name_kw(cross_df),
-            )
+            }
+            if cross_color == "Регион":
+                cross_kw["color_discrete_sequence"] = px.colors.qualitative.Dark24
+                cross_kw["hover_data"]["Регион"] = True
+            else:
+                cross_kw["color_continuous_scale"] = "Turbo"
+            fig_well_cross = px.scatter(cross_df, **cross_kw)
             _apply_crossplot_hover(
                 fig_well_cross, "Кн_W_wmean=%{x:.3f}<br>Kng_model_wmean=%{y:.3f}", cross_df
             )
@@ -4189,6 +4225,7 @@ def leverett_tab() -> None:
             fig_well_cross.update_layout(
                 xaxis_title="Кн_W (средневзвеш.)",
                 yaxis_title="Kng_model (средневзвеш.)",
+                legend_title_text="Регион" if cross_color == "Регион" else None,
             )
             st.plotly_chart(fig_well_cross, use_container_width=True)
             st.markdown("#### Невязка по кроссплоту (скважины)")
@@ -4204,6 +4241,86 @@ def leverett_tab() -> None:
                 method_label="J-функция",
                 show_metrics_help=True,
             )
+
+    st.subheader("Интерактивные графики (Кн)")
+    interactive_region = st.selectbox(
+        "Регион для интерактивного графика",
+        options=_pvt_region_select_options(region_options),
+        key="j_interactive_region",
+    )
+    interactive_df_raw = _filter_df_by_pvt_region(result_df, interactive_region)
+    interactive_df = _filter_convergence_points(interactive_df_raw)
+    if interactive_df.empty:
+        st.warning("Для выбранного региона нет валидных точек для интерактивного графика.")
+    else:
+        depth_col_inter = _pick_depth_column(interactive_df)
+        all_regions_interactive = _is_all_regions(interactive_region)
+
+        if all_regions_interactive:
+            interactive_df = _add_pvt_region_column(interactive_df)
+            color_col: str | None = "Регион"
+            color_title_suffix = "регион"
+        else:
+            color_mode = st.radio(
+                "Палитра точек на графике",
+                options=("По весу", "По толщине"),
+                horizontal=True,
+                key="scatter_color_mode",
+            )
+
+            depth_for_thickness = depth_col_inter
+            if color_mode == "По толщине":
+                if depth_for_thickness is None:
+                    st.warning("Колонка глубины не найдена, палитра автоматически переключена на веса.")
+                    color_mode = "По весу"
+                elif "WELL_NAME" not in interactive_df.columns:
+                    st.warning("Нет колонки WELL_NAME для расчета толщин, палитра переключена на веса.")
+                    color_mode = "По весу"
+                else:
+                    interactive_df[depth_for_thickness] = pd.to_numeric(
+                        interactive_df[depth_for_thickness], errors="coerce"
+                    )
+                    thickness_df = (
+                        interactive_df.dropna(subset=[depth_for_thickness])
+                        .groupby("WELL_NAME")[depth_for_thickness]
+                        .agg(["min", "max"])
+                        .reset_index()
+                    )
+                    thickness_df["thickness"] = thickness_df["max"] - thickness_df["min"]
+                    interactive_df = interactive_df.merge(
+                        thickness_df[["WELL_NAME", "thickness"]], on="WELL_NAME", how="left"
+                    )
+
+            color_col = "weight"
+            if color_mode == "По толщине" and "thickness" in interactive_df.columns:
+                color_col = "thickness"
+            color_title_suffix = "вес" if color_col == "weight" else "толщина"
+
+        hover_cols, hover_metrics = _j_kng_interactive_hover(interactive_df, depth_col_inter)
+        scatter_kw: dict[str, object] = {
+            "x": "Кн_W",
+            "y": "Kng_model",
+            "color": color_col if color_col in interactive_df.columns else None,
+            "hover_data": hover_cols if hover_cols else None,
+            "title": (
+                f"{_region_plot_label(interactive_region)}: предсказанное Кн(историческое) ({color_title_suffix})"
+            ),
+            "opacity": 0.7,
+            **_crossplot_hover_name_kw(interactive_df),
+        }
+        if color_col == "Регион":
+            scatter_kw["color_discrete_sequence"] = px.colors.qualitative.Dark24
+        else:
+            scatter_kw["color_continuous_scale"] = "Viridis"
+        fig_scatter = px.scatter(interactive_df, **scatter_kw)
+        fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
+        _apply_crossplot_hover(fig_scatter, hover_metrics, interactive_df)
+        fig_scatter.update_layout(
+            xaxis_title="Кн историческое (ГИС)",
+            yaxis_title="Кн предсказанное",
+            legend_title_text="Регион" if color_col == "Регион" else None,
+        )
+        st.plotly_chart(fig_scatter, use_container_width=True)
 
     st.markdown(f"#### Аналитика по выбранному региону (PVTNUM={region})")
     region_wells_count = region_df["WELL_NAME"].astype(str).nunique() if "WELL_NAME" in region_df.columns else 0
@@ -4228,29 +4345,6 @@ def leverett_tab() -> None:
             }
         )
         st.dataframe(_round_df(weight_summary_ru.head(15)), use_container_width=True)
-
-    if not qa_df.empty:
-        qa_row = qa_df[qa_df["PVTNUM_GDM"] == int(region)]
-        if not qa_row.empty:
-            qa_row = qa_row.iloc[0]
-            recs = []
-            if qa_row["R2"] < 0.5:
-                recs.append("Низкий R2: сузьте диапазоны a/b или увеличьте maxiter/popsize.")
-            bias = float(qa_row["BIAS"])
-            if abs(bias) > 0.08:
-                if bias > 0:
-                    recs.append("BIAS > 0 (модель завышает Кн): попробуйте повысить sigma или немного снизить a.")
-                else:
-                    recs.append("BIAS < 0 (модель занижает Кн): попробуйте понизить sigma или немного повысить a.")
-            if qa_row["RMSE"] > 0.15:
-                recs.append("Повышенный RMSE: проверьте выбросы PC/PERM/PORO и очистку данных.")
-            if qa_row["SCORE"] < 0.75:
-                recs.append("Низкий SCORE: проверьте соответствие горизонтов PVTNUM и пересмотрите границы a/b.")
-            if not recs:
-                recs.append("Качество выглядит стабильным; при автограницах можно сузить горизонты в лаборатории.")
-            st.markdown("**Рекомендации**")
-            for rec in recs:
-                st.write(f"- {rec}")
 
     if "WELL_NAME" in region_df.columns:
         wells = sorted(region_df["WELL_NAME"].astype(str).unique().tolist())
@@ -4826,7 +4920,6 @@ def brooks_corey_tab() -> None:
         return
 
     _bc_results_dashboard_run()
-    _bc_well_preview_run()
     if not st.session_state.get("_scroll_to_top_pending"):
         restore_bc_scroll = bool(st.session_state.get("_bc_scroll_restore", True))
         _preserve_scroll_position(restore=restore_bc_scroll)
@@ -4847,6 +4940,7 @@ def compare_methods_tab() -> None:
 
 
 def main() -> None:
+    _inject_streamlit_ru_ui_styles()
     page = st.sidebar.radio("Раздел", options=["Лаборатория", "Подбор J функции Леверетта", "Брукса-Кори", "Сравнение методов"])
     prev_page = st.session_state.get("_active_page")
     if prev_page != page:
