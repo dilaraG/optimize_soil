@@ -1,0 +1,6 @@
+#!/Users/dilyaragazizova/Desktop/ИТМО/Диплом_новый/.venv/bin/python3.14
+import sys
+from xlutils.margins import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

@@ -267,7 +267,7 @@ def compute_soil_from_params(df: pd.DataFrame, params: dict[str, float]) -> np.n
     2) Кпр(Кво) — степень.
     3) Pvit(√(Кпр/Кп)), n(√(Кпр/Кп)) — степени; Кпр ограничена сверху (мД).
     4) Swat по Corey; если Swat>1 или Pc=0 → Swat=1; если Swat<0 → Swat=0.
-    5) Soil = 1 - Swat (сопоставление с Кнг нефти).
+    5) Soil = 1 - Swat (сопоставление с Кн нефти).
     """
     poro_col = "PORO_FRAC" if "PORO_FRAC" in df.columns else "PORO_GDM"
     poro = pd.to_numeric(df[poro_col], errors="coerce").to_numpy()
@@ -307,7 +307,7 @@ def compute_soil_from_params(df: pd.DataFrame, params: dict[str, float]) -> np.n
 
 
 def evaluate_brooks_score(df: pd.DataFrame, params: dict[str, float]) -> float:
-    y_true = pd.to_numeric(df["Кнг_W"], errors="coerce").to_numpy()
+    y_true = pd.to_numeric(df["Кн_W"], errors="coerce").to_numpy()
     w = pd.to_numeric(df.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
     y_pred = compute_soil_from_params(df, params)
     m = np.isfinite(y_true) & np.isfinite(y_pred) & np.isfinite(w)
@@ -369,23 +369,23 @@ def prepare_brooks_training_data(df_wells: pd.DataFrame, df_prod: pd.DataFrame |
 
 def _filter_target_like_j(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
-    out["Кнг_W"] = pd.to_numeric(out["Кнг_W"], errors="coerce")
-    out = out[out["Кнг_W"].notna() & (out["Кнг_W"] != 0)]
+    out["Кн_W"] = pd.to_numeric(out["Кн_W"], errors="coerce")
+    out = out[out["Кн_W"].notna() & (out["Кн_W"] != 0)]
     if "WELL_NAME" not in out.columns or out.empty:
         return out
     keep_idx: list[int] = []
     for _, g in out.groupby("WELL_NAME"):
-        x = g["Кнг_W"].to_numpy(dtype=float)
+        x = g["Кн_W"].to_numpy(dtype=float)
         if len(x) < 6:
             keep_idx.extend(g.index.tolist())
             continue
         q1, q3 = np.quantile(x, [0.25, 0.75])
         iqr = q3 - q1
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        keep = g[(g["Кнг_W"] >= lo) & (g["Кнг_W"] <= hi)]
+        keep = g[(g["Кн_W"] >= lo) & (g["Кн_W"] <= hi)]
         if len(keep) < max(5, int(0.5 * len(g))):
             ql, qh = np.quantile(x, [0.02, 0.98])
-            keep = g[(g["Кнг_W"] >= ql) & (g["Кнг_W"] <= qh)]
+            keep = g[(g["Кн_W"] >= ql) & (g["Кн_W"] <= qh)]
         keep_idx.extend(keep.index.tolist())
     return out.loc[sorted(set(keep_idx))]
 
@@ -453,7 +453,7 @@ def optimize_brooks_corey_for_region(
 ) -> dict[str, float]:
     """
     Подбор параметров глобальной оптимизацией (differential_evolution / dual_annealing / pso):
-    взвешенный Huber по невязке Кнг + штраф за огибающие лаборатории.
+    взвешенный Huber по невязке Кн + штраф за огибающие лаборатории.
     """
     train = _filter_target_like_j(df_region)
     if train.empty:
@@ -477,7 +477,7 @@ def optimize_brooks_corey_for_region(
         bounds["n"].a,
         bounds["n"].b,
     ]
-    y_true = pd.to_numeric(train["Кнг_W"], errors="coerce").to_numpy()
+    y_true = pd.to_numeric(train["Кн_W"], errors="coerce").to_numpy()
     w = pd.to_numeric(train.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
 
     def _penalty_for_envelope(p: dict[str, float]) -> float:

@@ -47,7 +47,10 @@ from optimize import (
     DEFAULT_LOW_SWN_THRESHOLD,
     _timing_table_with_total,
     apply_low_swn_j_cap,
+    j_at_swn_threshold,
+    low_swn_j_cap_required,
     j_power_from_swn,
+    normalize_kn_column_names,
     run_pipeline,
 )
 
@@ -158,8 +161,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 SNAPSHOT_REQUIRED_COLUMNS = (
     "WELL_NAME",
     "_AXIS",
-    "Кнг_hist",
-    "Кнг_model",
+    "Кн_hist",
+    "Кн_model",
     "METHOD",
     "SNAPSHOT_ID",
     "SNAPSHOT_LABEL",
@@ -260,7 +263,7 @@ def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
     df.columns = (
         df.columns.astype(str).str.strip().str.replace('"', "", regex=False).str.replace("\ufeff", "", regex=False)
     )
-    return df
+    return normalize_kn_column_names(df)
 
 
 # Не участвует в фильтрации и не обязателен в выгрузке скважин.
@@ -404,8 +407,8 @@ def _clean_wells_df(
         )
     if "PC" in df.columns:
         df = df.loc[df["PC"] >= 0.01]
-    if "Кнг_W" in df.columns:
-        df.loc[df["Кнг_W"] > 1, "Кнг_W"] = df["Кнг_W"] / 100
+    if "Кн_W" in df.columns:
+        df.loc[df["Кн_W"] > 1, "Кн_W"] = df["Кн_W"] / 100
     return df.reset_index(drop=True)
 
 
@@ -456,8 +459,8 @@ def _series_1d(df: pd.DataFrame, col: str, *fallbacks: str) -> pd.Series:
 def _well_convergence_percent_weighted(df: pd.DataFrame) -> float:
     """Средневзвешенный процент сходимости: веса из колонки weight (если есть)."""
     eps = 1e-6
-    true_vals = _series_1d(df, "Кнг_W", "Кнг_hist")
-    pred_vals = _series_1d(df, "Kng_model", "Кнг_model")
+    true_vals = _series_1d(df, "Кн_W", "Кн_hist")
+    pred_vals = _series_1d(df, "Kng_model", "Кн_model")
     w = _series_1d(df, "weight").fillna(1.0).to_numpy(dtype=float)
     valid = (true_vals.notna() & pred_vals.notna()).to_numpy()
     if valid.sum() == 0:
@@ -475,38 +478,38 @@ def _well_convergence_percent_weighted(df: pd.DataFrame) -> float:
 
 def _filter_convergence_points(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Для кроссплотов: исключаем нули и выбросы Кнг_W по каждой скважине.
+    Для кроссплотов: исключаем нули и выбросы Кн_W по каждой скважине.
     """
     out = df.copy()
-    out["Кнг_W"] = pd.to_numeric(out["Кнг_W"], errors="coerce")
+    out["Кн_W"] = pd.to_numeric(out["Кн_W"], errors="coerce")
     out["Kng_model"] = pd.to_numeric(out["Kng_model"], errors="coerce")
-    out = out.dropna(subset=["Кнг_W", "Kng_model"])
-    out = out[out["Кнг_W"] != 0]
+    out = out.dropna(subset=["Кн_W", "Kng_model"])
+    out = out[out["Кн_W"] != 0]
     if out.empty or "WELL_NAME" not in out.columns:
         return out
 
     keep_idx: list[int] = []
     for _, g in out.groupby("WELL_NAME"):
-        x = g["Кнг_W"].to_numpy(dtype=float)
+        x = g["Кн_W"].to_numpy(dtype=float)
         if len(x) < 6:
             keep_idx.extend(g.index.tolist())
             continue
         q1, q3 = np.quantile(x, [0.25, 0.75])
         iqr = q3 - q1
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        keep = g[(g["Кнг_W"] >= lo) & (g["Кнг_W"] <= hi)]
+        keep = g[(g["Кн_W"] >= lo) & (g["Кн_W"] <= hi)]
         if len(keep) < max(5, int(0.5 * len(g))):
             ql, qh = np.quantile(x, [0.02, 0.98])
-            keep = g[(g["Кнг_W"] >= ql) & (g["Кнг_W"] <= qh)]
+            keep = g[(g["Кн_W"] >= ql) & (g["Кн_W"] <= qh)]
         keep_idx.extend(keep.index.tolist())
     return out.loc[sorted(set(keep_idx))].copy()
 
 
 def _exclude_clipped_kng_zeros(df: pd.DataFrame) -> pd.DataFrame:
-    """Исключить точки, где Kng_model=0 при ненулевом Кнг_W (обрезка модели)."""
+    """Исключить точки, где Kng_model=0 при ненулевом Кн_W (обрезка модели)."""
     out = df.copy()
-    y_true = _series_1d(out, "Кнг_W", "Кнг_hist")
-    y_pred = _series_1d(out, "Kng_model", "Кнг_model")
+    y_true = _series_1d(out, "Кн_W", "Кн_hist")
+    y_pred = _series_1d(out, "Kng_model", "Кн_model")
     clip = (y_pred == 0) & y_true.notna() & (y_true != 0)
     return out.loc[~clip].copy()
 
@@ -516,8 +519,8 @@ def _well_weighted_crossplot_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     rows = []
     for well, g in df.groupby("WELL_NAME"):
-        y_true = _series_1d(g, "Кнг_W", "Кнг_hist")
-        y_pred = _series_1d(g, "Kng_model", "Кнг_model")
+        y_true = _series_1d(g, "Кн_W", "Кн_hist")
+        y_pred = _series_1d(g, "Kng_model", "Кн_model")
         w = _series_1d(g, "weight").fillna(1.0) if "weight" in g.columns else pd.Series(1.0, index=g.index)
         valid = y_true.notna() & y_pred.notna()
         if valid.sum() == 0:
@@ -531,7 +534,7 @@ def _well_weighted_crossplot_df(df: pd.DataFrame) -> pd.DataFrame:
         rows.append(
             {
                 "WELL_NAME": str(well),
-                "Кнг_W_wmean": float(np.sum(ww * t) / ws),
+                "Кн_W_wmean": float(np.sum(ww * t) / ws),
                 "Kng_model_wmean": float(np.sum(ww * p) / ws),
                 "convergence_percent": _well_convergence_percent_weighted(g),
                 "points": int(valid.sum()),
@@ -560,7 +563,7 @@ def _apply_crossplot_hover(fig, metrics_lines: str, df: pd.DataFrame) -> None:
 
 
 def _j_kng_interactive_hover(df: pd.DataFrame, depth_col: str | None) -> tuple[list[str], str]:
-    """Колонки hover_data и шаблон подсказки для scatter Кнг (FWL, глубина, прочие поля)."""
+    """Колонки hover_data и шаблон подсказки для scatter Кн (FWL, глубина, прочие поля)."""
     hover_cols: list[str] = []
     label_by_col: dict[str, str] = {}
     if "FWL_GDM" in df.columns:
@@ -573,18 +576,18 @@ def _j_kng_interactive_hover(df: pd.DataFrame, depth_col: str | None) -> tuple[l
         if c in df.columns and c not in hover_cols:
             hover_cols.append(c)
             label_by_col[c] = c
-    lines = ["Кнг_W=%{x:.3f}", "Kng_model=%{y:.3f}"]
+    lines = ["Кн_W=%{x:.3f}", "Kng_model=%{y:.3f}"]
     for i, col in enumerate(hover_cols):
         lines.append(f"{label_by_col[col]}=%{{customdata[{i}]:.3f}}")
     return hover_cols, "<br>".join(lines)
 
 
 def _crossplot_points_from_snapshot(df_snap: pd.DataFrame) -> pd.DataFrame:
-    """Точки для кроссплота: без Кнг_hist = 0."""
-    if df_snap.empty or "Кнг_hist" not in df_snap.columns or "Кнг_model" not in df_snap.columns:
+    """Точки для кроссплота: без Кн_hist = 0."""
+    if df_snap.empty or "Кн_hist" not in df_snap.columns or "Кн_model" not in df_snap.columns:
         return pd.DataFrame()
-    y = pd.to_numeric(df_snap["Кнг_hist"], errors="coerce")
-    p = pd.to_numeric(df_snap["Кнг_model"], errors="coerce")
+    y = pd.to_numeric(df_snap["Кн_hist"], errors="coerce")
+    p = pd.to_numeric(df_snap["Кн_model"], errors="coerce")
     mask = y.notna() & p.notna() & (y.abs() > 1e-15)
     return df_snap.loc[mask].copy()
 
@@ -595,8 +598,8 @@ def _build_well_crossplot_table(df_snap: pd.DataFrame) -> pd.DataFrame:
     if src.empty:
         return pd.DataFrame()
     src = src.copy()
-    src["Кнг_W"] = _series_1d(src, "Кнг_hist", "Кнг_W")
-    src["Kng_model"] = _series_1d(src, "Кнг_model", "Kng_model")
+    src["Кн_W"] = _series_1d(src, "Кн_hist", "Кн_W")
+    src["Kng_model"] = _series_1d(src, "Кн_model", "Kng_model")
     if "weight" not in src.columns:
         src["weight"] = 1.0
     cross = _well_weighted_crossplot_df(src)
@@ -617,15 +620,15 @@ def _build_well_crossplot_table(df_snap: pd.DataFrame) -> pd.DataFrame:
 
 def _well_crossplot_table_from_result(
     df: pd.DataFrame | None,
-    hist_col: str = "Кнг_W",
+    hist_col: str = "Кн_W",
     model_col: str = "Kng_model",
 ) -> pd.DataFrame:
     """Таблица точек кроссплота по всему результату расчёта (для разбивки по PVTNUM)."""
     if df is None or df.empty or hist_col not in df.columns or model_col not in df.columns:
         return pd.DataFrame()
     snap: dict[str, pd.Series] = {
-        "Кнг_hist": pd.to_numeric(df[hist_col], errors="coerce"),
-        "Кнг_model": pd.to_numeric(df[model_col], errors="coerce"),
+        "Кн_hist": pd.to_numeric(df[hist_col], errors="coerce"),
+        "Кн_model": pd.to_numeric(df[model_col], errors="coerce"),
     }
     if "WELL_NAME" in df.columns:
         snap["WELL_NAME"] = df["WELL_NAME"].astype(str)
@@ -643,13 +646,13 @@ def _crossplot_qa_metrics_help_expander(key: str) -> None:
     with st.expander("Что означают метрики в таблице", expanded=False):
         st.markdown(
             """
-Каждая **скважина** на кроссплоте — одна точка: средневзвешенные по стволу Кнг истории и модели
-(без ячеек с Кнг_hist = 0).
+Каждая **скважина** на кроссплоте — одна точка: средневзвешенные по стволу Кн истории и модели
+(без ячеек с Кн_hist = 0).
 
 | Метрика | Смысл |
 |---------|--------|
 | **Скважин** | Число скважин, вошедших в расчёт по региону (или по всем регионам в первой строке). |
-| **MAE** | Средняя абсолютная невязка «модель − история» по скважинам (в долях Кнг). Чем меньше, тем ближе к диагонали в среднем. |
+| **MAE** | Средняя абсолютная невязка «модель − история» по скважинам (в долях Кн). Чем меньше, тем ближе к диагонали в среднем. |
 | **SCORE** | 1 минус взвешенная средняя абсолютная невязка (как в таблице метрик качества). Ближе к **1** — лучше. |
 | **Сходимость, %** | Насколько точки скважин в среднем близки к диагонали y = x (100 % — идеальное попадание). Удобна для сравнения с графиком. |
             """
@@ -791,16 +794,16 @@ def _compute_qa_metrics(df: pd.DataFrame, true_col: str, pred_col: str) -> pd.Da
 
 def _qa_metrics_from_snapshot(df_snap: pd.DataFrame) -> pd.DataFrame:
     """Метрики по снимку скважин — та же формула, что на вкладках J и БК (_compute_qa_metrics)."""
-    if df_snap.empty or "Кнг_hist" not in df_snap.columns or "Кнг_model" not in df_snap.columns:
+    if df_snap.empty or "Кн_hist" not in df_snap.columns or "Кн_model" not in df_snap.columns:
         return pd.DataFrame()
     work = df_snap.copy()
     if "PVTNUM_GDM" not in work.columns:
         work["PVTNUM_GDM"] = 0
-    qa = _compute_qa_metrics(work, "Кнг_hist", "Кнг_model")
+    qa = _compute_qa_metrics(work, "Кн_hist", "Кн_model")
 
     def _n_points(g: pd.DataFrame) -> int:
-        y = pd.to_numeric(g["Кнг_hist"], errors="coerce")
-        p = pd.to_numeric(g["Кнг_model"], errors="coerce")
+        y = pd.to_numeric(g["Кн_hist"], errors="coerce")
+        p = pd.to_numeric(g["Кн_model"], errors="coerce")
         w = pd.to_numeric(g.get("weight", 1.0), errors="coerce")
         return int((y.notna() & p.notna() & w.notna()).sum())
 
@@ -817,7 +820,7 @@ def _qa_metrics_from_snapshot(df_snap: pd.DataFrame) -> pd.DataFrame:
 
 
 def _build_well_snapshot(df: pd.DataFrame, model_col: str) -> pd.DataFrame:
-    if "WELL_NAME" not in df.columns or "Кнг_W" not in df.columns or model_col not in df.columns:
+    if "WELL_NAME" not in df.columns or "Кн_W" not in df.columns or model_col not in df.columns:
         return pd.DataFrame()
     work = df.copy()
     work["WELL_NAME"] = work["WELL_NAME"].astype(str)
@@ -828,16 +831,16 @@ def _build_well_snapshot(df: pd.DataFrame, model_col: str) -> pd.DataFrame:
     else:
         work["_AXIS"] = pd.to_numeric(work[depth_col], errors="coerce")
         axis_kind = "depth"
-    work["Кнг_hist"] = pd.to_numeric(work["Кнг_W"], errors="coerce")
-    work["Кнг_model"] = pd.to_numeric(work[model_col], errors="coerce")
-    keep_cols = ["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"]
+    work["Кн_hist"] = pd.to_numeric(work["Кн_W"], errors="coerce")
+    work["Кн_model"] = pd.to_numeric(work[model_col], errors="coerce")
+    keep_cols = ["WELL_NAME", "_AXIS", "Кн_hist", "Кн_model"]
     if "PVTNUM_GDM" in work.columns:
         keep_cols.append("PVTNUM_GDM")
     if "weight" in work.columns:
         keep_cols.append("weight")
     if "ACTNUM_GDM" in work.columns:
         keep_cols.append("ACTNUM_GDM")
-    out = work[keep_cols].dropna(subset=["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"]).copy()
+    out = work[keep_cols].dropna(subset=["WELL_NAME", "_AXIS", "Кн_hist", "Кн_model"]).copy()
     if out.empty:
         return out
     out["AXIS_KIND"] = axis_kind
@@ -848,7 +851,7 @@ def _build_well_snapshot(df: pd.DataFrame, model_col: str) -> pd.DataFrame:
 def _save_well_snapshot(df: pd.DataFrame, model_col: str, method_tag: str) -> tuple[bool, str]:
     snap = _build_well_snapshot(df, model_col=model_col)
     if snap.empty:
-        return False, "Не удалось сохранить: нет валидных скважинных точек (WELL_NAME/Кнг_W/модель)."
+        return False, "Не удалось сохранить: нет валидных скважинных точек (WELL_NAME/Кн_W/модель)."
     now = pd.Timestamp.now()
     snap_id = f"{method_tag}-{now.strftime('%Y%m%d-%H%M%S')}"
     snap["METHOD"] = method_tag
@@ -935,10 +938,10 @@ def _normalize_loaded_snapshots(df: pd.DataFrame) -> pd.DataFrame:
         work["SAVED_AT"] = pd.Timestamp.now().isoformat()
     if "AXIS_KIND" not in work.columns:
         work["AXIS_KIND"] = "depth"
-    for col in ("Кнг_hist", "Кнг_model", "_AXIS"):
+    for col in ("Кн_hist", "Кн_model", "_AXIS"):
         work[col] = pd.to_numeric(work[col], errors="coerce")
     work["WELL_NAME"] = work["WELL_NAME"].astype(str)
-    work = work.dropna(subset=["WELL_NAME", "_AXIS", "Кнг_hist", "Кнг_model"])
+    work = work.dropna(subset=["WELL_NAME", "_AXIS", "Кн_hist", "Кн_model"])
     if work.empty:
         raise ValueError("После проверки не осталось валидных строк снимка.")
     return work.reset_index(drop=True)
@@ -1120,21 +1123,68 @@ def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
         help="Полный или относительный путь, например data/snapshots/имя.csv",
     )
     snaps = _get_well_method_snapshots()
+    if not snaps.empty:
+        st.markdown("**Какие снимки сохранить**")
+        # выбор по методам
+        available_methods = sorted(set(snaps.get("METHOD", pd.Series([], dtype=str)).astype(str).unique()) & {"J", "BC"})
+        default_methods = available_methods if available_methods else ["J", "BC"]
+        sel_methods = st.multiselect(
+            "Методы",
+            options=available_methods or ["J", "BC"],
+            default=default_methods,
+            key=f"{key_prefix}_save_methods",
+            help="Можно сохранить только J, только БК или оба метода.",
+        )
+
+        # выбор конкретных снимков (по каталогу)
+        cat_rows: list[tuple[str, str]] = []
+        for m in ("J", "BC"):
+            cat = _snapshot_catalog(m)
+            if cat is None or cat.empty:
+                continue
+            for _, r in cat.iterrows():
+                sid = str(r.get("SNAPSHOT_ID", "")).strip()
+                lab = str(r.get("SNAPSHOT_LABEL", sid)).strip()
+                if sid:
+                    cat_rows.append((sid, lab))
+        # уникальные по id, сохраняя порядок
+        seen = set()
+        cat_rows = [(sid, lab) for sid, lab in cat_rows if not (sid in seen or seen.add(sid))]
+        snap_id_options = [sid for sid, _ in cat_rows]
+        snap_id_labels = {sid: lab for sid, lab in cat_rows}
+        sel_ids = st.multiselect(
+            "Конкретные снимки (необязательно)",
+            options=snap_id_options,
+            default=[],
+            format_func=lambda sid: snap_id_labels.get(sid, sid),
+            key=f"{key_prefix}_save_ids",
+            help="Если список пуст — сохраняются все снимки выбранных методов. Если выбрать ID — сохранятся только они.",
+        )
+
+        snaps_to_save = snaps.copy()
+        if sel_methods:
+            snaps_to_save = snaps_to_save[snaps_to_save["METHOD"].astype(str).isin(sel_methods)]
+        if sel_ids:
+            snaps_to_save = snaps_to_save[snaps_to_save["SNAPSHOT_ID"].astype(str).isin(sel_ids)]
+        st.caption(f"Будет сохранено строк: **{len(snaps_to_save)}**.")
+    else:
+        snaps_to_save = snaps
+
     b_save, b_pick, b_dl = st.columns([2, 2, 2])
     with b_save:
         if st.button("Сохранить в файл", type="primary", key=f"{key_prefix}_save_btn", use_container_width=True):
-            if snaps.empty:
+            if snaps_to_save.empty:
                 st.warning("Нет снимков. Сначала «Запомнить» на вкладках J и/или БК.")
             else:
                 try:
                     save_path_str = str(st.session_state.get(save_path_key, ""))
                     out_path = _resolve_snapshot_path(save_path_str, default_filename=default_name)
-                    _write_snapshots_file(out_path, snaps)
+                    _write_snapshots_file(out_path, snaps_to_save)
                     if str(out_path) != save_path_str.strip():
                         st.session_state[save_path_pending_key] = str(out_path)
                         st.rerun()
                     else:
-                        st.success(f"Сохранено {len(snaps)} строк → `{out_path}`")
+                        st.success(f"Сохранено {len(snaps_to_save)} строк → `{out_path}`")
                 except (OSError, ValueError) as e:
                     st.error(str(e))
     with b_pick:
@@ -1146,10 +1196,10 @@ def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
             elif err:
                 st.warning(err)
     with b_dl:
-        if not snaps.empty:
+        if not snaps_to_save.empty:
             st.download_button(
                 "Скачать CSV",
-                data=_csv_bytes(snaps),
+                data=_csv_bytes(snaps_to_save),
                 file_name=default_name,
                 mime="text/csv",
                 key=f"{key_prefix}_download",
@@ -1209,10 +1259,10 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         if df_snap.empty:
             return pd.DataFrame()
         work = df_snap.copy()
-        work["Кнг_hist"] = pd.to_numeric(work["Кнг_hist"], errors="coerce")
-        work["Кнг_model"] = pd.to_numeric(work["Кнг_model"], errors="coerce")
+        work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
+        work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
         work["weight"] = pd.to_numeric(work.get("weight", 1.0), errors="coerce").fillna(1.0)
-        work = work[np.isfinite(work["Кнг_hist"]) & np.isfinite(work["Кнг_model"]) & (work["weight"] > 0)]
+        work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"]) & (work["weight"] > 0)]
         if work.empty:
             return pd.DataFrame()
 
@@ -1221,12 +1271,12 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             sw = float(np.sum(w))
             if sw <= 0:
                 return None
-            hist_w = float(np.sum(w * g["Кнг_hist"].to_numpy(dtype=float)) / sw)
-            model_w = float(np.sum(w * g["Кнг_model"].to_numpy(dtype=float)) / sw)
+            hist_w = float(np.sum(w * g["Кн_hist"].to_numpy(dtype=float)) / sw)
+            model_w = float(np.sum(w * g["Кн_model"].to_numpy(dtype=float)) / sw)
             return {
                 "Регион": label,
-                "Средневзвешенное Кнг (история)": hist_w,
-                "Средневзвешенное Кнг (модель)": model_w,
+                "Средневзвешенное Кн (история)": hist_w,
+                "Средневзвешенное Кн (модель)": model_w,
                 "Дельта": model_w - hist_w,
                 "Точек": int(len(g)),
             }
@@ -1252,7 +1302,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         return tab
 
     def _kng_hist_stats(arr: np.ndarray) -> list[float]:
-        """Сводные по истории: без точек с Кнг_hist = 0 (нефтяные интервалы)."""
+        """Сводные по истории: без точек с Кн_hist = 0 (нефтяные интервалы)."""
         a = arr[np.isfinite(arr) & (arr > 1e-15)]
         if a.size == 0:
             return [np.nan] * 5
@@ -1280,17 +1330,17 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         if df_snap.empty:
             return pd.DataFrame(), pd.DataFrame()
         work = df_snap.copy()
-        work["Кнг_hist"] = pd.to_numeric(work["Кнг_hist"], errors="coerce")
-        work["Кнг_model"] = pd.to_numeric(work["Кнг_model"], errors="coerce")
-        work = work[np.isfinite(work["Кнг_hist"]) & np.isfinite(work["Кнг_model"])]
+        work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
+        work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
+        work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"])]
         if work.empty:
             return pd.DataFrame(), pd.DataFrame()
         if (region_pick != "Все регионы") and ("PVTNUM_GDM" in work.columns):
             work = work[work["PVTNUM_GDM"].astype(str) == str(region_pick)]
         if work.empty:
             return pd.DataFrame(), pd.DataFrame()
-        hist = work["Кнг_hist"].to_numpy(dtype=float)
-        model = work["Кнг_model"].to_numpy(dtype=float)
+        hist = work["Кн_hist"].to_numpy(dtype=float)
+        model = work["Кн_model"].to_numpy(dtype=float)
         lo = float(np.nanmin(np.r_[hist, model]))
         hi = float(np.nanmax(np.r_[hist, model]))
         if not np.isfinite(lo) or not np.isfinite(hi):
@@ -1336,11 +1386,11 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         for frame in (j, b):
             frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce")
             frame["WELL_NAME"] = frame["WELL_NAME"].astype(str)
-        mj = j[["WELL_NAME", "_AXIS_R", "Кнг_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
-            columns={"Кнг_model": "J_model", "PVTNUM_GDM": "PVT_J"}
+        mj = j[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
+            columns={"Кн_model": "J_model", "PVTNUM_GDM": "PVT_J"}
         )
-        mb = b[["WELL_NAME", "_AXIS_R", "Кнг_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in b.columns else [])].rename(
-            columns={"Кнг_model": "BC_model", "PVTNUM_GDM": "PVT_BC"}
+        mb = b[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in b.columns else [])].rename(
+            columns={"Кн_model": "BC_model", "PVTNUM_GDM": "PVT_BC"}
         )
         m = mj.merge(mb, on=["WELL_NAME", "_AXIS_R"], how="inner")
         if m.empty:
@@ -1437,7 +1487,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     st.markdown("### Метрики по каждому методу (по горизонтам, Регион)")
     st.caption(
         "Те же взвешенные MAE/RMSE/BIAS/R²/SCORE, что на вкладках J и БК после расчёта "
-        "(по сохранённому снимку). На кроссплотах ниже по-прежнему не учитываются точки с Кнг_hist = 0."
+        "(по сохранённому снимку). На кроссплотах ниже по-прежнему не учитываются точки с Кн_hist = 0."
     )
     tab_j = _qa_metrics_from_snapshot(sj)
     tab_b = _qa_metrics_from_snapshot(sb)
@@ -1450,15 +1500,15 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     sj_x = _crossplot_df(sj)
     sb_x = _crossplot_df(sb)
     if sj_x.empty:
-        c3.info("Нет точек для кроссплота J после исключения Кнг_hist = 0.")
+        c3.info("Нет точек для кроссплота J после исключения Кн_hist = 0.")
     else:
         sj_plot = sj_x.copy()
         if "PVTNUM_GDM" in sj_plot.columns:
             sj_plot["Регион"] = pd.to_numeric(sj_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
         fig_j = px.scatter(
             sj_plot,
-            x="Кнг_hist",
-            y="Кнг_model",
+            x="Кн_hist",
+            y="Кн_model",
             color="Регион" if "Регион" in sj_plot.columns else None,
             color_discrete_sequence=px.colors.qualitative.Dark24,
             hover_data=[c for c in ["_AXIS", "Регион"] if c in sj_plot.columns],
@@ -1467,19 +1517,19 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             **_crossplot_hover_name_kw(sj_plot),
         )
         fig_j.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-        _apply_crossplot_hover(fig_j, "Кнг_hist=%{x:.3f}<br>Кнг_model=%{y:.3f}", sj_plot)
+        _apply_crossplot_hover(fig_j, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sj_plot)
         fig_j.update_layout(legend_title_text="Регион")
         c3.plotly_chart(fig_j, use_container_width=True)
     if sb_x.empty:
-        c4.info("Нет точек для кроссплота БК после исключения Кнг_hist = 0.")
+        c4.info("Нет точек для кроссплота БК после исключения Кн_hist = 0.")
     else:
         sb_plot = sb_x.copy()
         if "PVTNUM_GDM" in sb_plot.columns:
             sb_plot["Регион"] = pd.to_numeric(sb_plot["PVTNUM_GDM"], errors="coerce").astype("Int64").astype(str)
         fig_bc = px.scatter(
             sb_plot,
-            x="Кнг_hist",
-            y="Кнг_model",
+            x="Кн_hist",
+            y="Кн_model",
             color="Регион" if "Регион" in sb_plot.columns else None,
             color_discrete_sequence=px.colors.qualitative.Dark24,
             hover_data=[c for c in ["_AXIS", "Регион"] if c in sb_plot.columns],
@@ -1488,7 +1538,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             **_crossplot_hover_name_kw(sb_plot),
         )
         fig_bc.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-        _apply_crossplot_hover(fig_bc, "Кнг_hist=%{x:.3f}<br>Кнг_model=%{y:.3f}", sb_plot)
+        _apply_crossplot_hover(fig_bc, "Кн_hist=%{x:.3f}<br>Кн_model=%{y:.3f}", sb_plot)
         fig_bc.update_layout(legend_title_text="Регион")
         c4.plotly_chart(fig_bc, use_container_width=True)
 
@@ -1515,7 +1565,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                     color="Источник",
                     barmode="overlay",
                     opacity=0.6,
-                    title=f"J-функция: распределение Кнг ({reg_pick})",
+                    title=f"J-функция: распределение Кн ({reg_pick})",
                 )
                 fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
                 cc1.plotly_chart(fig_h, use_container_width=True)
@@ -1556,7 +1606,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                     color="Источник",
                     barmode="overlay",
                     opacity=0.6,
-                    title=f"Брукс-Кори: распределение Кнг ({reg_pick})",
+                    title=f"Брукс-Кори: распределение Кн ({reg_pick})",
                 )
                 fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
                 cc1.plotly_chart(fig_h, use_container_width=True)
@@ -1598,7 +1648,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 color="Модель",
                 barmode="overlay",
                 opacity=0.6,
-                title=f"Распределения предсказанной Кнг: J vs БК ({reg_pick})",
+                title=f"Распределения предсказанной Кн: J vs БК ({reg_pick})",
             )
             fig_cmp.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
             c1.plotly_chart(fig_cmp, use_container_width=True)
@@ -1626,7 +1676,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     if sj_cross_src.empty:
         cw1.info("Недостаточно данных для кроссплота по скважинам (J).")
     else:
-        sj_cross_src = sj_cross_src.rename(columns={"Кнг_hist": "Кнг_W", "Кнг_model": "Kng_model"})
+        sj_cross_src = sj_cross_src.rename(columns={"Кн_hist": "Кн_W", "Кн_model": "Kng_model"})
         if "weight" not in sj_cross_src.columns:
             sj_cross_src["weight"] = 1.0
         sj_cross = _well_weighted_crossplot_df(sj_cross_src)
@@ -1645,7 +1695,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 sj_cross = sj_cross.merge(well_region_j, on="WELL_NAME", how="left")
             fig_jw = px.scatter(
                 sj_cross,
-                x="Кнг_W_wmean",
+                x="Кн_W_wmean",
                 y="Kng_model_wmean",
                 color="Регион" if "Регион" in sj_cross.columns else None,
                 color_discrete_sequence=px.colors.qualitative.Dark24,
@@ -1659,11 +1709,11 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 opacity=0.85,
                 **_crossplot_hover_name_kw(sj_cross),
             )
-            _apply_crossplot_hover(fig_jw, "Кнг_hist_wmean=%{x:.3f}<br>Кнг_J_wmean=%{y:.3f}", sj_cross)
+            _apply_crossplot_hover(fig_jw, "Кн_hist_wmean=%{x:.3f}<br>Кн_J_wmean=%{y:.3f}", sj_cross)
             fig_jw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             fig_jw.update_layout(
-                xaxis_title="Кнг_hist (средневзвеш.)",
-                yaxis_title="Кнг_J (средневзвеш.)",
+                xaxis_title="Кн_hist (средневзвеш.)",
+                yaxis_title="Кн_J (средневзвеш.)",
                 legend_title_text="Регион",
             )
             cw1.plotly_chart(fig_jw, use_container_width=True)
@@ -1673,7 +1723,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     if sb_cross_src.empty:
         cw2.info("Недостаточно данных для кроссплота по скважинам (БК).")
     else:
-        sb_cross_src = sb_cross_src.rename(columns={"Кнг_hist": "Кнг_W", "Кнг_model": "Kng_model"})
+        sb_cross_src = sb_cross_src.rename(columns={"Кн_hist": "Кн_W", "Кн_model": "Kng_model"})
         if "weight" not in sb_cross_src.columns:
             sb_cross_src["weight"] = 1.0
         sb_cross = _well_weighted_crossplot_df(sb_cross_src).rename(columns={"Kng_model_wmean": "Kng_BC_wmean"})
@@ -1692,7 +1742,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 sb_cross = sb_cross.merge(well_region_b, on="WELL_NAME", how="left")
             fig_bw = px.scatter(
                 sb_cross,
-                x="Кнг_W_wmean",
+                x="Кн_W_wmean",
                 y="Kng_BC_wmean",
                 color="Регион" if "Регион" in sb_cross.columns else None,
                 color_discrete_sequence=px.colors.qualitative.Dark24,
@@ -1706,11 +1756,11 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
                 opacity=0.85,
                 **_crossplot_hover_name_kw(sb_cross),
             )
-            _apply_crossplot_hover(fig_bw, "Кнг_hist_wmean=%{x:.3f}<br>Кнг_БК_wmean=%{y:.3f}", sb_cross)
+            _apply_crossplot_hover(fig_bw, "Кн_hist_wmean=%{x:.3f}<br>Кн_БК_wmean=%{y:.3f}", sb_cross)
             fig_bw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             fig_bw.update_layout(
-                xaxis_title="Кнг_hist (средневзвеш.)",
-                yaxis_title="Кнг_БК (средневзвеш.)",
+                xaxis_title="Кн_hist (средневзвеш.)",
+                yaxis_title="Кн_БК (средневзвеш.)",
                 legend_title_text="Регион",
             )
             cw2.plotly_chart(fig_bw, use_container_width=True)
@@ -1718,8 +1768,8 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
 
     st.markdown("### Невязка по кроссплоту (скважины)")
     st.caption(
-        "Одна точка на скважину (средневзвешенные Кнг); первая строка — **все регионы**, "
-        "далее — по PVTNUM. Ячейки с Кнг_hist = 0 не учитываются."
+        "Одна точка на скважину (средневзвешенные Кн); первая строка — **все регионы**, "
+        "далее — по PVTNUM. Ячейки с Кн_hist = 0 не учитываются."
     )
     _crossplot_qa_metrics_help_expander(key=f"{block_key}_cross_qa_help")
     sj_cross_tbl = _build_well_crossplot_table(sj)
@@ -1728,7 +1778,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     with cjq:
         _render_well_crossplot_qa_panel(
             sj_cross_tbl,
-            x_col="Кнг_W_wmean",
+            x_col="Кн_W_wmean",
             y_col="Kng_model_wmean",
             region_col="Регион",
             block_key=f"{block_key}_j",
@@ -1738,7 +1788,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     with cbq:
         _render_well_crossplot_qa_panel(
             sb_cross_tbl,
-            x_col="Кнг_W_wmean",
+            x_col="Кн_W_wmean",
             y_col="Kng_BC_wmean",
             region_col="Регион",
             block_key=f"{block_key}_bc",
@@ -1758,8 +1808,8 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         wb = sb[sb["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
         if wj.empty or wb.empty:
             continue
-        tj = wj.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
-        tb = wb.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+        tj = wj.groupby("_AXIS", as_index=False).agg(Кн_hist=("Кн_hist", "mean"), Кн_model=("Кн_model", "mean"))
+        tb = wb.groupby("_AXIS", as_index=False).agg(Кн_hist=("Кн_hist", "mean"), Кн_model=("Кн_model", "mean"))
         x_lo = max(float(tj["_AXIS"].min()), float(tb["_AXIS"].min()))
         x_hi = min(float(tj["_AXIS"].max()), float(tb["_AXIS"].max()))
         if x_hi <= x_lo:
@@ -1768,11 +1818,11 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             grid = np.linspace(x_lo, x_hi, int(max(30, min(180, 2 * min(len(tj), len(tb))))))
         if len(grid) < 5:
             continue
-        hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_hist"].to_numpy(dtype=float))
-        hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_hist"].to_numpy(dtype=float))
+        hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кн_hist"].to_numpy(dtype=float))
+        hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кн_hist"].to_numpy(dtype=float))
         hist = 0.5 * (hj + hb)
-        pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_model"].to_numpy(dtype=float))
-        pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_model"].to_numpy(dtype=float))
+        pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кн_model"].to_numpy(dtype=float))
+        pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кн_model"].to_numpy(dtype=float))
         rows.append(
             {
                 "WELL_NAME": str(well),
@@ -1845,19 +1895,19 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     wb = sb[sb["WELL_NAME"].astype(str) == well].copy().sort_values("_AXIS")
     if wj.empty or wb.empty:
         return
-    tj = wj.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
-    tb = wb.groupby("_AXIS", as_index=False).agg(Кнг_hist=("Кнг_hist", "mean"), Кнг_model=("Кнг_model", "mean"))
+    tj = wj.groupby("_AXIS", as_index=False).agg(Кн_hist=("Кн_hist", "mean"), Кн_model=("Кн_model", "mean"))
+    tb = wb.groupby("_AXIS", as_index=False).agg(Кн_hist=("Кн_hist", "mean"), Кн_model=("Кн_model", "mean"))
     x_lo = max(float(tj["_AXIS"].min()), float(tb["_AXIS"].min()))
     x_hi = min(float(tj["_AXIS"].max()), float(tb["_AXIS"].max()))
     if x_hi <= x_lo:
         grid = np.array(sorted(set(tj["_AXIS"].tolist() + tb["_AXIS"].tolist())), dtype=float)
     else:
         grid = np.linspace(x_lo, x_hi, int(max(40, min(250, 2 * min(len(tj), len(tb))))))
-    hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_hist"].to_numpy(dtype=float))
-    hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_hist"].to_numpy(dtype=float))
+    hj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кн_hist"].to_numpy(dtype=float))
+    hb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кн_hist"].to_numpy(dtype=float))
     hist = 0.5 * (hj + hb)
-    pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кнг_model"].to_numpy(dtype=float))
-    pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кнг_model"].to_numpy(dtype=float))
+    pj = np.interp(grid, tj["_AXIS"].to_numpy(dtype=float), tj["Кн_model"].to_numpy(dtype=float))
+    pb = np.interp(grid, tb["_AXIS"].to_numpy(dtype=float), tb["Кн_model"].to_numpy(dtype=float))
     plot_df = pd.DataFrame({"_AXIS": grid, "Кн историческая": hist, "Кн J-функция": pj, "Кн Брукса-Кори": pb}).melt(
         id_vars="_AXIS", var_name="Кривая", value_name="Кн"
     )
@@ -1962,7 +2012,7 @@ def _manual_params_ui(pvts: list[int]) -> dict[int, tuple[float, float, float]]:
 
 def _validate_columns(df_wells: pd.DataFrame, df_prod: pd.DataFrame | None) -> list[str]:
     errors: list[str] = []
-    required = {"WELL_NAME", "PVTNUM_GDM", "PORO_GDM", "PERM_GDM", "PC", "SWL_GDM", "Кнг_W"}
+    required = {"WELL_NAME", "PVTNUM_GDM", "PORO_GDM", "PERM_GDM", "PC", "SWL_GDM", "Кн_W"}
     missing = sorted(required - set(df_wells.columns))
     if missing:
         errors.append(f"В файле скважин не хватает колонок: {missing}")
@@ -2356,7 +2406,7 @@ def _bc_well_preview_fragment() -> None:
             return
         psel = pvt_opts[0]
     g = bc_res[pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce") == float(psel)].copy()
-    g = g.dropna(subset=["Кнг_W", "Kng_BC_model"])
+    g = g.dropna(subset=["Кн_W", "Kng_BC_model"])
     g_conv = _filter_convergence_points(g.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
         columns={"Kng_model": "Kng_BC_model"}
     )
@@ -2374,8 +2424,8 @@ def _bc_well_preview_fragment() -> None:
     else:
         wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
         wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
-        curve = wd[[dcol, "ACTNUM_GDM", "Кнг_W", "Kng_BC_model"]].rename(
-            columns={"Кнг_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
+        curve = wd[[dcol, "ACTNUM_GDM", "Кн_W", "Kng_BC_model"]].rename(
+            columns={"Кн_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
         )
         melt = curve.melt(
             id_vars=[dcol],
@@ -2453,7 +2503,7 @@ def _bc_results_dashboard_fragment() -> None:
     pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
     psel = st.selectbox("Регион для графиков БК", pvt_opts, key="bc_plot_pvt")
     g = bc_res[pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce") == float(psel)].copy()
-    g = g.dropna(subset=["Кнг_W", "Kng_BC_model"])
+    g = g.dropna(subset=["Кн_W", "Kng_BC_model"])
     if g.empty:
         return
 
@@ -2538,13 +2588,13 @@ def _bc_results_dashboard_fragment() -> None:
 
     fig = px.scatter(
         g_conv,
-        x="Кнг_W",
+        x="Кн_W",
         y="Kng_BC_model",
         color=bc_color,
         color_continuous_scale="Viridis",
         hover_data={
             c: ":.3f"
-            for c in ["PC", "PORO_GDM", "Kng_BC_model", "Кнг_W", "thickness", "weight"]
+            for c in ["PC", "PORO_GDM", "Kng_BC_model", "Кн_W", "thickness", "weight"]
             if c in g_conv.columns
         },
         title=f"PVT {psel}: предсказанное(историческое) (Брукса-Кори)",
@@ -2552,7 +2602,7 @@ def _bc_results_dashboard_fragment() -> None:
         **_crossplot_hover_name_kw(g_conv),
     )
     fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
-    _apply_crossplot_hover(fig, "Кнг_W=%{x:.3f}<br>Kng_BC_model=%{y:.3f}", g_conv)
+    _apply_crossplot_hover(fig, "Кн_W=%{x:.3f}<br>Kng_BC_model=%{y:.3f}", g_conv)
     st.plotly_chart(fig, use_container_width=True)
 
     if "WELL_NAME" in g_conv.columns:
@@ -2562,7 +2612,7 @@ def _bc_results_dashboard_fragment() -> None:
         if not cross.empty:
             figw = px.scatter(
                 cross,
-                x="Кнг_W_wmean",
+                x="Кн_W_wmean",
                 y="Kng_BC_wmean",
                 color="convergence_percent",
                 color_continuous_scale="Turbo",
@@ -2574,14 +2624,14 @@ def _bc_results_dashboard_fragment() -> None:
                 title=f"PVT {psel}: кроссплот по скважинам (БК, средневзвешенно)",
                 **_crossplot_hover_name_kw(cross),
             )
-            _apply_crossplot_hover(figw, "Кнг_W_wmean=%{x:.3f}<br>Kng_BC_wmean=%{y:.3f}", cross)
+            _apply_crossplot_hover(figw, "Кн_W_wmean=%{x:.3f}<br>Kng_BC_wmean=%{y:.3f}", cross)
             figw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             st.plotly_chart(figw, use_container_width=True)
             st.markdown("#### Невязка по кроссплоту (скважины)")
-            cross_all_bc = _well_crossplot_table_from_result(bc_res, "Кнг_W", "Kng_BC_model")
+            cross_all_bc = _well_crossplot_table_from_result(bc_res, "Кн_W", "Kng_BC_model")
             _render_well_crossplot_qa_panel(
                 cross_all_bc,
-                x_col="Кнг_W_wmean",
+                x_col="Кн_W_wmean",
                 y_col="Kng_model_wmean",
                 region_col="Регион",
                 block_key="bc_all_pvt",
@@ -2674,14 +2724,14 @@ def _map_uploaded_wells_df(raw_wells: pd.DataFrame, *, key_prefix: str, title: s
         ("PERM_GDM", "Проницаемость", ["PERM", "ПРОНИ", "KPR", "K_PR"]),
         ("PC", "Капиллярное давление", ["PC", "КАПИЛ", "P_CAP"]),
         ("SWL_GDM", "Кво", ["SWL", "SWI", "SW_MIN", "КВО"]),
-        ("Кнг_W", "Нефтенасыщенность", ["КНГ", "KNG", "KN", "SOIL", "НЕФТЕНАС", "RIGIS"]),
+        ("Кн_W", "Нефтенасыщенность", ["КНГ", "KNG", "KN", "SOIL", "НЕФТЕНАС", "RIGIS"]),
     ]
     defaults = {}
     for target, _, hints in mapping_rules:
         cand = saved_map.get(target)
         if isinstance(cand, str) and cand in cols:
             defaults[target] = cand
-        elif target == "Кнг_W":
+        elif target == "Кн_W":
             gk = _guess_kng_w_column(cols)
             defaults[target] = gk if gk else _safe_guess_col(cols, hints)
         else:
@@ -2892,7 +2942,7 @@ def _guess_bc_lab_n_column(cols: list[str]) -> str:
 
 def _guess_kng_w_column(cols: list[str]) -> str:
     """
-    Автовыбор столбца нефтенасыщенности (Кнг): Kn, Кн, soil, КНГ, нефтенасыщенность и т.п.
+    Автовыбор столбца нефтенасыщенности (Кн): Kn, Кн, soil, КНГ, нефтенасыщенность и т.п.
     """
     if not cols:
         return ""
@@ -3175,7 +3225,21 @@ def _fig_j_swn_lab(
         grid = np.unique(np.sort(np.concatenate([grid, [thr]])))
 
     def _j_on_grid(a: float, b: float) -> np.ndarray:
-        return apply_low_swn_j_cap(grid, j_power_from_swn(grid, a, b), swn_threshold=thr, j_cap=cap)
+        return apply_low_swn_j_cap(
+            grid, j_power_from_swn(grid, a, b), swn_threshold=thr, j_cap=cap, a=a, b=b
+        )
+
+    def _j_cap_note(a: float, b: float) -> str:
+        j_thr = j_at_swn_threshold(a, b, thr)
+        if low_swn_j_cap_required(a, b, swn_threshold=thr, j_cap=cap):
+            return (
+                f"(J@{thr:g}={j_thr:.3g} > {cap:g}: при Swn<{thr:g} — J={cap:g})"
+            )
+        if np.isfinite(j_thr):
+            return (
+                f"(J@{thr:g}={j_thr:.3g} ≤ {cap:g}: при Swn<{thr:g} — J={j_thr:.3g})"
+            )
+        return ""
 
     ann_text = []
     if trend_fit and np.isfinite(trend_fit.get("a", np.nan)) and np.isfinite(trend_fit.get("b", np.nan)):
@@ -3190,8 +3254,7 @@ def _fig_j_swn_lab(
             )
         )
         ann_text.append(
-            f"Лаб. тренд: J = {a:.4g}·Swn<sup>{b:.4g}</sup> "
-            f"(при Swn≤{thr:g} — J≤{cap:g})"
+            f"Лаб. тренд: J = {a:.4g}·Swn<sup>{b:.4g}</sup> {_j_cap_note(a, b)}"
         )
 
     if extra_lines:
@@ -3236,8 +3299,7 @@ def _fig_j_swn_lab(
             )
         )
         ann_text.append(
-            f"Опт. модель: J = {a:.4g}·Swn<sup>{b:.4g}</sup> "
-            f"(при Swn≤{low_swn_threshold:g} — J≤{j_cap_at_low_swn:g})"
+            f"Опт. модель: J = {a:.4g}·Swn<sup>{b:.4g}</sup> {_j_cap_note(a, b)}"
         )
 
     if ann_text:
@@ -3589,25 +3651,32 @@ def leverett_tab() -> None:
         )
         maxiter = st.slider("Итерации оптимизации", min_value=20, max_value=300, value=200, step=10)
         popsize = st.slider("Размер популяции", min_value=8, max_value=40, value=20, step=1)
-        st.markdown("**Ограничение J при малых Swn (только обучение)**")
+        st.markdown("**Табличная J при малых Swn**")
+        st.caption(
+            "Подбор (a, b, σ) идёт по степенной J = a·Swn^b в лабораторном коридоре и по Кн. "
+            "Правило таблицы (J при Swn<порога) применяется только при расчёте модельного Кн и на графике J ниже порога."
+        )
         low_swn_threshold = st.number_input(
-            "Порог Swn",
+            "Порог Swn (мин. Swn таблицы)",
             min_value=1e-6,
             max_value=0.5,
             value=DEFAULT_LOW_SWN_THRESHOLD,
             step=0.001,
             format="%.4f",
             key="j_low_swn_threshold",
-            help="При Swn не выше этого порога в целевой функции J(Swn)=a·Swn^b ограничивается сверху.",
+            help="Нижняя граница табличной J (по умолчанию 0,01).",
         )
         j_cap_at_low_swn = st.number_input(
-            "Макс. J при Swn ≤ порога",
+            "Порог J на Swn = порогу",
             min_value=0.1,
             max_value=10000.0,
             value=DEFAULT_J_CAP_AT_LOW_SWN,
             step=0.5,
             key="j_cap_at_low_swn",
-            help="Если расчётная J выше — при обучении используется это значение (по умолчанию 20).",
+            help=(
+                "Только для расчёта Кн и участка Swn < порога на графике: "
+                "базово J(Swn=порог); если J(Swn=порог) > этого значения — плато J = это значение."
+            ),
         )
 
     if wells_file is not None:
@@ -4026,7 +4095,7 @@ def leverett_tab() -> None:
             )
             st.plotly_chart(fig, use_container_width=True)
 
-    st.subheader("Интерактивные графики (Кнг)")
+    st.subheader("Интерактивные графики (Кн)")
     pvt_series = pd.to_numeric(result_df["PVTNUM_GDM"], errors="coerce")
     region_options = sorted(pvt_series.dropna().astype(int).unique().tolist())
     if not region_options:
@@ -4039,7 +4108,7 @@ def leverett_tab() -> None:
     region_df = _filter_convergence_points(region_df_raw)
 
     if region_df.empty:
-        st.warning("Для выбранного региона нет валидных точек сходимости (без нулей/выбросов Кнг_W).")
+        st.warning("Для выбранного региона нет валидных точек сходимости (без нулей/выбросов Кн_W).")
         return
 
     depth_col = _pick_depth_column(region_df)
@@ -4077,18 +4146,18 @@ def leverett_tab() -> None:
     hover_cols, hover_metrics = _j_kng_interactive_hover(region_df, depth_col)
     fig_scatter = px.scatter(
         region_df,
-        x="Кнг_W",
+        x="Кн_W",
         y="Kng_model",
         color=color_col if color_col in region_df.columns else None,
         color_continuous_scale="Viridis",
         hover_data=hover_cols if hover_cols else None,
-        title=f"PVT {region}: предсказанное Кнг(историческое) ({'вес' if color_col == 'weight' else 'толщина'})",
+        title=f"PVT {region}: предсказанное Кн(историческое) ({'вес' if color_col == 'weight' else 'толщина'})",
         opacity=0.7,
         **_crossplot_hover_name_kw(region_df),
     )
     fig_scatter.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
     _apply_crossplot_hover(fig_scatter, hover_metrics, region_df)
-    fig_scatter.update_layout(xaxis_title="Кнг историческое (ГИС)", yaxis_title="Кнг предсказанное")
+    fig_scatter.update_layout(xaxis_title="Кн историческое (ГИС)", yaxis_title="Кн предсказанное")
     st.plotly_chart(fig_scatter, use_container_width=True)
 
     st.subheader("Кроссплот по скважинам (средневзвешенные значения)")
@@ -4100,7 +4169,7 @@ def leverett_tab() -> None:
         else:
             fig_well_cross = px.scatter(
                 cross_df,
-                x="Кнг_W_wmean",
+                x="Кн_W_wmean",
                 y="Kng_model_wmean",
                 color="convergence_percent",
                 color_continuous_scale="Turbo",
@@ -4114,21 +4183,21 @@ def leverett_tab() -> None:
                 **_crossplot_hover_name_kw(cross_df),
             )
             _apply_crossplot_hover(
-                fig_well_cross, "Кнг_W_wmean=%{x:.3f}<br>Kng_model_wmean=%{y:.3f}", cross_df
+                fig_well_cross, "Кн_W_wmean=%{x:.3f}<br>Kng_model_wmean=%{y:.3f}", cross_df
             )
             fig_well_cross.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             fig_well_cross.update_layout(
-                xaxis_title="Кнг_W (средневзвеш.)",
+                xaxis_title="Кн_W (средневзвеш.)",
                 yaxis_title="Kng_model (средневзвеш.)",
             )
             st.plotly_chart(fig_well_cross, use_container_width=True)
             st.markdown("#### Невязка по кроссплоту (скважины)")
             cross_all_j = _well_crossplot_table_from_result(
-                _exclude_clipped_kng_zeros(result_df), "Кнг_W", "Kng_model"
+                _exclude_clipped_kng_zeros(result_df), "Кн_W", "Kng_model"
             )
             _render_well_crossplot_qa_panel(
                 cross_all_j,
-                x_col="Кнг_W_wmean",
+                x_col="Кн_W_wmean",
                 y_col="Kng_model_wmean",
                 region_col="Регион",
                 block_key=f"j_all_pvt",
@@ -4196,11 +4265,11 @@ def leverett_tab() -> None:
         else:
             well_df[well_depth_col] = pd.to_numeric(well_df[well_depth_col], errors="coerce")
             well_df = well_df.dropna(subset=[well_depth_col]).sort_values(well_depth_col).reset_index(drop=True)
-            curve_cols = [well_depth_col, "ACTNUM_GDM", "Кнг_W", "Kng_model"]
+            curve_cols = [well_depth_col, "ACTNUM_GDM", "Кн_W", "Kng_model"]
             if "FWL_GDM" in well_df.columns:
                 curve_cols.insert(1, "FWL_GDM")
             curve_df = well_df[curve_cols].copy()
-            curve_df = curve_df.rename(columns={"Кнг_W": "Кн РИГИС", "Kng_model": "Кн J-функция"})
+            curve_df = curve_df.rename(columns={"Кн_W": "Кн РИГИС", "Kng_model": "Кн J-функция"})
             id_vars = [well_depth_col]
             if "FWL_GDM" in curve_df.columns:
                 id_vars.append("FWL_GDM")
@@ -4399,7 +4468,7 @@ def brooks_corey_tab() -> None:
         + (f" | Выбранный файл добычи: `{Path(prod_path).name}`" if prod_path else " | Выбранный файл добычи: не выбран")
     )
 
-    required = {"PORO_GDM", "PC", "Кнг_W", "PVTNUM_GDM"}
+    required = {"PORO_GDM", "PC", "Кн_W", "PVTNUM_GDM"}
     missing = [c for c in required if c not in df_geo.columns]
     if missing:
         st.error(f"В файле геомодели отсутствуют колонки: {missing}")
@@ -4738,7 +4807,7 @@ def brooks_corey_tab() -> None:
             return
         bc_res = pd.concat(results, ignore_index=True)
         bc_params = pd.DataFrame(params_rows)
-        bc_qa = _compute_qa_metrics(bc_res, "Кнг_W", "Kng_BC_model")
+        bc_qa = _compute_qa_metrics(bc_res, "Кн_W", "Kng_BC_model")
         total_elapsed = float(time.perf_counter() - t0_total)
         bc_timing = _timing_table_with_total(timing_rows, total_elapsed=total_elapsed)
         st.session_state["bc_result_df"] = bc_res

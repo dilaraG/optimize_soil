@@ -25,9 +25,9 @@ df = df[~(df[columns_to_convert] <= -1).any(axis=1)].dropna()
 
 df = df.loc[df['ACTNUM_GDM'] != 0]
 df = df.loc[df['PC'] >= 0.01]
-df = df.loc[df['Кнг_W'] != 0 ]
+df = df.loc[df['Кн_W'] != 0 ]
 
-df.loc[df["Кнг_W"] > 1, "Кнг_W"] = df["Кнг_W"] / 100
+df.loc[df["Кн_W"] > 1, "Кн_W"] = df["Кн_W"] / 100
 
 df.to_csv("../data/df_wells_krasnogor_C1.csv", index=False)
 

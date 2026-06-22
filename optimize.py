@@ -15,8 +15,26 @@ REQUIRED_WELL_COLUMNS = [
     "PERM_GDM",
     "PC",
     "SWL_GDM",
-    "Кнг_W",
+    "Кн_W",
 ]
+
+# Старые выгрузки геомодели могли содержать «Кнг_*»
+_LEGACY_KN_COLUMNS = {
+    "Кнг_W": "Кн_W",
+    "Кнг_hist": "Кн_hist",
+    "Кнг_model": "Кн_model",
+}
+
+
+def normalize_kn_column_names(df: pd.DataFrame) -> pd.DataFrame:
+    rename = {
+        old: new
+        for old, new in _LEGACY_KN_COLUMNS.items()
+        if old in df.columns and new not in df.columns
+    }
+    if rename:
+        df = df.rename(columns=rename)
+    return df
 
 DEFAULT_LOW_SWN_THRESHOLD = 0.01
 DEFAULT_J_CAP_AT_LOW_SWN = 20.0
@@ -69,7 +87,63 @@ def _safe_series(df: pd.DataFrame, col: str) -> np.ndarray:
     return pd.to_numeric(df[col], errors="coerce").to_numpy()
 
 
-def calc_kng_vector(df: pd.DataFrame, a: float, b: float, sigma: float) -> np.ndarray:
+def j_at_swn_threshold(a: float, b: float, swn_threshold: float) -> float:
+    """J = a·Swn^b на нижней границе табличной J (по умолчанию Swn = 0,01)."""
+    if not (np.isfinite(a) and np.isfinite(b) and np.isfinite(swn_threshold) and swn_threshold > 0):
+        return float("nan")
+    with np.errstate(over="ignore", invalid="ignore"):
+        val = float(a * (float(swn_threshold) ** b))
+    return val if np.isfinite(val) else float("nan")
+
+
+def low_swn_j_cap_required(
+    a: float,
+    b: float,
+    *,
+    swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
+) -> bool:
+    """
+    Нужно ли принудительно использовать user-cap на участке Swn < порога.
+    True, если J(Swn=порог) = a·Swn^b > j_cap.
+    """
+    j_thr = j_at_swn_threshold(a, b, swn_threshold)
+    cap = float(j_cap)
+    if not (np.isfinite(j_thr) and np.isfinite(cap)):
+        return False
+    return j_thr > cap
+
+
+def low_swn_plateau_j(
+    a: float,
+    b: float,
+    *,
+    swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
+) -> float:
+    """
+    Правило для участка Swn < порога:
+    1) базово J_low = J(swn_threshold), т.е. значение на нижней границе табличной J;
+    2) если J(swn_threshold) > j_cap, использовать J_low = j_cap.
+    """
+    j_thr = j_at_swn_threshold(a, b, swn_threshold)
+    if not np.isfinite(j_thr):
+        return float(j_cap)
+    if low_swn_j_cap_required(a, b, swn_threshold=swn_threshold, j_cap=j_cap):
+        return float(j_cap)
+    return float(j_thr)
+
+
+def calc_kng_vector(
+    df: pd.DataFrame,
+    a: float,
+    b: float,
+    sigma: float,
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
+    apply_table_j_rule: bool = True,
+) -> np.ndarray:
     poro_col = "PORO_FRAC" if "PORO_FRAC" in df.columns else "PORO_GDM"
     poro = _safe_series(df, poro_col)
     perm = _safe_series(df, "PERM_GDM")
@@ -87,6 +161,16 @@ def calc_kng_vector(df: pd.DataFrame, a: float, b: float, sigma: float) -> np.nd
     swl = swl[valid]
 
     j = np.pi * pc / sigma * np.sqrt(perm / poro)
+    # Табличная J (как во внешней программе): только при финальном расчёте Кн и implied Swn < порога.
+    if apply_table_j_rule:
+        thr = float(low_swn_threshold)
+        cap = float(j_cap_at_low_swn)
+        if np.isfinite(a) and a != 0 and np.isfinite(b) and b != 0 and np.isfinite(thr) and thr > 0:
+            j_low = low_swn_plateau_j(a, b, swn_threshold=thr, j_cap=cap)
+            with np.errstate(divide="ignore", invalid="ignore"):
+                swn_implied = (j / a) ** (1.0 / b)
+            in_plateau = np.isfinite(swn_implied) & (swn_implied < thr)
+            j = np.where(in_plateau, j_low, j)
     kvn = (j / a) ** (1 / b)
     kv = swl + (1 - swl) * kvn
     kng_valid = 1 - kv
@@ -113,17 +197,25 @@ def apply_low_swn_j_cap(
     *,
     swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
     j_cap: float = DEFAULT_J_CAP_AT_LOW_SWN,
+    a: float | None = None,
+    b: float | None = None,
 ) -> np.ndarray:
-    """При Swn ≤ порога ограничивает J сверху (по умолчанию J ≤ 20 при Swn ≤ 0.01)."""
+    """
+    Табличная J при Swn < порога: постоянное плато J_low:
+    - базово J(swn_threshold);
+    - если J(swn_threshold) > j_cap, то J_low = j_cap.
+    """
     s = np.asarray(swn, dtype=float)
     y = np.asarray(j, dtype=float).copy()
     thr = float(swn_threshold)
     cap = float(j_cap)
     if not (np.isfinite(thr) and thr > 0 and np.isfinite(cap) and cap > 0):
         return y
-    low = s <= thr
+    if a is None or b is None:
+        return y
+    low = s < thr
     if np.any(low):
-        y[low] = np.minimum(y[low], cap)
+        y[low] = low_swn_plateau_j(a, b, swn_threshold=thr, j_cap=cap)
     return y
 
 
@@ -136,7 +228,7 @@ def _low_swn_j_cap_penalty(
     n_grid: int = 24,
     scale: float = 2e5,
 ) -> float:
-    """Штраф, если некапированная J = a·Swn^b превышает j_cap при Swn ≤ порога."""
+    """Штраф за отклонение low-Swn участка от целевого табличного плато."""
     thr = float(swn_threshold)
     cap = float(j_cap)
     if not (np.isfinite(a) and np.isfinite(b) and np.isfinite(thr) and thr > 0 and np.isfinite(cap) and cap > 0):
@@ -148,7 +240,8 @@ def _low_swn_j_cap_penalty(
     raw = j_power_from_swn(grid, a, b)
     if not np.any(np.isfinite(raw)):
         return 0.0
-    viol = np.clip(raw - cap, 0.0, np.inf)
+    target = low_swn_plateau_j(a, b, swn_threshold=thr, j_cap=cap)
+    viol = raw - target
     viol = viol[np.isfinite(viol)]
     if viol.size == 0:
         return 0.0
@@ -196,7 +289,8 @@ def _j_power_envelope_penalty(
         y_hi_b = ahi * (grid**bhi)
         j_lo = np.minimum(y_lo_b, y_hi_b)
         j_hi = np.maximum(y_lo_b, y_hi_b)
-        j_opt = apply_low_swn_j_cap(grid, j_power_from_swn(grid, a, b), swn_threshold=thr, j_cap=cap)
+        # При подборе сравниваем степенную J = a·Swn^b с коридором (тренд в облаке).
+        j_opt = j_power_from_swn(grid, a, b)
     viol_lo = np.clip(j_lo - j_opt, 0.0, np.inf)
     viol_hi = np.clip(j_opt - j_hi, 0.0, np.inf)
     return float(scale * np.mean(viol_lo**2 + viol_hi**2))
@@ -211,8 +305,14 @@ def loss_function(
     j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
 ) -> float:
     a, b, sigma = params
-    kng_model = calc_kng_vector(df, a, b, sigma)
-    kng_true = _safe_series(df, "Кнг_W")
+    kng_model = calc_kng_vector(
+        df,
+        a,
+        b,
+        sigma,
+        apply_table_j_rule=False,
+    )
+    kng_true = _safe_series(df, "Кн_W")
     weights = pd.to_numeric(df.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
     valid = ~np.isnan(kng_model) & np.isfinite(kng_true)
     if not np.any(valid):
@@ -222,8 +322,7 @@ def loss_function(
     env_pen = _j_power_envelope_penalty(
         a, b, j_envelope, swn_threshold=low_swn_threshold, j_cap=j_cap_at_low_swn
     )
-    cap_pen = _low_swn_j_cap_penalty(a, b, swn_threshold=low_swn_threshold, j_cap=j_cap_at_low_swn)
-    return base + env_pen + cap_pen
+    return base + env_pen
 
 
 def _make_loss_fn(
@@ -363,7 +462,13 @@ def optimize_pvt(
     return params
 
 
-def apply_model(df: pd.DataFrame, params: dict[int, tuple[float, float, float]]) -> pd.DataFrame:
+def apply_model(
+    df: pd.DataFrame,
+    params: dict[int, tuple[float, float, float]],
+    *,
+    low_swn_threshold: float = DEFAULT_LOW_SWN_THRESHOLD,
+    j_cap_at_low_swn: float = DEFAULT_J_CAP_AT_LOW_SWN,
+) -> pd.DataFrame:
     df = df.copy()
     kng_model = np.zeros(len(df))
 
@@ -372,7 +477,15 @@ def apply_model(df: pd.DataFrame, params: dict[int, tuple[float, float, float]])
         if pvt not in params:
             continue
         a, b, sigma = params[pvt]
-        val = calc_kng_vector(row.to_frame().T, a, b, sigma)[0]
+        val = calc_kng_vector(
+            row.to_frame().T,
+            a,
+            b,
+            sigma,
+            low_swn_threshold=low_swn_threshold,
+            j_cap_at_low_swn=j_cap_at_low_swn,
+            apply_table_j_rule=True,
+        )[0]
         kng_model[i] = val
 
     df["Kng_model"] = kng_model
@@ -427,7 +540,7 @@ def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
     for pvt_raw, g in df.groupby("PVTNUM_GDM"):
         rows.append(
             _qa_metrics_row(
-                _safe_series(g, "Кнг_W"),
+                _safe_series(g, "Кн_W"),
                 _safe_series(g, "Kng_model"),
                 g.get("weight", 1.0),
                 int(float(pvt_raw)),
@@ -440,7 +553,7 @@ def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
             key=lambda s: pd.to_numeric(s, errors="coerce"),
         ).reset_index(drop=True)
     global_row = _qa_metrics_row(
-        _safe_series(df, "Кнг_W"),
+        _safe_series(df, "Кн_W"),
         _safe_series(df, "Kng_model"),
         df.get("weight", 1.0),
         "Все регионы",
@@ -450,13 +563,13 @@ def compute_qa(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
+    df = normalize_kn_column_names(df.copy())
     numeric_cols = [
         "PORO_GDM",
         "PERM_GDM",
         "PC",
         "SWL_GDM",
-        "Кнг_W",
+        "Кн_W",
         "PVTNUM_GDM",
         "Perf_GDM",
         "ACTNUM_GDM",
@@ -470,11 +583,11 @@ def prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
         poro = pd.to_numeric(df["PORO_GDM"], errors="coerce")
         df["PORO_FRAC"] = np.where(poro > 1, poro / 100.0, poro)
 
-    if "Кнг_W" in df.columns:
-        mask = df["Кнг_W"] > 1
-        df.loc[mask, "Кнг_W"] = df.loc[mask, "Кнг_W"] / 100
+    if "Кн_W" in df.columns:
+        mask = df["Кн_W"] > 1
+        df.loc[mask, "Кн_W"] = df.loc[mask, "Кн_W"] / 100
 
-    required_for_model = ["PORO_FRAC", "PERM_GDM", "PC", "SWL_GDM", "Кнг_W", "PVTNUM_GDM"]
+    required_for_model = ["PORO_FRAC", "PERM_GDM", "PC", "SWL_GDM", "Кн_W", "PVTNUM_GDM"]
     df = df.dropna(subset=required_for_model)
 
     if "ACTNUM_GDM" in df.columns:
@@ -485,30 +598,30 @@ def prepare_input_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def _filter_training_kng(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Для обучения исключаем нулевые и выбросные Кнг_W по каждой скважине.
+    Для обучения исключаем нулевые и выбросные Кн_W по каждой скважине.
     Визуализация при этом выполняется на полном датафрейме.
     """
     out = df.copy()
-    out["Кнг_W"] = pd.to_numeric(out["Кнг_W"], errors="coerce")
-    mask = out["Кнг_W"].notna() & (out["Кнг_W"] != 0)
+    out["Кн_W"] = pd.to_numeric(out["Кн_W"], errors="coerce")
+    mask = out["Кн_W"].notna() & (out["Кн_W"] != 0)
     out = out.loc[mask].copy()
     if out.empty or "WELL_NAME" not in out.columns:
         return out
 
     keep_idx: list[int] = []
     for _, g in out.groupby("WELL_NAME"):
-        x = g["Кнг_W"].to_numpy(dtype=float)
+        x = g["Кн_W"].to_numpy(dtype=float)
         if len(x) < 6:
             keep_idx.extend(g.index.tolist())
             continue
         q1, q3 = np.quantile(x, [0.25, 0.75])
         iqr = q3 - q1
         lo, hi = q1 - 1.5 * iqr, q3 + 1.5 * iqr
-        keep = g[(g["Кнг_W"] >= lo) & (g["Кнг_W"] <= hi)]
+        keep = g[(g["Кн_W"] >= lo) & (g["Кн_W"] <= hi)]
         # Если фильтр слишком агрессивный, оставляем почти все кроме экстремумов по 2/98
         if len(keep) < max(5, int(0.5 * len(g))):
             ql, qh = np.quantile(x, [0.02, 0.98])
-            keep = g[(g["Кнг_W"] >= ql) & (g["Кнг_W"] <= qh)]
+            keep = g[(g["Кн_W"] >= ql) & (g["Кн_W"] <= qh)]
         keep_idx.extend(keep.index.tolist())
     return out.loc[sorted(set(keep_idx))].copy()
 
@@ -548,7 +661,12 @@ def run_pipeline(
         low_swn_threshold=low_swn_threshold,
         j_cap_at_low_swn=j_cap_at_low_swn,
     )
-    result = apply_model(data, params)
+    result = apply_model(
+        data,
+        params,
+        low_swn_threshold=low_swn_threshold,
+        j_cap_at_low_swn=j_cap_at_low_swn,
+    )
     qa = compute_qa(result)
     timing_df = _timing_table_with_total(timing_rows)
 
