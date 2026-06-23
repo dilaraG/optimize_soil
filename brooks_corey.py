@@ -391,10 +391,55 @@ def _filter_target_like_j(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _clip_bc_vec(vec: np.ndarray, lb: np.ndarray, ub: np.ndarray) -> np.ndarray:
+    """Обрезка вектора коэффициентов БК: пары (a, b), у степенных b < 0."""
     out = np.clip(np.asarray(vec, dtype=float), lb, ub)
-    for idx in (3, 5, 7):
-        out[idx] = min(float(out[idx]), -1e-3)
+    for i in range(1, len(out), 2):
+        out[i] = min(float(out[i]), -1e-3)
     return out
+
+
+BC_DEP_KEYS = ("swl", "perm", "pvit", "n")
+BC_DEP_PARAM_NAMES: dict[str, tuple[str, str]] = {
+    "swl": ("a_swl", "b_swl"),
+    "perm": ("a_perm", "b_perm"),
+    "pvit": ("a_pvit", "b_pvit"),
+    "n": ("a_n", "b_n"),
+}
+BC_ALL_PARAM_NAMES = [n for pair in BC_DEP_PARAM_NAMES.values() for n in pair]
+
+
+def _bc_params_from_free_vec(
+    free_vec: np.ndarray,
+    *,
+    free_keys: list[str],
+    fixed_pairs: dict[str, tuple[float, float]],
+) -> dict[str, float]:
+    p: dict[str, float] = {}
+    vi = 0
+    for key in BC_DEP_KEYS:
+        a_name, b_name = BC_DEP_PARAM_NAMES[key]
+        if key in fixed_pairs:
+            a_fix, b_fix = fixed_pairs[key]
+            p[a_name] = float(a_fix)
+            p[b_name] = float(b_fix)
+        else:
+            p[a_name] = float(free_vec[vi])
+            p[b_name] = float(free_vec[vi + 1])
+            vi += 2
+    return p
+
+
+def _bc_validate_params(p: dict[str, float]) -> bool:
+    if not (1e-9 < float(p.get("a_swl", 0)) <= 100.0):
+        return False
+    b_swl = float(p.get("b_swl", 0))
+    if not np.isfinite(b_swl) or b_swl >= 0 or b_swl < -120.0:
+        return False
+    if any(float(p.get(k, 0)) <= 0 for k in ("a_perm", "a_pvit", "a_n")):
+        return False
+    if any(float(p.get(k, 0)) >= 0 for k in ("b_perm", "b_pvit", "b_n")):
+        return False
+    return True
 
 
 def _bc_pso_optimize(
@@ -450,10 +495,14 @@ def optimize_brooks_corey_for_region(
     baseline_params: dict[str, float] | None = None,
     perm_max_md: float = DEFAULT_PERM_MAX_MD,
     optimizer_method: str = "differential_evolution",
+    fixed_pairs: dict[str, tuple[float, float]] | None = None,
 ) -> dict[str, float]:
     """
     Подбор параметров глобальной оптимизацией (differential_evolution / dual_annealing / pso):
     взвешенный Huber по невязке Кн + штраф за огибающие лаборатории.
+
+  fixed_pairs: зафиксированные зависимости {"swl": (a, b), "perm": (a, b), ...};
+    для них оптимизация не выполняется, штраф по огибающим не начисляется.
     """
     train = _filter_target_like_j(df_region)
     if train.empty:
@@ -466,23 +515,21 @@ def optimize_brooks_corey_for_region(
         return {}
     resolved_perm_max = float(perm_max_md) if np.isfinite(perm_max_md) and perm_max_md > 0 else DEFAULT_PERM_MAX_MD
 
-    param_names = ["a_swl", "b_swl", "a_perm", "b_perm", "a_pvit", "b_pvit", "a_n", "b_n"]
-    de_bounds = [
-        bounds["swl"].a,
-        bounds["swl"].b,
-        bounds["perm"].a,
-        bounds["perm"].b,
-        bounds["pvit"].a,
-        bounds["pvit"].b,
-        bounds["n"].a,
-        bounds["n"].b,
-    ]
+    fixed_pairs = dict(fixed_pairs or {})
+    for key in list(fixed_pairs.keys()):
+        if key not in BC_DEP_PARAM_NAMES:
+            fixed_pairs.pop(key, None)
+
+    free_keys = [k for k in BC_DEP_KEYS if k not in fixed_pairs]
+    init_guess = initial_guess or {}
+
     y_true = pd.to_numeric(train["Кн_W"], errors="coerce").to_numpy()
     w = pd.to_numeric(train.get("weight", 1.0), errors="coerce").fillna(1.0).to_numpy()
 
-    def _penalty_for_envelope(p: dict[str, float]) -> float:
+    def _penalty_for_envelope(p: dict[str, float], *, optimize_keys: list[str] | None = None) -> float:
         if not envelopes:
             return 0.0
+        keys = optimize_keys if optimize_keys is not None else list(BC_DEP_KEYS)
         pen = 0.0
         hard_max = 0.0
 
@@ -496,7 +543,7 @@ def optimize_brooks_corey_for_region(
             ("pvit", "a_pvit", "b_pvit"),
             ("n", "a_n", "b_n"),
         ]:
-            if key not in envelopes:
+            if key not in keys or key not in envelopes:
                 continue
             env = envelopes[key]
             x = np.asarray(env.get("x"), dtype=float)
@@ -517,22 +564,13 @@ def optimize_brooks_corey_for_region(
             pen += avg_v
             hard_max = max(hard_max, max_v)
 
-        # Жесткий барьер: если где-то вышли за огибающие — решение недопустимо.
         if hard_max > 1e-9:
             return float(1e9 + 1e9 * hard_max)
         return float(1e6 * pen)
 
-    def loss(vec: np.ndarray) -> float:
-        p = {k: float(v) for k, v in zip(param_names, vec)}
-        p["perm_max_md"] = resolved_perm_max
-        # Жесткие физические ограничения
-        if not (1e-9 < p["a_swl"] <= 100.0):
-            return 1e12
-        if not np.isfinite(p["b_swl"]) or p["b_swl"] >= 0 or p["b_swl"] < -120.0:
-            return 1e12
-        if any(p[k] <= 0 for k in ["a_perm", "a_pvit", "a_n"]):
-            return 1e12
-        if any(p[k] >= 0 for k in ["b_perm", "b_pvit", "b_n"]):
+    def _loss_from_params(p: dict[str, float]) -> float:
+        p = {**p, "perm_max_md": resolved_perm_max}
+        if not _bc_validate_params(p):
             return 1e12
         pred = compute_soil_from_params(train, p)
         m = np.isfinite(pred) & np.isfinite(y_true)
@@ -540,45 +578,49 @@ def optimize_brooks_corey_for_region(
             return 1e12
         r = pred[m] - y_true[m]
         base = float(np.sum(w[m] * huber_loss(r)))
-        return base + _penalty_for_envelope(p)
+        return base + _penalty_for_envelope(p, optimize_keys=free_keys)
 
-    # Первое приближение из корреляционных зависимостей (по облакам лабораторных точек)
-    init_guess = initial_guess or {}
-    x0 = np.array(
-        [
-            init_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[0],
-            init_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[1],
-            init_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[0],
-            init_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[1],
-            init_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[0],
-            init_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[1],
-            init_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[0],
-            init_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[1],
-        ],
-        dtype=float,
-    )
-    lb = np.array([b[0] for b in de_bounds], dtype=float)
-    ub = np.array([b[1] for b in de_bounds], dtype=float)
-    x0 = _clip_bc_vec(x0, lb, ub)
+    if not free_keys:
+        p_fix = _bc_params_from_free_vec(np.array([], dtype=float), free_keys=[], fixed_pairs=fixed_pairs)
+        if not _bc_validate_params(p_fix):
+            return {}
+        p_fix["perm_max_md"] = resolved_perm_max
+        return {k: float(p_fix[k]) for k in BC_ALL_PARAM_NAMES} | {"perm_max_md": resolved_perm_max}
+
+    free_bounds: list[tuple[float, float]] = []
+    x0_parts: list[float] = []
+    for key in free_keys:
+        pb = bounds[key]
+        center = init_guess.get(key, (np.mean(pb.a), np.mean(pb.b)))
+        free_bounds.extend([pb.a, pb.b])
+        x0_parts.extend([float(center[0]), float(center[1])])
+
+    lb = np.array([b[0] for b in free_bounds], dtype=float)
+    ub = np.array([b[1] for b in free_bounds], dtype=float)
+    x0 = _clip_bc_vec(np.array(x0_parts, dtype=float), lb, ub)
+
+    def loss_free(vec: np.ndarray) -> float:
+        p = _bc_params_from_free_vec(vec, free_keys=free_keys, fixed_pairs=fixed_pairs)
+        return _loss_from_params(p)
 
     method = (optimizer_method or "differential_evolution").lower()
     if method == "pso":
-        res_x = _bc_pso_optimize(loss, de_bounds, maxiter=maxiter, popsize=popsize, seed=42)
+        res_x = _bc_pso_optimize(loss_free, free_bounds, maxiter=maxiter, popsize=popsize, seed=42)
     elif method == "dual_annealing":
-        da_res = dual_annealing(loss, bounds=de_bounds, maxiter=maxiter, seed=42)
+        da_res = dual_annealing(loss_free, bounds=free_bounds, maxiter=maxiter, seed=42)
         res_x = _clip_bc_vec(np.asarray(da_res.x, dtype=float), lb, ub)
     else:
         rng = np.random.default_rng(42)
-        n_dim = len(de_bounds)
-        n_pop = max(popsize * n_dim, 24)
+        n_dim = len(free_bounds)
+        n_pop = max(popsize * max(n_dim, 1), 24)
         init_pop = rng.uniform(lb, ub, size=(n_pop, n_dim))
         init_pop[0] = x0
         for i in range(1, min(6, n_pop)):
             jitter = rng.normal(0.0, 0.05, size=n_dim) * (ub - lb)
             init_pop[i] = _clip_bc_vec(x0 + jitter, lb, ub)
         res = differential_evolution(
-            loss,
-            bounds=de_bounds,
+            loss_free,
+            bounds=free_bounds,
             maxiter=maxiter,
             popsize=popsize,
             seed=42,
@@ -586,43 +628,38 @@ def optimize_brooks_corey_for_region(
         )
         res_x = np.asarray(res.x, dtype=float)
 
-    best = {k: float(v) for k, v in zip(param_names, res_x)}
-    best["perm_max_md"] = resolved_perm_max
-    best_val = float(loss(np.array([best[k] for k in param_names], dtype=float)))
+    best_p = _bc_params_from_free_vec(res_x, free_keys=free_keys, fixed_pairs=fixed_pairs)
+    best_p["perm_max_md"] = resolved_perm_max
+    best = {k: float(best_p[k]) for k in BC_ALL_PARAM_NAMES} | {"perm_max_md": resolved_perm_max}
+    best_val = float(loss_free(res_x))
 
-    # Fallback: сравниваем с базовыми наборами коэффициентов и берём лучший
     candidates: list[dict[str, float]] = []
     if baseline_params:
-        bp = {k: float(baseline_params[k]) for k in param_names if k in baseline_params}
+        bp = {k: float(baseline_params[k]) for k in BC_ALL_PARAM_NAMES if k in baseline_params}
+        for key, (a_fix, b_fix) in fixed_pairs.items():
+            a_name, b_name = BC_DEP_PARAM_NAMES[key]
+            bp[a_name] = float(a_fix)
+            bp[b_name] = float(b_fix)
         bp["perm_max_md"] = resolved_perm_max
         candidates.append(bp)
     if initial_guess:
-        ig = {
-            "a_swl": float(initial_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[0]),
-            "b_swl": float(initial_guess.get("swl", (np.mean(bounds["swl"].a), np.mean(bounds["swl"].b)))[1]),
-            "a_perm": float(initial_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[0]),
-            "b_perm": float(initial_guess.get("perm", (np.mean(bounds["perm"].a), np.mean(bounds["perm"].b)))[1]),
-            "a_pvit": float(initial_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[0]),
-            "b_pvit": float(initial_guess.get("pvit", (np.mean(bounds["pvit"].a), np.mean(bounds["pvit"].b)))[1]),
-            "a_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[0]),
-            "b_n": float(initial_guess.get("n", (np.mean(bounds["n"].a), np.mean(bounds["n"].b)))[1]),
-            "perm_max_md": resolved_perm_max,
-        }
+        ig: dict[str, float] = {"perm_max_md": resolved_perm_max}
+        for key in BC_DEP_KEYS:
+            a_name, b_name = BC_DEP_PARAM_NAMES[key]
+            if key in fixed_pairs:
+                ig[a_name], ig[b_name] = float(fixed_pairs[key][0]), float(fixed_pairs[key][1])
+            else:
+                c = initial_guess.get(key, (np.mean(bounds[key].a), np.mean(bounds[key].b)))
+                ig[a_name] = float(c[0])
+                ig[b_name] = float(c[1])
         candidates.append(ig)
 
-    lb = np.array([b[0] for b in de_bounds], dtype=float)
-    ub = np.array([b[1] for b in de_bounds], dtype=float)
     for cand in candidates:
-        if len(cand) < len(param_names):
+        if not all(k in cand for k in BC_ALL_PARAM_NAMES):
             continue
-        vec = np.array([cand[k] for k in param_names], dtype=float)
-        vec = np.clip(vec, lb, ub)
-        for idx in [3, 5, 7]:
-            vec[idx] = min(vec[idx], -1e-3)
-        val = float(loss(vec))
+        val = float(_loss_from_params(cand))
         if val < best_val:
             best_val = val
-            best = {k: float(v) for k, v in zip(param_names, vec)}
-            best["perm_max_md"] = resolved_perm_max
+            best = {k: float(cand[k]) for k in BC_ALL_PARAM_NAMES} | {"perm_max_md": resolved_perm_max}
 
     return best

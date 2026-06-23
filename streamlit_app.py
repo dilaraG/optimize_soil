@@ -17,6 +17,8 @@ import streamlit as st
 import streamlit.components.v1 as components
 
 from brooks_corey import (
+    BC_DEP_KEYS,
+    BC_DEP_PARAM_NAMES,
     PowerBounds,
     auto_exp_bounds_swl_poro,
     auto_power_bounds,
@@ -55,6 +57,10 @@ from optimize import (
 )
 
 st.set_page_config(page_title="J-функция Леверетта", layout="wide")
+
+
+def _fragment_run(fn):
+    return st.fragment(fn) if hasattr(st, "fragment") else fn
 
 
 def _inject_streamlit_ru_ui_styles() -> None:
@@ -160,6 +166,22 @@ def _inject_streamlit_ru_ui_styles() -> None:
             content: "Экран";
             font-size: 0.7rem;
             line-height: normal;
+        }
+        /* Меньше скачков при появлении спиннера и фокусе на кнопках */
+        [data-testid="stSpinner"] {
+            min-height: 1.75rem;
+        }
+        [data-testid="stAppViewContainer"] {
+            scroll-behavior: auto !important;
+        }
+        [data-testid="stSelectbox"],
+        [data-testid="stSelectbox"] > div,
+        [data-baseweb="select"] {
+            overflow-anchor: none;
+            scroll-margin: 0 !important;
+        }
+        button:focus-visible {
+            scroll-margin: 0 !important;
         }
         </style>
         """,
@@ -1259,211 +1281,213 @@ def _render_snapshot_disk_panel(key_prefix: str = "snap_disk") -> None:
                 st.error(str(e))
 
 
+def _kng_hist_stats(arr: np.ndarray) -> list[float]:
+    """Сводные по истории: без точек с Кн_hist = 0 (нефтяные интервалы)."""
+    a = arr[np.isfinite(arr) & (arr > 1e-15)]
+    if a.size == 0:
+        return [np.nan] * 5
+    return [
+        float(np.min(a)),
+        float(np.max(a)),
+        float(np.mean(a)),
+        float(np.median(a)),
+        float(np.std(a)),
+    ]
+
+
+def _kng_model_stats(arr: np.ndarray) -> list[float]:
+    a = arr[np.isfinite(arr)]
+    if a.size == 0:
+        return [np.nan] * 5
+    return [
+        float(np.nanmin(a)),
+        float(np.nanmax(a)),
+        float(np.nanmean(a)),
+        float(np.nanmedian(a)),
+        float(np.nanstd(a)),
+    ]
+
+
+def _weighted_region_table(df_snap: pd.DataFrame) -> pd.DataFrame:
+    if df_snap.empty:
+        return pd.DataFrame()
+    work = df_snap.copy()
+    work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
+    work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
+    work["weight"] = pd.to_numeric(work.get("weight", 1.0), errors="coerce").fillna(1.0)
+    work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"]) & (work["weight"] > 0)]
+    if work.empty:
+        return pd.DataFrame()
+
+    def _row(g: pd.DataFrame, label: str | int | float) -> dict | None:
+        w = g["weight"].to_numpy(dtype=float)
+        sw = float(np.sum(w))
+        if sw <= 0:
+            return None
+        hist_w = float(np.sum(w * g["Кн_hist"].to_numpy(dtype=float)) / sw)
+        model_w = float(np.sum(w * g["Кн_model"].to_numpy(dtype=float)) / sw)
+        return {
+            "Регион": label,
+            "Средневзвешенное Кн (история)": hist_w,
+            "Средневзвешенное Кн (модель)": model_w,
+            "Дельта": model_w - hist_w,
+            "Точек": int(len(g)),
+        }
+
+    rows: list[dict] = []
+    all_row = _row(work, "Все регионы")
+    if all_row:
+        rows.append(all_row)
+
+    region_col = "PVTNUM_GDM" if "PVTNUM_GDM" in work.columns else None
+    if region_col is not None and work[region_col].notna().any():
+        for region, g in work.groupby(region_col, dropna=False):
+            r = _row(g, region)
+            if r:
+                rows.append(r)
+
+    if not rows:
+        return pd.DataFrame()
+    tab = pd.DataFrame(rows)
+    tab["_ord"] = pd.to_numeric(tab["Регион"], errors="coerce")
+    tab.loc[tab["Регион"].astype(str) == "Все регионы", "_ord"] = -1
+    tab = tab.sort_values("_ord", na_position="last").drop(columns="_ord").reset_index(drop=True)
+    return tab
+
+
+def _hist_percent(df_snap: pd.DataFrame, region_pick: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df_snap.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    work = df_snap.copy()
+    work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
+    work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
+    work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"])]
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if (region_pick != "Все регионы") and ("PVTNUM_GDM" in work.columns):
+        work = work[work["PVTNUM_GDM"].astype(str) == str(region_pick)]
+    if work.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    hist = work["Кн_hist"].to_numpy(dtype=float)
+    model = work["Кн_model"].to_numpy(dtype=float)
+    lo = float(np.nanmin(np.r_[hist, model]))
+    hi = float(np.nanmax(np.r_[hist, model]))
+    if not np.isfinite(lo) or not np.isfinite(hi):
+        return pd.DataFrame(), pd.DataFrame()
+    if hi <= lo:
+        hi = lo + 1e-6
+    step = 0.02
+    lo_b = 0.5
+    hi_b = step * np.ceil(hi / step)
+    if hi_b <= lo_b:
+        hi_b = lo_b + step
+    bins = np.arange(lo_b, hi_b + step * 1.001, step)
+    if len(bins) < 2:
+        bins = np.array([lo_b, lo_b + step], dtype=float)
+    h_hist, edges = np.histogram(hist, bins=bins)
+    h_model, _ = np.histogram(model, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    denom_h = max(1, int(h_hist.sum()))
+    denom_m = max(1, int(h_model.sum()))
+    hist_df = pd.DataFrame(
+        {
+            "Нефтенасыщенность": centers,
+            "История, %": 100.0 * h_hist / denom_h,
+            "Модель, %": 100.0 * h_model / denom_m,
+        }
+    )
+    stats = pd.DataFrame(
+        {
+            "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
+            "История": _kng_hist_stats(hist),
+            "Модель": _kng_model_stats(model),
+        }
+    )
+    return hist_df, stats
+
+
+def _models_hist_percent(
+    df_j: pd.DataFrame, df_bc: pd.DataFrame, region_pick: str
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df_j.empty or df_bc.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    j = df_j.copy()
+    b = df_bc.copy()
+    for frame in (j, b):
+        frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce")
+        frame["WELL_NAME"] = frame["WELL_NAME"].astype(str)
+    mj = j[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
+        columns={"Кн_model": "J_model", "PVTNUM_GDM": "PVT_J"}
+    )
+    mb = b[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in b.columns else [])].rename(
+        columns={"Кн_model": "BC_model", "PVTNUM_GDM": "PVT_BC"}
+    )
+    m = mj.merge(mb, on=["WELL_NAME", "_AXIS_R"], how="inner")
+    if m.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    if "PVT_J" in m.columns:
+        m["PVTNUM_GDM"] = m["PVT_J"]
+    elif "PVT_BC" in m.columns:
+        m["PVTNUM_GDM"] = m["PVT_BC"]
+    if (region_pick != "Все регионы") and ("PVTNUM_GDM" in m.columns):
+        m = m[pd.to_numeric(m["PVTNUM_GDM"], errors="coerce") == float(region_pick)]
+    m["J_model"] = pd.to_numeric(m["J_model"], errors="coerce")
+    m["BC_model"] = pd.to_numeric(m["BC_model"], errors="coerce")
+    m = m[np.isfinite(m["J_model"]) & np.isfinite(m["BC_model"])]
+    if m.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    jv = m["J_model"].to_numpy(dtype=float)
+    bv = m["BC_model"].to_numpy(dtype=float)
+    lo = float(np.nanmin(np.r_[jv, bv]))
+    hi = float(np.nanmax(np.r_[jv, bv]))
+    if hi <= lo:
+        hi = lo + 1e-6
+    step = 0.02
+    lo_b = 0.5
+    hi_b = step * np.ceil(hi / step)
+    if hi_b <= lo_b:
+        hi_b = lo_b + step
+    bins = np.arange(lo_b, hi_b + step * 1.001, step)
+    if len(bins) < 2:
+        bins = np.array([lo_b, lo_b + step], dtype=float)
+    h_j, edges = np.histogram(jv, bins=bins)
+    h_b, _ = np.histogram(bv, bins=bins)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    hist_df = pd.DataFrame(
+        {
+            "Нефтенасыщенность": centers,
+            "J-функция, %": 100.0 * h_j / max(1, int(h_j.sum())),
+            "Брукс-Кори, %": 100.0 * h_b / max(1, int(h_b.sum())),
+        }
+    )
+    stats_df = pd.DataFrame(
+        {
+            "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
+            "J-функция": [
+                float(np.nanmin(jv)),
+                float(np.nanmax(jv)),
+                float(np.nanmean(jv)),
+                float(np.nanmedian(jv)),
+                float(np.nanstd(jv)),
+            ],
+            "Брукс-Кори": [
+                float(np.nanmin(bv)),
+                float(np.nanmax(bv)),
+                float(np.nanmean(bv)),
+                float(np.nanmedian(bv)),
+                float(np.nanstd(bv)),
+            ],
+        }
+    )
+    return hist_df, stats_df
+
+
 def _render_methods_comparison_block(block_key: str = "compare_methods") -> None:
     cat_j = _snapshot_catalog("J")
     cat_bc = _snapshot_catalog("BC")
     if cat_j.empty or cat_bc.empty:
         st.info("Сохраните результаты обоих методов кнопкой «Запомнить результаты по скважинам».")
         return
-
-    def _crossplot_df(df_snap: pd.DataFrame) -> pd.DataFrame:
-        return _crossplot_points_from_snapshot(df_snap)
-
-    def _weighted_region_table(df_snap: pd.DataFrame) -> pd.DataFrame:
-        if df_snap.empty:
-            return pd.DataFrame()
-        work = df_snap.copy()
-        work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
-        work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
-        work["weight"] = pd.to_numeric(work.get("weight", 1.0), errors="coerce").fillna(1.0)
-        work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"]) & (work["weight"] > 0)]
-        if work.empty:
-            return pd.DataFrame()
-
-        def _row(g: pd.DataFrame, label: str | int | float) -> dict | None:
-            w = g["weight"].to_numpy(dtype=float)
-            sw = float(np.sum(w))
-            if sw <= 0:
-                return None
-            hist_w = float(np.sum(w * g["Кн_hist"].to_numpy(dtype=float)) / sw)
-            model_w = float(np.sum(w * g["Кн_model"].to_numpy(dtype=float)) / sw)
-            return {
-                "Регион": label,
-                "Средневзвешенное Кн (история)": hist_w,
-                "Средневзвешенное Кн (модель)": model_w,
-                "Дельта": model_w - hist_w,
-                "Точек": int(len(g)),
-            }
-
-        rows: list[dict] = []
-        all_row = _row(work, "Все регионы")
-        if all_row:
-            rows.append(all_row)
-
-        region_col = "PVTNUM_GDM" if "PVTNUM_GDM" in work.columns else None
-        if region_col is not None and work[region_col].notna().any():
-            for region, g in work.groupby(region_col, dropna=False):
-                r = _row(g, region)
-                if r:
-                    rows.append(r)
-
-        if not rows:
-            return pd.DataFrame()
-        tab = pd.DataFrame(rows)
-        tab["_ord"] = pd.to_numeric(tab["Регион"], errors="coerce")
-        tab.loc[tab["Регион"].astype(str) == "Все регионы", "_ord"] = -1
-        tab = tab.sort_values("_ord", na_position="last").drop(columns="_ord").reset_index(drop=True)
-        return tab
-
-    def _kng_hist_stats(arr: np.ndarray) -> list[float]:
-        """Сводные по истории: без точек с Кн_hist = 0 (нефтяные интервалы)."""
-        a = arr[np.isfinite(arr) & (arr > 1e-15)]
-        if a.size == 0:
-            return [np.nan] * 5
-        return [
-            float(np.min(a)),
-            float(np.max(a)),
-            float(np.mean(a)),
-            float(np.median(a)),
-            float(np.std(a)),
-        ]
-
-    def _kng_model_stats(arr: np.ndarray) -> list[float]:
-        a = arr[np.isfinite(arr)]
-        if a.size == 0:
-            return [np.nan] * 5
-        return [
-            float(np.nanmin(a)),
-            float(np.nanmax(a)),
-            float(np.nanmean(a)),
-            float(np.nanmedian(a)),
-            float(np.nanstd(a)),
-        ]
-
-    def _hist_percent(df_snap: pd.DataFrame, region_pick: str) -> tuple[pd.DataFrame, pd.DataFrame]:
-        if df_snap.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        work = df_snap.copy()
-        work["Кн_hist"] = pd.to_numeric(work["Кн_hist"], errors="coerce")
-        work["Кн_model"] = pd.to_numeric(work["Кн_model"], errors="coerce")
-        work = work[np.isfinite(work["Кн_hist"]) & np.isfinite(work["Кн_model"])]
-        if work.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        if (region_pick != "Все регионы") and ("PVTNUM_GDM" in work.columns):
-            work = work[work["PVTNUM_GDM"].astype(str) == str(region_pick)]
-        if work.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        hist = work["Кн_hist"].to_numpy(dtype=float)
-        model = work["Кн_model"].to_numpy(dtype=float)
-        lo = float(np.nanmin(np.r_[hist, model]))
-        hi = float(np.nanmax(np.r_[hist, model]))
-        if not np.isfinite(lo) or not np.isfinite(hi):
-            return pd.DataFrame(), pd.DataFrame()
-        if hi <= lo:
-            hi = lo + 1e-6
-        step = 0.02
-        lo_b = 0.5
-        hi_b = step * np.ceil(hi / step)
-        if hi_b <= lo_b:
-            hi_b = lo_b + step
-        bins = np.arange(lo_b, hi_b + step * 1.001, step)
-        if len(bins) < 2:
-            bins = np.array([lo_b, lo_b + step], dtype=float)
-        h_hist, edges = np.histogram(hist, bins=bins)
-        h_model, _ = np.histogram(model, bins=bins)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        denom_h = max(1, int(h_hist.sum()))
-        denom_m = max(1, int(h_model.sum()))
-        hist_df = pd.DataFrame(
-            {
-                "Нефтенасыщенность": centers,
-                "История, %": 100.0 * h_hist / denom_h,
-                "Модель, %": 100.0 * h_model / denom_m,
-            }
-        )
-        stats = pd.DataFrame(
-            {
-                "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
-                "История": _kng_hist_stats(hist),
-                "Модель": _kng_model_stats(model),
-            }
-        )
-        return hist_df, stats
-
-    def _models_hist_percent(
-        df_j: pd.DataFrame, df_bc: pd.DataFrame, region_pick: str
-    ) -> tuple[pd.DataFrame, pd.DataFrame]:
-        if df_j.empty or df_bc.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        j = df_j.copy()
-        b = df_bc.copy()
-        for frame in (j, b):
-            frame["_AXIS_R"] = pd.to_numeric(frame["_AXIS"], errors="coerce")
-            frame["WELL_NAME"] = frame["WELL_NAME"].astype(str)
-        mj = j[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in j.columns else [])].rename(
-            columns={"Кн_model": "J_model", "PVTNUM_GDM": "PVT_J"}
-        )
-        mb = b[["WELL_NAME", "_AXIS_R", "Кн_model"] + (["PVTNUM_GDM"] if "PVTNUM_GDM" in b.columns else [])].rename(
-            columns={"Кн_model": "BC_model", "PVTNUM_GDM": "PVT_BC"}
-        )
-        m = mj.merge(mb, on=["WELL_NAME", "_AXIS_R"], how="inner")
-        if m.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        if "PVT_J" in m.columns:
-            m["PVTNUM_GDM"] = m["PVT_J"]
-        elif "PVT_BC" in m.columns:
-            m["PVTNUM_GDM"] = m["PVT_BC"]
-        if (region_pick != "Все регионы") and ("PVTNUM_GDM" in m.columns):
-            m = m[pd.to_numeric(m["PVTNUM_GDM"], errors="coerce") == float(region_pick)]
-        m["J_model"] = pd.to_numeric(m["J_model"], errors="coerce")
-        m["BC_model"] = pd.to_numeric(m["BC_model"], errors="coerce")
-        m = m[np.isfinite(m["J_model"]) & np.isfinite(m["BC_model"])]
-        if m.empty:
-            return pd.DataFrame(), pd.DataFrame()
-        jv = m["J_model"].to_numpy(dtype=float)
-        bv = m["BC_model"].to_numpy(dtype=float)
-        lo = float(np.nanmin(np.r_[jv, bv]))
-        hi = float(np.nanmax(np.r_[jv, bv]))
-        if hi <= lo:
-            hi = lo + 1e-6
-        step = 0.02
-        lo_b = 0.5
-        hi_b = step * np.ceil(hi / step)
-        if hi_b <= lo_b:
-            hi_b = lo_b + step
-        bins = np.arange(lo_b, hi_b + step * 1.001, step)
-        if len(bins) < 2:
-            bins = np.array([lo_b, lo_b + step], dtype=float)
-        h_j, edges = np.histogram(jv, bins=bins)
-        h_b, _ = np.histogram(bv, bins=bins)
-        centers = 0.5 * (edges[:-1] + edges[1:])
-        hist_df = pd.DataFrame(
-            {
-                "Нефтенасыщенность": centers,
-                "J-функция, %": 100.0 * h_j / max(1, int(h_j.sum())),
-                "Брукс-Кори, %": 100.0 * h_b / max(1, int(h_b.sum())),
-            }
-        )
-        stats_df = pd.DataFrame(
-            {
-                "Показатель": ["Минимум", "Максимум", "Среднее", "Медиана", "Станд. отклонение"],
-                "J-функция": [
-                    float(np.nanmin(jv)),
-                    float(np.nanmax(jv)),
-                    float(np.nanmean(jv)),
-                    float(np.nanmedian(jv)),
-                    float(np.nanstd(jv)),
-                ],
-                "Брукс-Кори": [
-                    float(np.nanmin(bv)),
-                    float(np.nanmax(bv)),
-                    float(np.nanmean(bv)),
-                    float(np.nanmedian(bv)),
-                    float(np.nanstd(bv)),
-                ],
-            }
-        )
-        return hist_df, stats_df
 
     def _corr(a: np.ndarray, b: np.ndarray) -> float:
         m = np.isfinite(a) & np.isfinite(b)
@@ -1524,40 +1548,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             st.info("Недостаточно данных для региональной сводки J-функции.")
         else:
             st.dataframe(_round_df(tab_reg_j), use_container_width=True)
-            reg_opts = [str(x) for x in tab_reg_j["Регион"].tolist()]
-            reg_pick = st.selectbox("Регион для гистограммы (J)", options=reg_opts, key=f"{block_key}_hist_reg_j")
-            hist_df, stats_df = _hist_percent(sj, reg_pick)
-            if hist_df.empty:
-                st.info("Нет данных для гистограммы J-функции.")
-            else:
-                cc1, cc2 = st.columns([2, 1])
-                fig_h = px.bar(
-                    hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
-                    x="Нефтенасыщенность",
-                    y="Проценты",
-                    color="Источник",
-                    barmode="overlay",
-                    opacity=0.6,
-                    title=f"J-функция: распределение Кн ({reg_pick})",
-                )
-                fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
-                cc1.plotly_chart(fig_h, use_container_width=True)
-                cc1.download_button(
-                    "Скачать данные гистограммы (J, CSV)",
-                    data=_csv_bytes(hist_df),
-                    file_name=f"hist_j_{str(reg_pick).replace(' ', '_')}.csv",
-                    mime="text/csv",
-                    key=f"{block_key}_dl_hist_j",
-                )
-                cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
-                cc2.dataframe(_round_df(stats_df), use_container_width=True)
-                cc2.download_button(
-                    "Скачать статистику (J, CSV)",
-                    data=_csv_bytes(stats_df),
-                    file_name=f"hist_j_stats_{str(reg_pick).replace(' ', '_')}.csv",
-                    mime="text/csv",
-                    key=f"{block_key}_dl_hist_j_stats",
-                )
+            _compare_hist_j_run(block_key, sj)
 
     with meth_tab_bc:
         tab_reg_b = _weighted_region_table(sb)
@@ -1565,87 +1556,15 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             st.info("Недостаточно данных для региональной сводки Брукса-Кори.")
         else:
             st.dataframe(_round_df(tab_reg_b), use_container_width=True)
-            reg_opts = [str(x) for x in tab_reg_b["Регион"].tolist()]
-            reg_pick = st.selectbox("Регион для гистограммы (БК)", options=reg_opts, key=f"{block_key}_hist_reg_bc")
-            hist_df, stats_df = _hist_percent(sb, reg_pick)
-            if hist_df.empty:
-                st.info("Нет данных для гистограммы Брукса-Кори.")
-            else:
-                cc1, cc2 = st.columns([2, 1])
-                fig_h = px.bar(
-                    hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
-                    x="Нефтенасыщенность",
-                    y="Проценты",
-                    color="Источник",
-                    barmode="overlay",
-                    opacity=0.6,
-                    title=f"Брукс-Кори: распределение Кн ({reg_pick})",
-                )
-                fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
-                cc1.plotly_chart(fig_h, use_container_width=True)
-                cc1.download_button(
-                    "Скачать данные гистограммы (БК, CSV)",
-                    data=_csv_bytes(hist_df),
-                    file_name=f"hist_bc_{str(reg_pick).replace(' ', '_')}.csv",
-                    mime="text/csv",
-                    key=f"{block_key}_dl_hist_bc",
-                )
-                cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
-                cc2.dataframe(_round_df(stats_df), use_container_width=True)
-                cc2.download_button(
-                    "Скачать статистику (БК, CSV)",
-                    data=_csv_bytes(stats_df),
-                    file_name=f"hist_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
-                    mime="text/csv",
-                    key=f"{block_key}_dl_hist_bc_stats",
-                )
+            _compare_hist_bc_run(block_key, sb)
 
     with meth_tab_cmp:
-        pvt_vals = sorted(
-            set(
-                [str(x) for x in pd.to_numeric(sj.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
-                + [str(x) for x in pd.to_numeric(sb.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
-            )
-        )
-        reg_opts = ["Все регионы"] + pvt_vals
-        reg_pick = st.selectbox("Регион для гистограммы (J vs БК)", options=reg_opts, key=f"{block_key}_hist_reg_jbc")
-        hist_df, stats_df = _models_hist_percent(sj, sb, reg_pick)
-        if hist_df.empty:
-            st.info("Недостаточно общих точек J и БК для построения гистограммы.")
-        else:
-            c1, c2 = st.columns([2, 1])
-            fig_cmp = px.bar(
-                hist_df.melt(id_vars="Нефтенасыщенность", var_name="Модель", value_name="Проценты"),
-                x="Нефтенасыщенность",
-                y="Проценты",
-                color="Модель",
-                barmode="overlay",
-                opacity=0.6,
-                title=f"Распределения предсказанной Кн: J vs БК ({reg_pick})",
-            )
-            fig_cmp.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
-            c1.plotly_chart(fig_cmp, use_container_width=True)
-            c1.download_button(
-                "Скачать данные гистограммы (J_vs_БК, CSV)",
-                data=_csv_bytes(hist_df),
-                file_name=f"hist_j_bc_{str(reg_pick).replace(' ', '_')}.csv",
-                mime="text/csv",
-                key=f"{block_key}_dl_hist_jbc",
-            )
-            c2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
-            c2.dataframe(_round_df(stats_df), use_container_width=True)
-            c2.download_button(
-                "Скачать статистику (J_vs_БК, CSV)",
-                data=_csv_bytes(stats_df),
-                file_name=f"hist_j_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
-                mime="text/csv",
-                key=f"{block_key}_dl_hist_jbc_stats",
-            )
+        _compare_hist_jbc_run(block_key, sj, sb)
 
     st.markdown("### Кроссплоты по скважинам (средневзвешенно, все регионы)")
     cw1, cw2 = st.columns(2)
 
-    sj_cross_src = _crossplot_df(sj)
+    sj_cross_src = _crossplot_points_from_snapshot(sj)
     if sj_cross_src.empty:
         cw1.info("Недостаточно данных для кроссплота по скважинам (J).")
     else:
@@ -1692,7 +1611,7 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
             cw1.plotly_chart(fig_jw, use_container_width=True)
             cw1.caption(f"Скважин (точек кроссплота): {len(sj_cross)}")
 
-    sb_cross_src = _crossplot_df(sb)
+    sb_cross_src = _crossplot_points_from_snapshot(sb)
     if sb_cross_src.empty:
         cw2.info("Недостаточно данных для кроссплота по скважинам (БК).")
     else:
@@ -1771,8 +1690,8 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
 
     st.markdown("### Кроссплоты по методам")
     c3, c4 = st.columns(2)
-    sj_x = _crossplot_df(sj)
-    sb_x = _crossplot_df(sb)
+    sj_x = _crossplot_points_from_snapshot(sj)
+    sb_x = _crossplot_points_from_snapshot(sb)
     if sj_x.empty:
         c3.info("Нет точек для кроссплота J после исключения Кн_hist = 0.")
     else:
@@ -1876,6 +1795,141 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
         use_container_width=True,
     )
 
+    _compare_well_profile_run(block_key, sj, sb, cmp_df)
+
+
+def _compare_hist_j_fragment(block_key: str, sj: pd.DataFrame) -> None:
+    tab_reg_j = _weighted_region_table(sj)
+    if tab_reg_j.empty:
+        return
+    reg_opts = [str(x) for x in tab_reg_j["Регион"].tolist()]
+    reg_pick = st.selectbox("Регион для гистограммы (J)", options=reg_opts, key=f"{block_key}_hist_reg_j")
+    hist_df, stats_df = _hist_percent(sj, reg_pick)
+    if hist_df.empty:
+        st.info("Нет данных для гистограммы J-функции.")
+        return
+    cc1, cc2 = st.columns([2, 1])
+    fig_h = px.bar(
+        hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
+        x="Нефтенасыщенность",
+        y="Проценты",
+        color="Источник",
+        barmode="overlay",
+        opacity=0.6,
+        title=f"J-функция: распределение Кн ({reg_pick})",
+    )
+    fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+    cc1.plotly_chart(fig_h, use_container_width=True, key=f"{block_key}_hist_j_plot")
+    cc1.download_button(
+        "Скачать данные гистограммы (J, CSV)",
+        data=_csv_bytes(hist_df),
+        file_name=f"hist_j_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_j",
+    )
+    cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
+    cc2.dataframe(_round_df(stats_df), use_container_width=True)
+    cc2.download_button(
+        "Скачать статистику (J, CSV)",
+        data=_csv_bytes(stats_df),
+        file_name=f"hist_j_stats_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_j_stats",
+    )
+    _inject_scroll_restore_only()
+
+
+def _compare_hist_bc_fragment(block_key: str, sb: pd.DataFrame) -> None:
+    tab_reg_b = _weighted_region_table(sb)
+    if tab_reg_b.empty:
+        return
+    reg_opts = [str(x) for x in tab_reg_b["Регион"].tolist()]
+    reg_pick = st.selectbox("Регион для гистограммы (БК)", options=reg_opts, key=f"{block_key}_hist_reg_bc")
+    hist_df, stats_df = _hist_percent(sb, reg_pick)
+    if hist_df.empty:
+        st.info("Нет данных для гистограммы Брукса-Кори.")
+        return
+    cc1, cc2 = st.columns([2, 1])
+    fig_h = px.bar(
+        hist_df.melt(id_vars="Нефтенасыщенность", var_name="Источник", value_name="Проценты"),
+        x="Нефтенасыщенность",
+        y="Проценты",
+        color="Источник",
+        barmode="overlay",
+        opacity=0.6,
+        title=f"Брукс-Кори: распределение Кн ({reg_pick})",
+    )
+    fig_h.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+    cc1.plotly_chart(fig_h, use_container_width=True, key=f"{block_key}_hist_bc_plot")
+    cc1.download_button(
+        "Скачать данные гистограммы (БК, CSV)",
+        data=_csv_bytes(hist_df),
+        file_name=f"hist_bc_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_bc",
+    )
+    cc2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
+    cc2.dataframe(_round_df(stats_df), use_container_width=True)
+    cc2.download_button(
+        "Скачать статистику (БК, CSV)",
+        data=_csv_bytes(stats_df),
+        file_name=f"hist_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_bc_stats",
+    )
+    _inject_scroll_restore_only()
+
+
+def _compare_hist_jbc_fragment(block_key: str, sj: pd.DataFrame, sb: pd.DataFrame) -> None:
+    pvt_vals = sorted(
+        set(
+            [str(x) for x in pd.to_numeric(sj.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
+            + [str(x) for x in pd.to_numeric(sb.get("PVTNUM_GDM"), errors="coerce").dropna().astype(int).tolist()]
+        )
+    )
+    reg_opts = ["Все регионы"] + pvt_vals
+    reg_pick = st.selectbox("Регион для гистограммы (J vs БК)", options=reg_opts, key=f"{block_key}_hist_reg_jbc")
+    hist_df, stats_df = _models_hist_percent(sj, sb, reg_pick)
+    if hist_df.empty:
+        st.info("Недостаточно общих точек J и БК для построения гистограммы.")
+        return
+    c1, c2 = st.columns([2, 1])
+    fig_cmp = px.bar(
+        hist_df.melt(id_vars="Нефтенасыщенность", var_name="Модель", value_name="Проценты"),
+        x="Нефтенасыщенность",
+        y="Проценты",
+        color="Модель",
+        barmode="overlay",
+        opacity=0.6,
+        title=f"Распределения предсказанной Кн: J vs БК ({reg_pick})",
+    )
+    fig_cmp.update_xaxes(range=[0.5, None], dtick=0.02, tickformat=".2f")
+    c1.plotly_chart(fig_cmp, use_container_width=True, key=f"{block_key}_hist_jbc_plot")
+    c1.download_button(
+        "Скачать данные гистограммы (J_vs_БК, CSV)",
+        data=_csv_bytes(hist_df),
+        file_name=f"hist_j_bc_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_jbc",
+    )
+    c2.markdown("<div style='height: 42px;'></div>", unsafe_allow_html=True)
+    c2.dataframe(_round_df(stats_df), use_container_width=True)
+    c2.download_button(
+        "Скачать статистику (J_vs_БК, CSV)",
+        data=_csv_bytes(stats_df),
+        file_name=f"hist_j_bc_stats_{str(reg_pick).replace(' ', '_')}.csv",
+        mime="text/csv",
+        key=f"{block_key}_dl_hist_jbc_stats",
+    )
+    _inject_scroll_restore_only()
+
+
+_compare_hist_j_run = _fragment_run(_compare_hist_j_fragment)
+_compare_hist_bc_run = _fragment_run(_compare_hist_bc_fragment)
+_compare_hist_jbc_run = _fragment_run(_compare_hist_jbc_fragment)
+
+
+def _compare_well_profile_fragment(block_key: str, sj: pd.DataFrame, sb: pd.DataFrame, cmp_df: pd.DataFrame) -> None:
     well = st.selectbox(
         "Скважина для детального сравнения",
         options=sorted(cmp_df["WELL_NAME"].unique().tolist()),
@@ -1908,6 +1962,10 @@ def _render_methods_comparison_block(block_key: str = "compare_methods") -> None
     else:
         fig.update_yaxes(title="Индекс точки")
     st.plotly_chart(fig, use_container_width=True)
+    _inject_scroll_restore_only()
+
+
+_compare_well_profile_run = _fragment_run(_compare_well_profile_fragment)
 
 
 def _well_pvts(df: pd.DataFrame) -> list[int]:
@@ -2023,6 +2081,19 @@ def _coalesce_path(*keys: str) -> str | None:
     return None
 
 
+SCROLL_PAGE_KEYS: dict[str, str] = {
+    "Лаборатория": "scroll_lab",
+    "Подбор J функции Леверетта": "scroll_j",
+    "Брукса-Кори": "scroll_bc",
+    "Сравнение методов": "scroll_cmp",
+}
+ALL_SCROLL_KEYS: tuple[str, ...] = tuple(SCROLL_PAGE_KEYS.values())
+
+
+def _scroll_key_for_page(page: str) -> str:
+    return SCROLL_PAGE_KEYS.get(page, "scroll_app")
+
+
 def _scroll_page_top() -> None:
     """Прокрутка в начало страницы (с повторами после отрисовки контента Streamlit)."""
     components.html(
@@ -2079,7 +2150,7 @@ def _scroll_page_top() -> None:
     )
 
 
-SCROLL_STORAGE_BC = "scroll_bc_main"
+SCROLL_STORAGE_BC = SCROLL_PAGE_KEYS["Брукса-Кори"]
 
 
 def _mark_scroll_to_top_pending() -> None:
@@ -2096,7 +2167,8 @@ def _scroll_to_top_if_pending(*, finish: bool = False) -> None:
 
 
 def _clear_preserved_scroll(*storage_keys: str) -> None:
-    keys_js = ", ".join(repr(k) for k in storage_keys)
+    keys = list(storage_keys) if storage_keys else list(ALL_SCROLL_KEYS)
+    keys_js = ", ".join(repr(k) for k in keys)
     components.html(
         f"""
         <script>
@@ -2113,56 +2185,157 @@ def _clear_preserved_scroll(*storage_keys: str) -> None:
     )
 
 
-def _preserve_scroll_position(storage_key: str = SCROLL_STORAGE_BC, *, restore: bool = True) -> None:
-    """Сохраняет прокрутку; восстановление только внутри той же вкладки (restore=True)."""
+def _inject_scroll_preservation(
+    storage_key: str,
+    *,
+    restore: bool = True,
+    save_current: bool = False,
+) -> None:
+    """Сохраняет и восстанавливает прокрутку при rerun (кнопки, selectbox, спиннер)."""
     restore_js = "true" if restore else "false"
+    save_js = "true" if save_current else "false"
     components.html(
         f"""
         <script>
         (function() {{
           const doc = window.parent.document;
+          const win = window.parent;
           if (!doc) return;
           const KEY = '{storage_key}';
           const doRestore = {restore_js};
+          const doSave = {save_js};
+          win.__st_scroll_key = KEY;
+
           function scrollEl() {{
             return doc.querySelector('[data-testid="stAppViewContainer"]')
                 || doc.querySelector('section.main')
                 || doc.scrollingElement
                 || doc.documentElement;
           }}
-          const el = scrollEl();
-          if (!el) return;
 
-          if (doRestore) {{
-            const saved = sessionStorage.getItem(KEY);
-            if (saved !== null && saved !== '') {{
-              const y = parseInt(saved, 10);
-              if (!Number.isNaN(y)) {{
-                const apply = () => {{ try {{ el.scrollTop = y; }} catch (e) {{}} }};
-                apply();
-                requestAnimationFrame(apply);
-                setTimeout(apply, 0);
-                setTimeout(apply, 80);
-                setTimeout(apply, 200);
+          function saveScroll() {{
+            const key = win.__st_scroll_key || KEY;
+            const el = scrollEl();
+            if (!el || !key) return;
+            try {{ sessionStorage.setItem(key, String(el.scrollTop)); }} catch (e) {{}}
+          }}
+
+          function startScrollLock(y, ms) {{
+            const until = Date.now() + (ms || 2800);
+            win.__st_scroll_lock_y = y;
+            win.__st_scroll_lock_until = until;
+            function lockFrame() {{
+              if (Date.now() > until) return;
+              const el = scrollEl();
+              if (el && Math.abs(el.scrollTop - y) > 1) {{
+                try {{ el.scrollTop = y; }} catch (e) {{}}
               }}
+              requestAnimationFrame(lockFrame);
             }}
-          }} else {{
-            try {{ sessionStorage.setItem(KEY, '0'); }} catch (e) {{}}
+            lockFrame();
           }}
 
-          const flag = '__scroll_listener_' + KEY;
-          if (!window[flag]) {{
-            window[flag] = true;
-            el.addEventListener('scroll', () => {{
-              sessionStorage.setItem(KEY, String(el.scrollTop));
-            }}, {{ passive: true }});
+          function restoreScroll() {{
+            const key = win.__st_scroll_key || KEY;
+            const el = scrollEl();
+            if (!el || !key) return;
+            const saved = sessionStorage.getItem(key);
+            if (saved === null || saved === '') return;
+            const y = parseInt(saved, 10);
+            if (Number.isNaN(y)) return;
+            const apply = () => {{
+              try {{
+                el.scrollTop = y;
+                if (typeof el.scrollTo === 'function') {{
+                  el.scrollTo({{ top: y, left: 0, behavior: 'auto' }});
+                }}
+              }} catch (e) {{}}
+            }};
+            apply();
+            requestAnimationFrame(apply);
+            [0, 30, 80, 150, 280, 450, 700, 1000, 1500, 2200, 3000].forEach((ms) => setTimeout(apply, ms));
+            startScrollLock(y, 2800);
           }}
+
+          if (!win.__st_scroll_installed) {{
+            win.__st_scroll_installed = true;
+
+            const onPointer = () => saveScroll();
+            doc.addEventListener('pointerdown', onPointer, true);
+            doc.addEventListener('mousedown', onPointer, true);
+            doc.addEventListener('touchstart', onPointer, true);
+            doc.addEventListener('change', onPointer, true);
+            doc.addEventListener('input', onPointer, true);
+
+            doc.addEventListener('click', (ev) => {{
+              saveScroll();
+              const t = ev.target;
+              const focusable = t && t.closest
+                ? t.closest('button, input, select, textarea, [data-baseweb="select"]')
+                : null;
+              const blurTarget = focusable || doc.activeElement;
+              if (blurTarget && blurTarget !== doc.body && typeof blurTarget.blur === 'function') {{
+                setTimeout(() => {{ try {{ blurTarget.blur(); }} catch (e) {{}} }}, 0);
+              }}
+            }}, true);
+
+            const el0 = scrollEl();
+            if (el0) {{
+              el0.addEventListener('scroll', () => {{
+                const key = win.__st_scroll_key;
+                const until = win.__st_scroll_lock_until || 0;
+                if (key && Date.now() < until) {{
+                  const y = win.__st_scroll_lock_y;
+                  if (typeof y === 'number' && Math.abs(el0.scrollTop - y) > 1) {{
+                    try {{ el0.scrollTop = y; }} catch (e) {{}}
+                    return;
+                  }}
+                }}
+                saveScroll();
+              }}, {{ passive: true }});
+            }}
+
+            win.__st_scroll_interval = setInterval(saveScroll, 120);
+
+            const root = doc.querySelector('[data-testid="stAppViewContainer"]') || doc.body;
+            if (root && !win.__st_scroll_observer) {{
+              win.__st_scroll_observer = new MutationObserver(() => {{
+                const key = win.__st_scroll_key;
+                if (!key) return;
+                const saved = sessionStorage.getItem(key);
+                if (saved === null || saved === '') return;
+                const y = parseInt(saved, 10);
+                if (Number.isNaN(y)) return;
+                const el = scrollEl();
+                if (el && Math.abs(el.scrollTop - y) > 2) {{
+                  try {{ el.scrollTop = y; }} catch (e) {{}}
+                }}
+              }});
+              win.__st_scroll_observer.observe(root, {{ childList: true, subtree: true, attributes: true }});
+            }}
+          }}
+
+          if (doSave) saveScroll();
+          if (doRestore) restoreScroll();
         }})();
         </script>
         """,
         height=0,
         width=0,
     )
+
+
+def _inject_scroll_restore_only() -> None:
+    """Восстановить прокрутку после partial rerun (st.fragment)."""
+    page = st.session_state.get("_active_page")
+    if page and not st.session_state.get("_scroll_to_top_pending"):
+        _inject_scroll_preservation(_scroll_key_for_page(str(page)), restore=True)
+
+
+def _preserve_scroll_position(storage_key: str = SCROLL_STORAGE_BC, *, restore: bool = True) -> None:
+    """Обратная совместимость: делегирует в _inject_scroll_preservation."""
+    if restore:
+        _inject_scroll_preservation(storage_key)
 
 
 def _ui_lock(is_locked: bool, lock_id: str) -> None:
@@ -2436,6 +2609,143 @@ _bc_pvt_horizon_mapping_run = (
     else _bc_pvt_horizon_mapping_fragment
 )
 
+BC_DEP_LABELS: dict[str, str] = {
+    "swl": "swl(Кп) = a·exp(b·Кп)",
+    "perm": "Кпр(Кво)",
+    "pvit": "Pvit(√(Кпр/Кп))",
+    "n": "n(√(Кпр/Кп))",
+}
+
+BC_DEP_DEFAULTS: dict[str, tuple[float, float, float, float]] = {
+    "swl": (0.15, 25.0, -80.0, -0.5),
+    "perm": (1.0, 1e6, -80.0, -0.5),
+    "pvit": (1.0, 1e6, -80.0, -0.5),
+    "n": (1.0, 1e6, -80.0, -0.5),
+}
+
+
+def _bc_fixed_deps_from_session() -> list[str]:
+    return [k for k in BC_DEP_KEYS if st.session_state.get(f"bc_fix_{k}", False)]
+
+
+def _bc_manual_params_ui(pvts: list[int], fixed_deps: list[str]) -> dict[int, dict[str, float]]:
+    """Ввод a,b для выбранных зависимостей по каждому PVTNUM."""
+    manual_by_pvt: dict[int, dict[str, float]] = {}
+    if not fixed_deps:
+        return manual_by_pvt
+    st.subheader("Ввод своих коэффициентов (по каждому региону)")
+    for p in pvts:
+        with st.expander(f"PVTNUM {p}: коэффициенты", expanded=False):
+            row: dict[str, float] = {}
+            for dep in fixed_deps:
+                a_name, b_name = BC_DEP_PARAM_NAMES[dep]
+                a_def, a_max, b_min, b_def = BC_DEP_DEFAULTS[dep]
+                c1, c2 = st.columns(2)
+                with c1:
+                    row[a_name] = float(
+                        st.number_input(
+                            f"a ({BC_DEP_LABELS[dep]}) | PVT {p}",
+                            value=float(a_def),
+                            min_value=1e-6 if dep == "swl" else 1e-9,
+                            max_value=float(a_max),
+                            format="%.6f",
+                            key=f"man_{a_name}_{p}",
+                        )
+                    )
+                with c2:
+                    row[b_name] = float(
+                        st.number_input(
+                            f"b ({BC_DEP_LABELS[dep]}) | PVT {p}",
+                            value=float(b_def),
+                            min_value=float(b_min),
+                            max_value=80.0 if dep == "swl" else 0.0,
+                            format="%.6f",
+                            key=f"man_{b_name}_{p}",
+                        )
+                    )
+            manual_by_pvt[p] = row
+    return manual_by_pvt
+
+
+def _bc_build_fixed_pairs(manual: dict[str, float], fixed_deps: list[str]) -> dict[str, tuple[float, float]]:
+    out: dict[str, tuple[float, float]] = {}
+    for dep in fixed_deps:
+        a_name, b_name = BC_DEP_PARAM_NAMES[dep]
+        if a_name in manual and b_name in manual:
+            out[dep] = (float(manual[a_name]), float(manual[b_name]))
+    return out
+
+
+def _bc_param_source_row(fixed_deps: list[str]) -> dict[str, str]:
+    return {f"src_{dep}": ("ручной" if dep in fixed_deps else "авто") for dep in BC_DEP_KEYS}
+
+
+def _bc_plot_manual_preview(
+    p_preview: int,
+    prm: dict[str, float],
+    lsub: pd.DataFrame,
+    fixed_deps: list[str],
+) -> None:
+    plots: list[tuple[object, str]] = []
+    if "swl" in fixed_deps:
+        plots.append(
+            (
+                _plot_bc_cloud(
+                    lsub,
+                    "PORO_LAB_FRAC",
+                    "SWL_LAB",
+                    f"PVT {p_preview}: swl=a·exp(b·Кп) — ручные коэффициенты",
+                    opt_ab=(prm["a_swl"], prm["b_swl"]),
+                    curve_kind="swl_exp_ab",
+                ),
+                "swl",
+            )
+        )
+    if "perm" in fixed_deps:
+        plots.append(
+            (
+                _plot_bc_cloud(
+                    lsub,
+                    "SWL_LAB",
+                    "PERM_LAB",
+                    f"PVT {p_preview}: Кпр(Кво) — ручные коэффициенты",
+                    opt_ab=(prm["a_perm"], prm["b_perm"]),
+                ),
+                "perm",
+            )
+        )
+    if "pvit" in fixed_deps:
+        plots.append(
+            (
+                _plot_bc_cloud(
+                    lsub,
+                    "perm_poro",
+                    "PVIT_LAB",
+                    f"PVT {p_preview}: pvit(perm_poro) — ручные коэффициенты",
+                    opt_ab=(prm["a_pvit"], prm["b_pvit"]),
+                ),
+                "pvit",
+            )
+        )
+    if "n" in fixed_deps:
+        plots.append(
+            (
+                _plot_bc_cloud(
+                    lsub,
+                    "perm_poro",
+                    "N_LAB",
+                    f"PVT {p_preview}: n(perm_poro) — ручные коэффициенты",
+                    opt_ab=(prm["a_n"], prm["b_n"]),
+                ),
+                "n",
+            )
+        )
+    for i in range(0, len(plots), 2):
+        c1, c2 = st.columns(2)
+        c1.plotly_chart(plots[i][0], use_container_width=True)
+        if i + 1 < len(plots):
+            c2.plotly_chart(plots[i + 1][0], use_container_width=True)
+
 
 def _bc_results_dashboard_fragment() -> None:
     """Таблицы и графики результатов БК (без блока просмотра скважины)."""
@@ -2450,7 +2760,15 @@ def _bc_results_dashboard_fragment() -> None:
     cpar, cqa = st.columns(2)
     with cpar:
         st.subheader("Параметры Брукса-Кори по регионам")
-        st.dataframe(_round_df(bc_params), use_container_width=True)
+        params_show = bc_params.rename(
+            columns={
+                "src_swl": "swl (источник)",
+                "src_perm": "Кпр (источник)",
+                "src_pvit": "Pvit (источник)",
+                "src_n": "n (источник)",
+            }
+        )
+        st.dataframe(_round_df(params_show), use_container_width=True)
         if isinstance(bc_timing, pd.DataFrame) and not bc_timing.empty:
             st.subheader("Статистика времени расчета БК")
             bc_timing_ru = bc_timing.rename(
@@ -2498,73 +2816,98 @@ def _bc_results_dashboard_fragment() -> None:
         else:
             st.warning(msg)
 
+    _bc_lab_deps_run()
+    _bc_crossplots_run()
+
+
+def _bc_lab_deps_fragment() -> None:
+    bc_res = st.session_state.get("bc_result_df")
+    bc_params = st.session_state.get("bc_params_df")
+    if not isinstance(bc_res, pd.DataFrame) or not isinstance(bc_params, pd.DataFrame) or bc_res.empty:
+        return
+
     pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
     psel = st.selectbox("Регион для графиков БК", pvt_opts, key="bc_plot_pvt")
     g = bc_res[pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce") == float(psel)].copy()
     g = g.dropna(subset=["Кн_W", "Kng_BC_model"])
     if g.empty:
+        st.warning(f"Для PVTNUM {psel} нет валидных точек для графиков зависимостей.")
         return
 
     bc_meta = st.session_state.get("bc_meta", {})
     m = bc_meta.get(psel, {})
     lab_pvt = m.get("lab", pd.DataFrame()).copy()
-    if not lab_pvt.empty:
-        st.subheader("Оптимальные зависимости Брукса-Кори по облакам")
-        horizons_for_plot = sorted(lab_pvt["HORIZON"].astype(str).unique().tolist())
-        selected_h = st.multiselect(
-            "Горизонты для отображения зависимостей",
-            options=horizons_for_plot,
-            default=horizons_for_plot,
-            key="bc_h_plot",
-        )
-        lab_plot = lab_pvt[lab_pvt["HORIZON"].astype(str).isin(selected_h)] if selected_h else lab_pvt
-        prow = bc_params[bc_params["PVTNUM_GDM"].astype(int) == int(psel)]
-        if not prow.empty and not lab_plot.empty:
-            pp = prow.iloc[0]
-            env = m.get("envelopes", {})
-            fig1 = _plot_bc_cloud(
-                lab_plot,
-                "PORO_LAB_FRAC",
-                "SWL_LAB",
-                f"PVT {psel}: swl = a·exp(b·Кп)",
-                lower_ab=env.get("swl", {}).get("lower"),
-                upper_ab=env.get("swl", {}).get("upper"),
-                opt_ab=(float(pp["a_swl"]), float(pp["b_swl"])),
-                curve_kind="swl_exp_ab",
-            )
-            fig2 = _plot_bc_cloud(
-                lab_plot,
-                "SWL_LAB",
-                "PERM_LAB",
-                f"PVT {psel}: Кпр(Кво)",
-                lower_ab=env.get("perm", {}).get("lower"),
-                upper_ab=env.get("perm", {}).get("upper"),
-                opt_ab=(float(pp["a_perm"]), float(pp["b_perm"])),
-            )
-            fig3 = _plot_bc_cloud(
-                lab_plot,
-                "perm_poro",
-                "PVIT_LAB",
-                f"PVT {psel}: pvit(perm_poro)",
-                lower_ab=env.get("pvit", {}).get("lower"),
-                upper_ab=env.get("pvit", {}).get("upper"),
-                opt_ab=(float(pp["a_pvit"]), float(pp["b_pvit"])),
-            )
-            fig4 = _plot_bc_cloud(
-                lab_plot,
-                "perm_poro",
-                "N_LAB",
-                f"PVT {psel}: n(perm_poro)",
-                lower_ab=env.get("n", {}).get("lower"),
-                upper_ab=env.get("n", {}).get("upper"),
-                opt_ab=(float(pp["a_n"]), float(pp["b_n"])),
-            )
-            c1, c2 = st.columns(2)
-            c1.plotly_chart(fig1, use_container_width=True)
-            c2.plotly_chart(fig2, use_container_width=True)
-            c3, c4 = st.columns(2)
-            c3.plotly_chart(fig3, use_container_width=True)
-            c4.plotly_chart(fig4, use_container_width=True)
+    if lab_pvt.empty:
+        return
+
+    st.subheader("Оптимальные зависимости Брукса-Кори по облакам")
+    horizons_for_plot = sorted(lab_pvt["HORIZON"].astype(str).unique().tolist())
+    selected_h = st.multiselect(
+        "Горизонты для отображения зависимостей",
+        options=horizons_for_plot,
+        default=horizons_for_plot,
+        key="bc_h_plot",
+    )
+    lab_plot = lab_pvt[lab_pvt["HORIZON"].astype(str).isin(selected_h)] if selected_h else lab_pvt
+    prow = bc_params[bc_params["PVTNUM_GDM"].astype(int) == int(psel)]
+    if prow.empty or lab_plot.empty:
+        return
+    pp = prow.iloc[0]
+    env = m.get("envelopes", {})
+    fig1 = _plot_bc_cloud(
+        lab_plot,
+        "PORO_LAB_FRAC",
+        "SWL_LAB",
+        f"PVT {psel}: swl = a·exp(b·Кп)",
+        lower_ab=env.get("swl", {}).get("lower"),
+        upper_ab=env.get("swl", {}).get("upper"),
+        opt_ab=(float(pp["a_swl"]), float(pp["b_swl"])),
+        curve_kind="swl_exp_ab",
+    )
+    fig2 = _plot_bc_cloud(
+        lab_plot,
+        "SWL_LAB",
+        "PERM_LAB",
+        f"PVT {psel}: Кпр(Кво)",
+        lower_ab=env.get("perm", {}).get("lower"),
+        upper_ab=env.get("perm", {}).get("upper"),
+        opt_ab=(float(pp["a_perm"]), float(pp["b_perm"])),
+    )
+    fig3 = _plot_bc_cloud(
+        lab_plot,
+        "perm_poro",
+        "PVIT_LAB",
+        f"PVT {psel}: pvit(perm_poro)",
+        lower_ab=env.get("pvit", {}).get("lower"),
+        upper_ab=env.get("pvit", {}).get("upper"),
+        opt_ab=(float(pp["a_pvit"]), float(pp["b_pvit"])),
+    )
+    fig4 = _plot_bc_cloud(
+        lab_plot,
+        "perm_poro",
+        "N_LAB",
+        f"PVT {psel}: n(perm_poro)",
+        lower_ab=env.get("n", {}).get("lower"),
+        upper_ab=env.get("n", {}).get("upper"),
+        opt_ab=(float(pp["a_n"]), float(pp["b_n"])),
+    )
+    c1, c2 = st.columns(2)
+    c1.plotly_chart(fig1, use_container_width=True)
+    c2.plotly_chart(fig2, use_container_width=True)
+    c3, c4 = st.columns(2)
+    c3.plotly_chart(fig3, use_container_width=True)
+    c4.plotly_chart(fig4, use_container_width=True)
+    _inject_scroll_restore_only()
+
+
+def _bc_crossplots_fragment() -> None:
+    bc_res = st.session_state.get("bc_result_df")
+    if not isinstance(bc_res, pd.DataFrame) or bc_res.empty:
+        return
+
+    pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
+    if not pvt_opts:
+        return
 
     st.subheader("Кроссплоты Брукса-Кори")
     bc_cross_pvt = st.selectbox(
@@ -2615,18 +2958,19 @@ def _bc_results_dashboard_fragment() -> None:
             _apply_crossplot_hover(figw, "Кн_W_wmean=%{x:.3f}<br>Kng_BC_wmean=%{y:.3f}", cross)
             figw.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
             figw.update_layout(legend_title_text="Регион" if cross_color == "Регион" else None)
-            st.plotly_chart(figw, use_container_width=True)
-            st.markdown("#### Невязка по кроссплоту (скважины)")
-            cross_all_bc = _well_crossplot_table_from_result(bc_res, "Кн_W", "Kng_BC_model")
-            _render_well_crossplot_qa_panel(
-                cross_all_bc,
-                x_col="Кн_W_wmean",
-                y_col="Kng_model_wmean",
-                region_col="Регион",
-                block_key="bc_all_pvt",
-                method_label="Брукса — Кори",
-                show_metrics_help=True,
-            )
+            st.plotly_chart(figw, use_container_width=True, key="bc_well_cross_plot")
+
+        st.markdown("#### Невязка по кроссплоту (скважины)")
+        cross_all_bc = _well_crossplot_table_from_result(bc_res, "Кн_W", "Kng_BC_model")
+        _render_well_crossplot_qa_panel(
+            cross_all_bc,
+            x_col="Кн_W_wmean",
+            y_col="Kng_model_wmean",
+            region_col="Регион",
+            block_key="bc_all_pvt",
+            method_label="Брукса — Кори",
+            show_metrics_help=True,
+        )
 
     bc_interactive_pvt = st.selectbox(
         "Регион для интерактивного графика",
@@ -2640,6 +2984,7 @@ def _bc_results_dashboard_fragment() -> None:
     )
     if g_conv.empty:
         st.warning("Нет валидных точек сходимости для интерактивного графика БК.")
+        _inject_scroll_restore_only()
         return
 
     st.markdown("#### Кроссплоты по скважинам (по всем точкам)")
@@ -2680,8 +3025,27 @@ def _bc_results_dashboard_fragment() -> None:
     fig.add_shape(type="line", x0=0, y0=0, x1=1, y1=1, line=dict(color="red", dash="dash"))
     _apply_crossplot_hover(fig, "Кн_W=%{x:.3f}<br>Kng_BC_model=%{y:.3f}", g_conv)
     fig.update_layout(legend_title_text="Регион" if bc_color == "Регион" else None)
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, use_container_width=True, key="bc_interactive_scatter_plot")
+    _inject_scroll_restore_only()
 
+
+_bc_lab_deps_run = _fragment_run(_bc_lab_deps_fragment)
+_bc_crossplots_run = _fragment_run(_bc_crossplots_fragment)
+
+
+def _bc_well_profile_fragment() -> None:
+    bc_res = st.session_state.get("bc_result_df")
+    if not isinstance(bc_res, pd.DataFrame) or bc_res.empty:
+        return
+    bc_interactive_pvt = st.session_state.get("bc_interactive_pvt")
+    if bc_interactive_pvt is None:
+        pvt_opts = sorted(pd.to_numeric(bc_res["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique().tolist())
+        bc_interactive_pvt = pvt_opts[0] if pvt_opts else None
+    g_conv = _filter_df_by_pvt_region(bc_res, bc_interactive_pvt)
+    g_conv = g_conv.dropna(subset=["Кн_W", "Kng_BC_model"])
+    g_conv = _filter_convergence_points(g_conv.rename(columns={"Kng_BC_model": "Kng_model"})).rename(
+        columns={"Kng_model": "Kng_BC_model"}
+    )
     if g_conv.empty or "WELL_NAME" not in g_conv.columns:
         return
     st.subheader("Просмотр скважины (Брукса-Кори)")
@@ -2691,24 +3055,29 @@ def _bc_results_dashboard_fragment() -> None:
     dcol = _pick_depth_column(wd)
     if dcol is None:
         st.warning("Не найдена колонка глубины для скважины.")
-    elif "ACTNUM_GDM" not in wd.columns:
+        return
+    if "ACTNUM_GDM" not in wd.columns:
         st.warning("В данных отсутствует ACTNUM_GDM.")
-    else:
-        wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
-        wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
-        curve = wd[[dcol, "ACTNUM_GDM", "Кн_W", "Kng_BC_model"]].rename(
-            columns={"Кн_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
-        )
-        melt = curve.melt(
-            id_vars=[dcol],
-            value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"],
-            var_name="Кривая",
-            value_name="Значение",
-        )
-        fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
-        fig_prof.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
-        fig_prof.update_yaxes(autorange="reversed")
-        st.plotly_chart(fig_prof, use_container_width=True)
+        return
+    wd[dcol] = pd.to_numeric(wd[dcol], errors="coerce")
+    wd = wd.dropna(subset=[dcol]).sort_values(dcol).reset_index(drop=True)
+    curve = wd[[dcol, "ACTNUM_GDM", "Кн_W", "Kng_BC_model"]].rename(
+        columns={"Кн_W": "Кн РИГИС", "Kng_BC_model": "Кн Брукса-Кори"}
+    )
+    melt = curve.melt(
+        id_vars=[dcol],
+        value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн Брукса-Кори"],
+        var_name="Кривая",
+        value_name="Значение",
+    )
+    fig_prof = px.line(melt, x="Значение", y=dcol, color="Кривая", title=f"Скважина {well}: вертикальный профиль (БК)")
+    fig_prof.update_traces(hovertemplate="Значение=%{x:.3f}<br>Глубина=%{y:.3f}<br>Кривая=%{fullData.name}<extra></extra>")
+    fig_prof.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig_prof, use_container_width=True)
+    _inject_scroll_restore_only()
+
+
+_bc_well_profile_run = _fragment_run(_bc_well_profile_fragment)
 
 
 _bc_results_dashboard_run = (
@@ -3679,6 +4048,49 @@ def laboratory_tab() -> None:
         st.plotly_chart(fig, use_container_width=True)
 
 
+def _j_swn_lab_optimal_fragment() -> None:
+    cloud = st.session_state.get("lab_cloud")
+    params_df = st.session_state.get("leverett_params_df")
+    if not isinstance(cloud, pd.DataFrame) or cloud.empty:
+        return
+    if not isinstance(params_df, pd.DataFrame) or params_df.empty:
+        return
+
+    st.subheader("J(Swn): лаборатория + степенная модель с оптимальными a, b")
+    pvt_opts = sorted(pd.to_numeric(params_df["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique())
+    if not pvt_opts:
+        return
+    region = st.selectbox(
+        "Регион для графика J–Swn",
+        options=pvt_opts,
+        key="jsw_region",
+    )
+    prow = params_df[params_df["PVTNUM_GDM"].astype(int) == int(region)]
+    if prow.empty:
+        return
+    a_opt = float(prow.iloc[0]["a"])
+    b_opt = float(prow.iloc[0]["b"])
+    hs = (st.session_state.get("pvt_horizon_map") or {}).get(int(region)) or sorted(
+        cloud["lab_horizon"].astype(str).unique().tolist()
+    )
+    sub = cloud[cloud["lab_horizon"].isin(hs)] if hs else cloud
+    lab_fit = fit_power_j_swn(sub["Swn"].to_numpy(), sub["J_lab"].to_numpy())
+    fig = _fig_j_swn_lab(
+        sub.assign(lab_area=sub["lab_area"].astype(str)),
+        title=f"PVT {region}: лаборатория и J = a·Swn^b (оптимальные a,b)",
+        trend_fit=lab_fit,
+        extra_lines=None,
+        optimal={"a": a_opt, "b": b_opt},
+        low_swn_threshold=float(st.session_state.get("j_low_swn_threshold", DEFAULT_LOW_SWN_THRESHOLD)),
+        j_cap_at_low_swn=float(st.session_state.get("j_cap_at_low_swn", DEFAULT_J_CAP_AT_LOW_SWN)),
+    )
+    st.plotly_chart(fig, use_container_width=True, key="jsw_plot_optimal")
+    _inject_scroll_restore_only()
+
+
+_j_swn_lab_optimal_run = _fragment_run(_j_swn_lab_optimal_fragment)
+
+
 def leverett_tab() -> None:
     st.title("Подбор J функции Леверетта")
     _scroll_to_top_if_pending()
@@ -4137,33 +4549,15 @@ def leverett_tab() -> None:
             st.warning(msg)
 
     if lab_ready and cloud is not None and not cloud.empty:
-        st.subheader("J(Swn): лаборатория + степенная модель с оптимальными a, b")
-        region = st.selectbox(
-            "Регион для графика J–Swn",
-            options=sorted(pd.to_numeric(params_df["PVTNUM_GDM"], errors="coerce").dropna().astype(int).unique()),
-            key="jsw_region",
-        )
-        prow = params_df[params_df["PVTNUM_GDM"].astype(int) == int(region)]
-        if not prow.empty:
-            a_opt = float(prow.iloc[0]["a"])
-            b_opt = float(prow.iloc[0]["b"])
-            hs = (st.session_state.get("pvt_horizon_map") or {}).get(int(region)) or sorted(
-                cloud["lab_horizon"].astype(str).unique().tolist()
-            )
-            sub = cloud[cloud["lab_horizon"].isin(hs)] if hs else cloud
-            lab_fit = fit_power_j_swn(sub["Swn"].to_numpy(), sub["J_lab"].to_numpy())
-            fig = _fig_j_swn_lab(
-                sub.assign(lab_area=sub["lab_area"].astype(str)),
-                title=f"PVT {region}: лаборатория и J = a·Swn^b (оптимальные a,b)",
-                trend_fit=lab_fit,
-                extra_lines=None,
-                optimal={"a": a_opt, "b": b_opt},
-                low_swn_threshold=float(
-                    st.session_state.get("j_low_swn_threshold", DEFAULT_LOW_SWN_THRESHOLD)
-                ),
-                j_cap_at_low_swn=float(st.session_state.get("j_cap_at_low_swn", DEFAULT_J_CAP_AT_LOW_SWN)),
-            )
-            st.plotly_chart(fig, use_container_width=True)
+        _j_swn_lab_optimal_run()
+
+    _j_kn_results_run()
+
+
+def _j_kn_results_fragment() -> None:
+    result_df = st.session_state.get("leverett_result_df")
+    if not isinstance(result_df, pd.DataFrame) or result_df.empty:
+        return
 
     pvt_series = pd.to_numeric(result_df["PVTNUM_GDM"], errors="coerce")
     region_options = sorted(pvt_series.dropna().astype(int).unique().tolist())
@@ -4347,64 +4741,76 @@ def leverett_tab() -> None:
         st.dataframe(_round_df(weight_summary_ru.head(15)), use_container_width=True)
 
     if "WELL_NAME" in region_df.columns:
-        wells = sorted(region_df["WELL_NAME"].astype(str).unique().tolist())
-        st.subheader("Просмотр скважины")
-        well = _shared_well_selectbox(wells)
-        well_df = region_df[region_df["WELL_NAME"].astype(str) == well].copy()
-        well_depth_col = depth_col or _pick_depth_column(well_df)
-        if well_depth_col is None:
-            st.warning("Не найдена колонка глубины (например DEPTH/DEPT).")
-        elif "ACTNUM_GDM" not in well_df.columns:
-            st.warning("В данных отсутствует ACTNUM_GDM для детального графика.")
-        else:
-            well_df[well_depth_col] = pd.to_numeric(well_df[well_depth_col], errors="coerce")
-            well_df = well_df.dropna(subset=[well_depth_col]).sort_values(well_depth_col).reset_index(drop=True)
-            curve_cols = [well_depth_col, "ACTNUM_GDM", "Кн_W", "Kng_model"]
-            if "FWL_GDM" in well_df.columns:
-                curve_cols.insert(1, "FWL_GDM")
-            curve_df = well_df[curve_cols].copy()
-            curve_df = curve_df.rename(columns={"Кн_W": "Кн РИГИС", "Kng_model": "Кн J-функция"})
-            id_vars = [well_depth_col]
-            if "FWL_GDM" in curve_df.columns:
-                id_vars.append("FWL_GDM")
-            chart_df = curve_df.melt(
-                id_vars=id_vars,
-                value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн J-функция"],
-                var_name="Кривая",
-                value_name="Значение",
-            )
-            fig_well = px.line(
-                chart_df,
-                x="Значение",
-                y=well_depth_col,
-                color="Кривая",
-                title=f"Скважина {well}: вертикальный профиль",
-            )
-            fig_well.update_traces(mode="lines")
-            if "FWL_GDM" in chart_df.columns:
-                fig_well.update_traces(
-                    hovertemplate=(
-                        "Значение=%{x:.3f}<br>"
-                        f"Глубина=%{{y:.3f}}<br>"
-                        "FWL=%{customdata[0]:.3f}<br>"
-                        "Кривая=%{fullData.name}<extra></extra>"
-                    )
-                )
-            else:
-                fig_well.update_traces(
-                    hovertemplate=(
-                        "Значение=%{x:.3f}<br>"
-                        f"Глубина=%{{y:.3f}}<br>"
-                        "Кривая=%{fullData.name}<extra></extra>"
-                    )
-                )
-            fig_well.update_yaxes(autorange="reversed")
-            fig_well.update_layout(xaxis_title="Значение", yaxis_title="Глубина")
-            st.plotly_chart(fig_well, use_container_width=True)
+        _j_well_profile_run(region_df, depth_col)
+    _inject_scroll_restore_only()
 
-            conv_percent = _well_convergence_percent_weighted(well_df)
-            if np.isfinite(conv_percent):
-                st.metric("Сходимость для скважины (средневзвеш.), %", f"{conv_percent:.2f}")
+
+_j_kn_results_run = _fragment_run(_j_kn_results_fragment)
+
+
+def _j_well_profile_fragment(region_df: pd.DataFrame, depth_col: str | None) -> None:
+    wells = sorted(region_df["WELL_NAME"].astype(str).unique().tolist())
+    st.subheader("Просмотр скважины")
+    well = _shared_well_selectbox(wells)
+    well_df = region_df[region_df["WELL_NAME"].astype(str) == well].copy()
+    well_depth_col = depth_col or _pick_depth_column(well_df)
+    if well_depth_col is None:
+        st.warning("Не найдена колонка глубины (например DEPTH/DEPT).")
+        return
+    if "ACTNUM_GDM" not in well_df.columns:
+        st.warning("В данных отсутствует ACTNUM_GDM для детального графика.")
+        return
+    well_df[well_depth_col] = pd.to_numeric(well_df[well_depth_col], errors="coerce")
+    well_df = well_df.dropna(subset=[well_depth_col]).sort_values(well_depth_col).reset_index(drop=True)
+    curve_cols = [well_depth_col, "ACTNUM_GDM", "Кн_W", "Kng_model"]
+    if "FWL_GDM" in well_df.columns:
+        curve_cols.insert(1, "FWL_GDM")
+    curve_df = well_df[curve_cols].copy()
+    curve_df = curve_df.rename(columns={"Кн_W": "Кн РИГИС", "Kng_model": "Кн J-функция"})
+    id_vars = [well_depth_col]
+    if "FWL_GDM" in curve_df.columns:
+        id_vars.append("FWL_GDM")
+    chart_df = curve_df.melt(
+        id_vars=id_vars,
+        value_vars=["ACTNUM_GDM", "Кн РИГИС", "Кн J-функция"],
+        var_name="Кривая",
+        value_name="Значение",
+    )
+    fig_well = px.line(
+        chart_df,
+        x="Значение",
+        y=well_depth_col,
+        color="Кривая",
+        title=f"Скважина {well}: вертикальный профиль",
+    )
+    fig_well.update_traces(mode="lines")
+    if "FWL_GDM" in chart_df.columns:
+        fig_well.update_traces(
+            hovertemplate=(
+                "Значение=%{x:.3f}<br>"
+                f"Глубина=%{{y:.3f}}<br>"
+                "FWL=%{customdata[0]:.3f}<br>"
+                "Кривая=%{fullData.name}<extra></extra>"
+            )
+        )
+    else:
+        fig_well.update_traces(
+            hovertemplate=(
+                "Значение=%{x:.3f}<br>"
+                f"Глубина=%{{y:.3f}}<br>"
+                "Кривая=%{fullData.name}<extra></extra>"
+            )
+        )
+    fig_well.update_yaxes(autorange="reversed")
+    fig_well.update_layout(xaxis_title="Значение", yaxis_title="Глубина")
+    st.plotly_chart(fig_well, use_container_width=True)
+    conv_percent = _well_convergence_percent_weighted(well_df)
+    if np.isfinite(conv_percent):
+        st.metric("Сходимость для скважины (средневзвеш.), %", f"{conv_percent:.2f}")
+    _inject_scroll_restore_only()
+
+
+_j_well_profile_run = _fragment_run(_j_well_profile_fragment)
 
 
 def brooks_corey_tab() -> None:
@@ -4726,53 +5132,50 @@ def brooks_corey_tab() -> None:
     bc_optimizer_method = str(st.session_state.get("bc_optimizer_method", "differential_evolution"))
     use_perf_weights = bool(st.session_state.get("bc_use_perf_weights", False))
 
-    use_manual_bc = st.checkbox("Использовать свои коэффициенты для 4 зависимостей (без оптимизации)", value=False, key="bc_manual_mode")
-    manual_params_by_pvt: dict[int, dict[str, float]] = {}
-    if use_manual_bc:
-        st.subheader("Ввод своих коэффициентов (по каждому региону)")
-        for p in pvts:
-            with st.expander(f"PVTNUM {p}: коэффициенты", expanded=False):
-                c1, c2 = st.columns(2)
-                with c1:
-                    a_swl = st.number_input(
-                        f"a (swl=a·exp(b·Кп)) | PVT {p}",
-                        value=0.15,
-                        min_value=1e-6,
-                        max_value=25.0,
-                        format="%.6f",
-                        key=f"man_a_swl_{p}",
-                    )
-                    a_perm = st.number_input(f"a_perm | PVT {p}", value=1.0, format="%.6f", key=f"man_a_perm_{p}")
-                    a_pvit = st.number_input(f"a_pvit | PVT {p}", value=1.0, format="%.6f", key=f"man_a_pvit_{p}")
-                    a_n = st.number_input(f"a_n | PVT {p}", value=1.0, format="%.6f", key=f"man_a_n_{p}")
-                with c2:
-                    b_swl = st.number_input(
-                        f"b (swl=a·exp(b·Кп)) | PVT {p}",
-                        value=-0.5,
-                        min_value=-80.0,
-                        max_value=80.0,
-                        format="%.6f",
-                        key=f"man_b_swl_{p}",
-                    )
-                    b_perm = st.number_input(f"b_perm | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_perm_{p}")
-                    b_pvit = st.number_input(f"b_pvit | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_pvit_{p}")
-                    b_n = st.number_input(f"b_n | PVT {p}", value=-0.5, format="%.6f", key=f"man_b_n_{p}")
-                manual_params_by_pvt[p] = {
-                    "a_swl": float(a_swl),
-                    "b_swl": float(b_swl),
-                    "a_perm": float(a_perm),
-                    "b_perm": float(b_perm),
-                    "a_pvit": float(a_pvit),
-                    "b_pvit": float(b_pvit),
-                    "a_n": float(a_n),
-                    "b_n": float(b_n),
-                }
+    bc_mode = st.radio(
+        "Режим калибровки Брукса-Кори",
+        options=["auto", "hybrid", "manual"],
+        format_func=lambda x: {
+            "auto": "Автоподбор всех зависимостей",
+            "hybrid": "Гибридный: свои зависимости + автоподбор остальных",
+            "manual": "Все зависимости вручную (без оптимизации)",
+        }[x],
+        key="bc_calib_mode",
+        horizontal=False,
+    )
 
-        st.subheader("Предпросмотр зависимостей по введенным коэффициентам")
+    fixed_deps_ui: list[str] = []
+    if bc_mode == "hybrid":
+        st.markdown("**Выберите зависимости для ручного ввода** (остальные будут подобраны автоматически по Кн):")
+        c_fix = st.columns(4)
+        for i, dep in enumerate(BC_DEP_KEYS):
+            if c_fix[i].checkbox(BC_DEP_LABELS[dep], key=f"bc_fix_{dep}"):
+                fixed_deps_ui.append(dep)
+        if not fixed_deps_ui:
+            st.caption("Если ничего не выбрано, при расчёте будет выполнен полный автоподбор.")
+        elif len(fixed_deps_ui) == len(BC_DEP_KEYS):
+            st.caption("Выбраны все зависимости — расчёт пойдёт как в режиме «вручную».")
+    elif bc_mode == "manual":
+        fixed_deps_ui = list(BC_DEP_KEYS)
+
+    manual_params_by_pvt = _bc_manual_params_ui(pvts, fixed_deps_ui)
+
+    if fixed_deps_ui:
+        st.subheader("Предпросмотр зависимостей по введённым коэффициентам")
+        auto_deps = [d for d in BC_DEP_KEYS if d not in fixed_deps_ui]
+        if auto_deps:
+            st.caption(
+                "Будут подобраны автоматически: "
+                + ", ".join(BC_DEP_LABELS[d] for d in auto_deps)
+            )
         if st.button("Показать / обновить предпросмотр", key="bc_manual_preview_btn"):
             st.session_state["bc_manual_preview_on"] = True
         if st.session_state.get("bc_manual_preview_on"):
-            p_preview = st.selectbox("Регион для предпросмотра ручных коэффициентов", options=pvts, key="bc_manual_preview_pvt")
+            p_preview = st.selectbox(
+                "Регион для предпросмотра ручных коэффициентов",
+                options=pvts,
+                key="bc_manual_preview_pvt",
+            )
             hs = pvt_horizon_map.get(p_preview, [])
             if not hs:
                 st.info(f"Для PVTNUM {p_preview} не выбраны горизонты.")
@@ -4780,43 +5183,10 @@ def brooks_corey_tab() -> None:
                 lsub = lab[lab["HORIZON"].isin(hs)].copy()
                 if lsub.empty:
                     st.info(f"Для PVTNUM {p_preview} нет лабораторных точек после фильтра.")
+                elif p_preview not in manual_params_by_pvt:
+                    st.info("Задайте коэффициенты для выбранного региона.")
                 else:
-                    prm = manual_params_by_pvt[p_preview]
-                    fig1 = _plot_bc_cloud(
-                        lsub,
-                        "PORO_LAB_FRAC",
-                        "SWL_LAB",
-                        f"PVT {p_preview}: swl=a·exp(b·Кп) — ручные коэффициенты",
-                        opt_ab=(prm["a_swl"], prm["b_swl"]),
-                        curve_kind="swl_exp_ab",
-                    )
-                    fig2 = _plot_bc_cloud(
-                        lsub,
-                        "SWL_LAB",
-                        "PERM_LAB",
-                        f"PVT {p_preview}: Кпр(Кво) — ручные коэффициенты",
-                        opt_ab=(prm["a_perm"], prm["b_perm"]),
-                    )
-                    fig3 = _plot_bc_cloud(
-                        lsub,
-                        "perm_poro",
-                        "PVIT_LAB",
-                        f"PVT {p_preview}: pvit(perm_poro) — ручные коэффициенты",
-                        opt_ab=(prm["a_pvit"], prm["b_pvit"]),
-                    )
-                    fig4 = _plot_bc_cloud(
-                        lsub,
-                        "perm_poro",
-                        "N_LAB",
-                        f"PVT {p_preview}: n(perm_poro) — ручные коэффициенты",
-                        opt_ab=(prm["a_n"], prm["b_n"]),
-                    )
-                    c1, c2 = st.columns(2)
-                    c1.plotly_chart(fig1, use_container_width=True)
-                    c2.plotly_chart(fig2, use_container_width=True)
-                    c3, c4 = st.columns(2)
-                    c3.plotly_chart(fig3, use_container_width=True)
-                    c4.plotly_chart(fig4, use_container_width=True)
+                    _bc_plot_manual_preview(p_preview, manual_params_by_pvt[p_preview], lsub, fixed_deps_ui)
 
     bc_busy = bool(st.session_state.get("bc_busy", False))
     if bc_busy:
@@ -4830,6 +5200,19 @@ def brooks_corey_tab() -> None:
         st.session_state["bc_busy"] = True
         _ui_lock(True, "ui_lock_bc")
         perm_cap_run = float(st.session_state.get("bc_perm_cap", 5000.0))
+
+        bc_mode_run = str(st.session_state.get("bc_calib_mode", "auto"))
+        if bc_mode_run == "manual":
+            fixed_deps_run = list(BC_DEP_KEYS)
+        elif bc_mode_run == "hybrid":
+            fixed_deps_run = _bc_fixed_deps_from_session()
+            if not fixed_deps_run:
+                st.session_state["bc_busy"] = False
+                _ui_lock(False, "ui_lock_bc")
+                st.warning("В гибридном режиме выберите хотя бы одну зависимость для ручного ввода.")
+                return
+        else:
+            fixed_deps_run = []
 
         results = []
         params_rows = []
@@ -4855,11 +5238,36 @@ def brooks_corey_tab() -> None:
                 "pvit": {"lower": pvit_info["lower"], "upper": pvit_info["upper"], "x": lsub["perm_poro"].to_numpy(dtype=float)},
                 "n": {"lower": n_info["lower"], "upper": n_info["upper"], "x": lsub["perm_poro"].to_numpy(dtype=float)},
             }
-            if use_manual_bc:
+            fixed_pairs = _bc_build_fixed_pairs(manual_params_by_pvt.get(p, {}), fixed_deps_run)
+            full_manual = bc_mode_run == "manual" or (
+                bc_mode_run == "hybrid" and len(fixed_deps_run) == len(BC_DEP_KEYS)
+            )
+
+            if full_manual:
                 params = {**manual_params_by_pvt.get(p, {}), "perm_max_md": perm_cap_run}
             else:
-                baseline = {"a_swl": 0.15, "b_swl": -0.5, "a_perm": 1.0, "b_perm": -0.5, "a_pvit": 1.0, "b_pvit": -0.5, "a_n": 1.0, "b_n": -0.5, "perm_max_md": perm_cap_run}
-                corr = {"a_swl": float(swl_exp_info.get("center")[0]), "b_swl": float(swl_exp_info.get("center")[1]), "a_perm": float(perm_info.get("center")[0]), "b_perm": float(perm_info.get("center")[1]), "a_pvit": float(pvit_info.get("center")[0]), "b_pvit": float(pvit_info.get("center")[1]), "a_n": float(n_info.get("center")[0]), "b_n": float(n_info.get("center")[1]), "perm_max_md": perm_cap_run}
+                baseline = {
+                    "a_swl": 0.15,
+                    "b_swl": -0.5,
+                    "a_perm": 1.0,
+                    "b_perm": -0.5,
+                    "a_pvit": 1.0,
+                    "b_pvit": -0.5,
+                    "a_n": 1.0,
+                    "b_n": -0.5,
+                    "perm_max_md": perm_cap_run,
+                }
+                corr = {
+                    "a_swl": float(swl_exp_info.get("center")[0]),
+                    "b_swl": float(swl_exp_info.get("center")[1]),
+                    "a_perm": float(perm_info.get("center")[0]),
+                    "b_perm": float(perm_info.get("center")[1]),
+                    "a_pvit": float(pvit_info.get("center")[0]),
+                    "b_pvit": float(pvit_info.get("center")[1]),
+                    "a_n": float(n_info.get("center")[0]),
+                    "b_n": float(n_info.get("center")[1]),
+                    "perm_max_md": perm_cap_run,
+                }
                 params = optimize_brooks_corey_for_region(
                     g,
                     bounds=bounds,
@@ -4875,23 +5283,31 @@ def brooks_corey_tab() -> None:
                     baseline_params=baseline,
                     perm_max_md=perm_cap_run,
                     optimizer_method=bc_optimizer_method,
+                    fixed_pairs=fixed_pairs or None,
                 )
-                best_params, best_score = None, -np.inf
-                for _, cp in [("auto", params), ("corr", corr), ("default", baseline)]:
-                    cp = {**cp, "perm_max_md": perm_cap_run}
-                    if envelope_max_violation(cp, envelopes) > 1e-9:
-                        continue
-                    score = evaluate_brooks_score(g, cp)
-                    if score > best_score:
-                        best_params, best_score = cp, score
-                if best_params is not None:
-                    params = best_params
+                if not fixed_pairs:
+                    best_params, best_score = None, -np.inf
+                    for _, cp in [("auto", params), ("corr", corr), ("default", baseline)]:
+                        cp = {**cp, "perm_max_md": perm_cap_run}
+                        if envelope_max_violation(cp, envelopes) > 1e-9:
+                            continue
+                        score = evaluate_brooks_score(g, cp)
+                        if score > best_score:
+                            best_params, best_score = cp, score
+                    if best_params is not None:
+                        params = best_params
             elapsed = float(time.perf_counter() - t0_pvt)
             if not params:
                 continue
             g["Kng_BC_model"] = compute_soil_from_params(g, params)
             results.append(g)
-            params_rows.append({"PVTNUM_GDM": p, **params})
+            params_rows.append(
+                {
+                    "PVTNUM_GDM": p,
+                    **params,
+                    **_bc_param_source_row(fixed_deps_run if full_manual else list(fixed_pairs.keys())),
+                }
+            )
             timing_rows.append({"PVTNUM_GDM": int(p), "rows_geo": int(len(g)), "rows_lab": int(len(lsub)), "elapsed_sec": elapsed})
             bc_meta[p] = {"lab": lsub.copy(), "bounds": bounds, "perm_max_md": perm_cap_run, "centers": {"swl": swl_exp_info.get("center"), "perm": perm_info.get("center"), "pvit": pvit_info.get("center"), "n": n_info.get("center")}, "envelopes": envelopes}
         if not results:
@@ -4920,11 +5336,7 @@ def brooks_corey_tab() -> None:
         return
 
     _bc_results_dashboard_run()
-    if not st.session_state.get("_scroll_to_top_pending"):
-        restore_bc_scroll = bool(st.session_state.get("_bc_scroll_restore", True))
-        _preserve_scroll_position(restore=restore_bc_scroll)
-        if not restore_bc_scroll:
-            st.session_state["_bc_scroll_restore"] = True
+    _bc_well_profile_run()
 
 
 def compare_methods_tab() -> None:
@@ -4945,11 +5357,13 @@ def main() -> None:
     prev_page = st.session_state.get("_active_page")
     if prev_page != page:
         _mark_scroll_to_top_pending()
-        _clear_preserved_scroll(SCROLL_STORAGE_BC)
-        st.session_state["_bc_scroll_restore"] = False
+        _clear_preserved_scroll(*ALL_SCROLL_KEYS)
         _scroll_page_top()
         # Привязки горизонт→PVTNUM не сбрасываем при смене вкладки (в т.ч. «Сравнение методов»).
     st.session_state["_active_page"] = page
+    scroll_key = _scroll_key_for_page(page)
+    if not st.session_state.get("_scroll_to_top_pending"):
+        _inject_scroll_preservation(scroll_key, restore=False, save_current=True)
     if page == "Лаборатория":
         laboratory_tab()
     elif page == "Подбор J функции Леверетта":
@@ -4959,6 +5373,8 @@ def main() -> None:
     else:
         compare_methods_tab()
 
+    if not st.session_state.get("_scroll_to_top_pending"):
+        _inject_scroll_preservation(scroll_key, restore=True)
     _scroll_to_top_if_pending(finish=True)
 
 
